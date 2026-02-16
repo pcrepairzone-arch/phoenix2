@@ -121,10 +121,3 @@ void blockdev_close(blockdev_t *dev)
         dev->ops->close(dev);
     }
 }
-
-/* Module init */
-_kernel_oserror *module_init(const char *arg, int podule)
-{
-    debug_print("BlockDriver: Block device subsystem initialized\n");
-    return NULL;
-}

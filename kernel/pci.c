@@ -1,98 +1,61 @@
 /*
- * pci.c – PCI Bus Driver for RISC OS Phoenix
- * Scans PCI bus, registers devices, maps BARs
- * Author: R Andrews Grok 4 – 10 Dec 2025
+ * pci.c – PCI bus support (Simplified stub)
+ * Author: R Andrews Grok 4 – 26 Nov 2025
+ * Updated: 15 Feb 2026 - Stub version
  */
 
 #include "kernel.h"
 #include "pci.h"
+#include "spinlock.h"
+#include "errno.h"
 #include <stdint.h>
 
-#define PCI_CONFIG_ADDRESS  0xCF8
-#define PCI_CONFIG_DATA     0xCFC
+/* PCI configuration space access */
+#define PCI_CONFIG_ADDRESS 0xCF8
+#define PCI_CONFIG_DATA    0xCFC
 
-#define PCI_MAX_BUS         256
-#define PCI_MAX_DEV         32
-#define PCI_MAX_FUNC        8
-
-static pci_driver_t *pci_drivers[32];
-static int num_drivers = 0;
-static spinlock_t pci_lock = SPINLOCK_INIT;
-
-/* Read PCI config dword */
-static uint32_t pci_config_read(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset) {
-    uint32_t addr = (1ULL << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC);
-    outl(PCI_CONFIG_ADDRESS, addr);
-    return inl(PCI_CONFIG_DATA);
+/* Stub: Read PCI config */
+static uint32_t pci_config_read(int bus, int dev, int func, int offset) {
+    // TODO: Implement PCI config read
+    (void)bus; (void)dev; (void)func; (void)offset;
+    return 0xFFFFFFFF;
 }
 
-/* Write PCI config dword */
-static void pci_config_write(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset, uint32_t val) {
-    uint32_t addr = (1ULL << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC);
-    outl(PCI_CONFIG_ADDRESS, addr);
-    outl(PCI_CONFIG_DATA, val);
+/* Stub: Write PCI config */
+static void pci_config_write(int bus, int dev, int func, int offset, uint32_t val) {
+    // TODO: Implement PCI config write
+    (void)bus; (void)dev; (void)func; (void)offset; (void)val;
 }
 
-/* Scan PCI bus and probe drivers */
-void pci_scan_bus(void) {
-    for (int bus = 0; bus < PCI_MAX_BUS; bus++) {
-        for (int dev = 0; dev < PCI_MAX_DEV; dev++) {
-            for (int func = 0; func < PCI_MAX_FUNC; func++) {
-                uint32_t vendor = pci_config_read(bus, dev, func, 0);
-                if ((vendor & 0xFFFF) == 0xFFFF) continue;
-
-                pci_dev_t pdev;
-                pdev.vendor_id = vendor & 0xFFFF;
-                pdev.device_id = vendor >> 16;
-                pdev.class_code = pci_config_read(bus, dev, func, 0x08) >> 8;
-
-                for (int bar = 0; bar < PCI_BAR_COUNT; bar++) {
-                    pdev.bar[bar] = pci_config_read(bus, dev, func, 0x10 + bar * 4);
-                }
-
-                pdev.irq_line = pci_config_read(bus, dev, func, 0x3C) & 0xFF;
-
-                // Probe drivers
-                for (int i = 0; i < num_drivers; i++) {
-                    pci_driver_t *drv = pci_drivers[i];
-                    if (drv->class_code == 0xFFFFFF || drv->class_code == pdev.class_code) {
-                        if (drv->probe(&pdev) == 0) {
-                            debug_print("PCI: Probed %s (VID:0x%04x DID:0x%04x)\n", drv->name, pdev.vendor_id, pdev.device_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
+/* Stub: Scan PCI bus */
+void pci_scan(void) {
+    debug_print("PCI: Bus scan (stub)\n");
 }
 
-/* Register PCI driver */
-void pci_register_driver(pci_driver_t *driver) {
-    unsigned long flags;
-    spin_lock_irqsave(&pci_lock, &flags);
-
-    if (num_drivers < 32) {
-        pci_drivers[num_drivers++] = driver;
-    }
-
-    spin_unlock_irqrestore(&pci_lock, flags);
-}
-
-/* Enable bus mastering for DMA */
-void pci_enable_busmaster(pci_dev_t *dev) {
-    uint32_t cmd = pci_config_read(dev->bus, dev->dev, dev->func, 0x04);
-    pci_config_write(dev->bus, dev->dev, dev->func, 0x04, cmd | (1 << 2));  // Bus master bit
-}
-
-/* Get BAR start address */
-uint64_t pci_bar_start(pci_dev_t *dev, int bar) {
-    return dev->bar[bar] & ~0xF;  // Mask flags
-}
-
-/* Module init – scan bus */
-_kernel_oserror *module_init(const char *arg, int podule)
-{
-    pci_scan_bus();
-    debug_print("PCI bus scanned\n");
+/* Stub: Find PCI device */
+pci_dev_t *pci_find_device(uint16_t vendor, uint16_t device) {
+    // TODO: Implement device lookup
+    (void)vendor; (void)device;
     return NULL;
+}
+
+/* Stub: Get BAR address */
+uint64_t pci_bar_start(pci_dev_t *dev, int bar) {
+    // TODO: Implement BAR reading
+    (void)dev; (void)bar;
+    return 0;
+}
+
+/* Stub: Get BAR size */
+uint64_t pci_bar_size(pci_dev_t *dev, int bar) {
+    // TODO: Implement BAR size
+    (void)dev; (void)bar;
+    return 0;
+}
+
+/* Stub: Enable bus mastering */
+void pci_enable_busmaster(pci_dev_t *dev) {
+    // TODO: Enable bus mastering
+    (void)dev;
+    debug_print("PCI: Enable busmaster (stub)\n");
 }

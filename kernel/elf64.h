@@ -16,6 +16,13 @@
 #define ELFDATA2LSB     1
 #define EM_AARCH64      183
 
+/* ELF file types */
+#define ET_NONE         0   // No file type
+#define ET_REL          1   // Relocatable file
+#define ET_EXEC         2   // Executable file
+#define ET_DYN          3   // Shared object file
+#define ET_CORE         4   // Core file
+
 typedef struct {
     unsigned char e_ident[16];  // Magic + class + data + version + OSABI + ABIVersion + padding
     uint16_t e_type;            // Object file type

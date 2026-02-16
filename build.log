@@ -21,56 +21,22 @@ kernel/mmu.c:151:13: warning: ‘pt_free’ defined but not used [-Wunused-funct
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/pipe.c -o kernel/pipe.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/select.c -o kernel/select.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/irq.c -o kernel/irq.o
-kernel/irq.c: In function ‘gic_dist_init’:
-kernel/irq.c:56:18: error: implicit declaration of function ‘ioremap’ [-Wimplicit-function-declaration]
-   56 |     void *dist = ioremap(GIC_DIST_BASE, PAGE_SIZE);
-      |                  ^~~~~~~
-kernel/irq.c:56:18: error: initialization of ‘void *’ from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
-kernel/irq.c:59:5: error: implicit declaration of function ‘writel’ [-Wimplicit-function-declaration]
-   59 |     writel(0, dist + GICD_CTLR);
-      |     ^~~~~~
-kernel/irq.c: In function ‘gic_redist_init’:
-kernel/irq.c:80:5: error: ‘sd_redist’ undeclared (first use in this function); did you mean ‘gic_redist’?
-   80 |     sd_redist = ioremap(GIC_REDIST_BASE + cpu_id * 0x20000, 0x20000);
-      |     ^~~~~~~~~
-      |     gic_redist
-kernel/irq.c:80:5: note: each undeclared identifier is reported only once for each function it appears in
-kernel/irq.c:83:15: error: ‘redist’ undeclared (first use in this function); did you mean ‘gic_redist’?
-   83 |     writel(0, redist + GICR_WAKER);
-      |               ^~~~~~
-      |               gic_redist
-kernel/irq.c:84:12: error: implicit declaration of function ‘readl’ [-Wimplicit-function-declaration]
-   84 |     while (readl(redist + GICR_WAKER) & 4);
-      |            ^~~~~
-kernel/irq.c: In function ‘irq_unmask’:
-kernel/irq.c:143:22: error: initialization of ‘void *’ from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
-  143 |         void *dist = ioremap(GIC_DIST_BASE, PAGE_SIZE);
-      |                      ^~~~~~~
-kernel/irq.c: In function ‘irq_eoi’:
-kernel/irq.c:154:33: error: ‘GICR_EOIR0’ undeclared (first use in this function)
-  154 |         writel(vector, redist + GICR_EOIR0);
-      |                                 ^~~~~~~~~~
-kernel/irq.c:157:22: error: initialization of ‘void *’ from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
-  157 |         void *dist = ioremap(GIC_DIST_BASE, PAGE_SIZE);
-      |                      ^~~~~~~
-kernel/irq.c:158:31: error: implicit declaration of function ‘GICD_EOIR’; did you mean ‘GICD_CTLR’? [-Wimplicit-function-declaration]
-  158 |         writel(vector, dist + GICD_EOIR(vector / 32));
-      |                               ^~~~~~~~~
-      |                               GICD_CTLR
-kernel/irq.c: In function ‘irq_handler’:
-kernel/irq.c:166:35: error: ‘GICR_IAR0’ undeclared (first use in this function); did you mean ‘GICR_ICFGR0’?
-  166 |     uint32_t iar = readl(redist + GICR_IAR0);
-      |                                   ^~~~~~~~~
-      |                                   GICR_ICFGR0
-kernel/irq.c:177:26: error: ‘GICR_EOIR0’ undeclared (first use in this function)
-  177 |     writel(iar, redist + GICR_EOIR0);
-      |                          ^~~~~~~~~~
-kernel/irq.c: In function ‘ipi_handler’:
-kernel/irq.c:202:81: error: ‘PAGE_SHIFT’ undeclared (first use in this function); did you mean ‘PAGE_SIZE’?
-  202 |                 __asm__ volatile ("tlbi vae1, %0\n dsb ish\n isb" :: "r"(arg >> PAGE_SHIFT));
-      |                                                                                 ^~~~~~~~~~
-      |                                                                                 PAGE_SIZE
-kernel/irq.c:216:44: error: ‘GICR_EOIR0’ undeclared (first use in this function)
-  216 |     writel(iar, gic_redist[get_cpu_id()] + GICR_EOIR0);
-      |                                            ^~~~~~~~~~
-make: *** [Makefile:64: kernel/irq.o] Error 1
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/timer.c -o kernel/timer.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/pci.c -o kernel/pci.o
+kernel/pci.c:25:13: warning: ‘pci_config_write’ defined but not used [-Wunused-function]
+   25 | static void pci_config_write(int bus, int dev, int func, int offset, uint32_t val) {
+      |             ^~~~~~~~~~~~~~~~
+kernel/pci.c:18:17: warning: ‘pci_config_read’ defined but not used [-Wunused-function]
+   18 | static uint32_t pci_config_read(int bus, int dev, int func, int offset) {
+      |                 ^~~~~~~~~~~~~~~
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/vfs.c -o kernel/vfs.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/filecore.c -o kernel/filecore.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/dl.c -o kernel/dl.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/blockdriver.c -o kernel/blockdriver.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/spinlock.c -o kernel/spinlock.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/nvme/nvme.c -o drivers/nvme/nvme.o
+drivers/nvme/nvme.c:12:10: fatal error: nvme.h: No such file or directory
+   12 | #include "nvme.h"
+      |          ^~~~~~~~
+compilation terminated.
+make: *** [Makefile:64: drivers/nvme/nvme.o] Error 1

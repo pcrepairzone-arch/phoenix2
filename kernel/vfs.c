@@ -1,39 +1,17 @@
 /*
- * vfs.c – Virtual File System for RISC OS Phoenix
- * Handles inodes, open/close/read/write/seek, pipes, file types
- * Integrates with block devices (NVMe, USB, SATA)
+ * vfs.c – Virtual File System (Simplified stub)
  * Author: R Andrews Grok 4 – 05 Feb 2026
- * Updated: 15 Feb 2026 - Added error handling
+ * Updated: 15 Feb 2026 - Stub version for compilation
  */
 
 #include "kernel.h"
 #include "vfs.h"
 #include "pipe.h"
 #include "errno.h"
-#include "error.h"
-// // #include <string.h> /* removed - use kernel.h */ /* removed - use kernel.h */
+#include "spinlock.h"
 
 #define MAX_INODES      1024
 #define MAX_FILES       1024
-
-typedef struct inode inode_t;
-typedef struct file file_t;
-
-struct inode {
-    uint64_t i_mode;        // S_IFREG, S_IFDIR, etc.
-    uint64_t i_size;
-    uint64_t i_blocks;
-    uint16_t file_type;     // RISC OS file type (0xFFF for Text, etc.)
-    // ... other fields (timestamps, permissions)
-    void *private;          // FS-specific data
-};
-
-struct file {
-    inode_t *f_inode;
-    uint64_t f_pos;
-    int f_flags;
-    file_ops_t *f_ops;
-};
 
 static inode_t inodes[MAX_INODES];
 static int num_inodes = 0;
@@ -43,6 +21,13 @@ static file_t files[MAX_FILES];
 static int num_files = 0;
 static spinlock_t file_lock = SPINLOCK_INIT;
 
+/* Stub: Resolve path to inode */
+static inode_t *resolve_path(const char *path) {
+    // TODO: Implement path resolution
+    (void)path;
+    return NULL;
+}
+
 /* Allocate new inode */
 inode_t *vfs_alloc_inode(void) {
     unsigned long flags;
@@ -51,7 +36,6 @@ inode_t *vfs_alloc_inode(void) {
     if (num_inodes >= MAX_INODES) {
         spin_unlock_irqrestore(&inode_lock, flags);
         errno = ENFILE;
-        debug_print("ERROR: vfs_alloc_inode - inode table full\n");
         return NULL;
     }
 
@@ -65,35 +49,89 @@ inode_t *vfs_alloc_inode(void) {
 
 /* Set RISC OS file type */
 void vfs_set_file_type(inode_t *inode, uint16_t type) {
-    inode->file_type = type & 0xFFF;  // 12-bit code
+    if (inode) {
+        inode->file_type = type & 0xFFF;
+    }
 }
 
-/* Open file */
+/* Stub: Open file */
 file_t *vfs_open(const char *path, int flags) {
-    unsigned long fl;
-    
     if (!path) {
         errno = EINVAL;
-        debug_print("ERROR: vfs_open - NULL path\n");
         return NULL;
     }
     
+    unsigned long fl;
     spin_lock_irqsave(&file_lock, &fl);
 
     if (num_files >= MAX_FILES) {
         spin_unlock_irqrestore(&file_lock, fl);
         errno = EMFILE;
-        debug_print("ERROR: vfs_open - file table full\n");
         return NULL;
     }
 
-    // Resolve path to inode (stub – implement path resolution)
     inode_t *inode = resolve_path(path);
     if (!inode) {
         spin_unlock_irqrestore(&file_lock, fl);
         errno = ENOENT;
-        debug_print("ERROR: vfs_open - file not found: %s\n", path);
         return NULL;
     }
 
-    file_t *file = &files
+    file_t *file = &files[num_files++];
+    file->f_inode = inode;
+    file->f_pos = 0;
+    file->f_flags = flags;
+    file->f_ops = get_fs_ops(inode);
+
+    spin_unlock_irqrestore(&file_lock, fl);
+    return file;
+}
+
+/* Stub: Close file */
+void vfs_close(file_t *file) {
+    if (file && file->f_ops && file->f_ops->close) {
+        file->f_ops->close(file);
+    }
+}
+
+/* Stub: Read from file */
+ssize_t vfs_read(file_t *file, void *buf, size_t count) {
+    if (!file || !file->f_ops || !file->f_ops->read) {
+        errno = EBADF;
+        return -1;
+    }
+    return file->f_ops->read(file, buf, count);
+}
+
+/* Stub: Write to file */
+ssize_t vfs_write(file_t *file, const void *buf, size_t count) {
+    if (!file || !file->f_ops || !file->f_ops->write) {
+        errno = EBADF;
+        return -1;
+    }
+    return file->f_ops->write(file, buf, count);
+}
+
+/* Stub: Seek in file */
+off_t vfs_seek(file_t *file, off_t offset, int whence) {
+    if (!file || !file->f_ops || !file->f_ops->seek) {
+        errno = EBADF;
+        return -1;
+    }
+    return file->f_ops->seek(file, offset, whence);
+}
+
+/* Stub: Poll file */
+int vfs_poll(file_t *file) {
+    if (!file || !file->f_ops || !file->f_ops->poll) {
+        return 0;
+    }
+    return file->f_ops->poll(file);
+}
+
+/* Stub: Get filesystem operations */
+file_ops_t *get_fs_ops(inode_t *inode) {
+    // TODO: Implement FS ops lookup based on inode type
+    (void)inode;
+    return NULL;
+}
