@@ -34,9 +34,18 @@ aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/dl.c -o kernel/dl.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/blockdriver.c -o kernel/blockdriver.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/spinlock.c -o kernel/spinlock.o
-aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/nvme/nvme.c -o drivers/nvme/nvme.o
-drivers/nvme/nvme.c:12:10: fatal error: nvme.h: No such file or directory
-   12 | #include "nvme.h"
-      |          ^~~~~~~~
-compilation terminated.
-make: *** [Makefile:64: drivers/nvme/nvme.o] Error 1
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/lib.c -o kernel/lib.o
+kernel/lib.c:109:6: error: conflicting types for ‘mmu_free_pagetable’; have ‘void(void *)’
+  109 | void mmu_free_pagetable(void *pgt) { (void)pgt; }
+      |      ^~~~~~~~~~~~~~~~~~
+In file included from kernel/lib.c:4:
+kernel/kernel.h:148:6: note: previous declaration of ‘mmu_free_pagetable’ with type ‘void(task_t *)’ {aka ‘void(struct task *)’}
+  148 | void mmu_free_pagetable(task_t *task);
+      |      ^~~~~~~~~~~~~~~~~~
+kernel/lib.c:110:6: error: conflicting types for ‘mmu_free_usermemory’; have ‘void(void *)’
+  110 | void mmu_free_usermemory(void *task) { (void)task; }
+      |      ^~~~~~~~~~~~~~~~~~~
+kernel/kernel.h:147:6: note: previous declaration of ‘mmu_free_usermemory’ with type ‘void(task_t *)’ {aka ‘void(struct task *)’}
+  147 | void mmu_free_usermemory(task_t *task);
+      |      ^~~~~~~~~~~~~~~~~~~
+make: *** [Makefile:65: kernel/lib.o] Error 1

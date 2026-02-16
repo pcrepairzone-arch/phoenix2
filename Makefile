@@ -29,6 +29,7 @@ OBJS = \
     kernel/dl.o \
     kernel/blockdriver.o \
     kernel/spinlock.o \
+    kernel/lib.o \
     drivers/nvme/nvme.o \
     drivers/usb/usb_storage.o \
     drivers/bluetooth/bluetooth.o \
