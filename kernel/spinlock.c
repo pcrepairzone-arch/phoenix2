@@ -7,6 +7,12 @@
 #include "kernel.h"
 #include "spinlock.h"
 
+/* Initialize spinlock */
+void spinlock_init(spinlock_t *lock)
+{
+    lock->value = 0;
+}
+
 /* Acquire spinlock and save current interrupt state (DAIF) */
 void spin_lock_irqsave(spinlock_t *lock, unsigned long *flags)
 {

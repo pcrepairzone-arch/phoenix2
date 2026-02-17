@@ -32,10 +32,11 @@ extern int wimp_init_checked(void);
 /* Global kernel state */
 int nr_cpus = 1;
 task_t *current_task = NULL;
+char exception_vectors[4096] __attribute__((aligned(2048)));
 
 /* Main kernel entry point */
 __attribute__((noreturn))
-void kernel_main(uint64_t dtb_ptr)
+void kernel_main_init(uint64_t dtb_ptr)
 {
     debug_print("\n");
     debug_print("========================================\n");
@@ -107,7 +108,7 @@ void kernel_main(uint64_t dtb_ptr)
 }
 
 /* Example init process */
-void init_process(void)
+void init_process_kernel(void)
 {
     debug_print("Init process started – launching desktop...\n");
 

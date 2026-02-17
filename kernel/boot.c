@@ -1,6 +1,9 @@
 /* boot.c – 64-bit ARM (AArch64) Primary Boot Stub for RISC OS Phoenix */
 #include "kernel.h"
 
+/* External UART functions */
+extern void uart_init(void);
+
 __attribute__((noreturn))
 void primary_cpu_entry(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
     /* x0 = device tree pointer (optional) */
@@ -43,7 +46,10 @@ void primary_cpu_entry(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
     uint64_t *bss_end = (uint64_t*)&__bss_end;
     while (bss < bss_end) *bss++ = 0;
 
-    /* 4. Jump to C kernel_main */
+    /* 4. Initialize UART first for debug output */
+    uart_init();
+
+    /* 5. Jump to C kernel_main */
     kernel_main(x0);
 
     __builtin_unreachable();
