@@ -1,0 +1,24 @@
+# Raspberry Pi 4/5 Boot Configuration for Phoenix RISC OS
+# Place this file in /boot/ on your SD card
+
+# Enable 64-bit mode
+arm_64bit=1
+
+# Kernel image name
+kernel=kernel8.img
+
+# UART settings for serial console
+enable_uart=1
+uart_2ndstage=1
+
+# Disable splash screen for faster boot
+disable_splash=1
+
+# Set GPU memory (minimum for headless)
+gpu_mem=64
+
+# Additional settings for Pi 5
+[pi5]
+kernel=kernel_2712.img
+
+[all]

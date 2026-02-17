@@ -35,17 +35,28 @@ aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/blockdriver.c -o kernel/blockdriver.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/spinlock.c -o kernel/spinlock.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/lib.c -o kernel/lib.o
-kernel/lib.c:109:6: error: conflicting types for ‘mmu_free_pagetable’; have ‘void(void *)’
-  109 | void mmu_free_pagetable(void *pgt) { (void)pgt; }
-      |      ^~~~~~~~~~~~~~~~~~
-In file included from kernel/lib.c:4:
-kernel/kernel.h:148:6: note: previous declaration of ‘mmu_free_pagetable’ with type ‘void(task_t *)’ {aka ‘void(struct task *)’}
-  148 | void mmu_free_pagetable(task_t *task);
-      |      ^~~~~~~~~~~~~~~~~~
-kernel/lib.c:110:6: error: conflicting types for ‘mmu_free_usermemory’; have ‘void(void *)’
-  110 | void mmu_free_usermemory(void *task) { (void)task; }
-      |      ^~~~~~~~~~~~~~~~~~~
-kernel/kernel.h:147:6: note: previous declaration of ‘mmu_free_usermemory’ with type ‘void(task_t *)’ {aka ‘void(struct task *)’}
-  147 | void mmu_free_usermemory(task_t *task);
-      |      ^~~~~~~~~~~~~~~~~~~
-make: *** [Makefile:65: kernel/lib.o] Error 1
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/devicetree.c -o kernel/devicetree.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/uart/uart.c -o drivers/uart/uart.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/nvme/nvme.c -o drivers/nvme/nvme.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/usb/usb_storage.c -o drivers/usb/usb_storage.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/bluetooth/bluetooth.c -o drivers/bluetooth/bluetooth.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/gpu.c -o drivers/gpu/gpu.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/mmc/mmc.c -o drivers/mmc/mmc.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/tcpip.c -o net/tcpip.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/socket.c -o net/socket.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/ipv4.c -o net/ipv4.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/ipv6.c -o net/ipv6.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/tcp.c -o net/tcp.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/udp.c -o net/udp.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/arp.c -o net/arp.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c wimp/wimp.c -o wimp/wimp.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c wimp/window.c -o wimp/window.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c wimp/event.c -o wimp/event.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c wimp/menu.c -o wimp/menu.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c apps/paint.c -o apps/paint.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c apps/netsurf.c -o apps/netsurf.o
+aarch64-linux-gnu-ld -T kernel/linker.ld -nostdlib -static kernel/boot.o kernel/kernel.o kernel/errno.o kernel/sched.o kernel/task.o kernel/signal.o kernel/mmu.o kernel/pipe.o kernel/select.o kernel/irq.o kernel/timer.o kernel/pci.o kernel/vfs.o kernel/filecore.o kernel/dl.o kernel/blockdriver.o kernel/spinlock.o kernel/lib.o kernel/devicetree.o drivers/uart/uart.o drivers/nvme/nvme.o drivers/usb/usb_storage.o drivers/bluetooth/bluetooth.o drivers/gpu/gpu.o drivers/mmc/mmc.o net/tcpip.o net/socket.o net/ipv4.o net/ipv6.o net/tcp.o net/udp.o net/arp.o wimp/wimp.o wimp/window.o wimp/event.o wimp/menu.o apps/paint.o apps/netsurf.o -o kernel.elf
+aarch64-linux-gnu-ld: warning: kernel.elf has a LOAD segment with RWX permissions
+aarch64-linux-gnu-objcopy -O binary kernel.elf phoenix64.img
+=== Build successful! ===
+Output: phoenix64.img
