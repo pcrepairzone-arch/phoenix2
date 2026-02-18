@@ -51,7 +51,7 @@ It combines:
 ## Building
 
 ```bash
-git clone https://github.com/pcrepairzone-arch/phoenix.git
+git clone https://github.com/pcrepairzone-arch/phoenix2.git
 cd phoenix
 
 make clean all
