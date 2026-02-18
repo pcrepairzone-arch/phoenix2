@@ -9,6 +9,10 @@ OBJCOPY = aarch64-linux-gnu-objcopy
 CFLAGS = -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only \
          -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp
 ASFLAGS = -mcpu=cortex-a72
+# Use GCC to assemble .S files so we get the C preprocessor and
+# ldr x0, =symbol  pseudo-instruction support via the GNU assembler
+%.o: %.S
+	$(CC) $(CFLAGS) -x assembler-with-cpp -c $< -o $@
 LDFLAGS = -T kernel/linker.ld -nostdlib -static
 
 OBJS = \
@@ -31,11 +35,16 @@ OBJS = \
     kernel/spinlock.o \
     kernel/lib.o \
     kernel/devicetree.o \
+    kernel/led_diag.o \
+    kernel/periph_base.o \
     drivers/uart/uart.o \
     drivers/nvme/nvme.o \
     drivers/usb/usb_storage.o \
     drivers/bluetooth/bluetooth.o \
     drivers/gpu/gpu.o \
+    drivers/gpu/mailbox.o \
+    drivers/gpu/framebuffer.o \
+    drivers/gpu/font8x8.o \
     drivers/mmc/mmc.o \
     net/tcpip.o \
     net/socket.o \
@@ -65,9 +74,6 @@ kernel.elf: $(OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
-
-%.o: %.S
-	$(AS) $(ASFLAGS) $< -o $@
 
 clean:
 	rm -f *.o */*.o */*/*.o kernel.elf $(TARGET)

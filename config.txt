@@ -1,24 +1,41 @@
 # Raspberry Pi 4/5 Boot Configuration for Phoenix RISC OS
-# Place this file in /boot/ on your SD card
+# =========================================================
+# Copy this file to the ROOT of your SD card's FAT32 boot partition.
+#
+# IMPORTANT NOTES:
+#  - Do NOT add dtoverlay=vc4-kms-v3d  (it blocks the legacy mailbox FB)
+#  - Do NOT add dtoverlay=vc4-fkms-v3d (same problem)
+#  - The Pi 4 firmware defaults to legacy framebuffer without these overlays
+#    and that is exactly what bare-metal mailbox framebuffer needs.
 
-# Enable 64-bit mode
+# ---- 64-bit ARM kernel ----
 arm_64bit=1
-
-# Kernel image name
 kernel=kernel8.img
 
-# UART settings for serial console
+# ---- UART serial console (GPIO 14/15, 115200 8N1) ----
 enable_uart=1
 uart_2ndstage=1
 
-# Disable splash screen for faster boot
-disable_splash=1
+# ---- HDMI display ----
+# Force HDMI even if no monitor was connected at power-on
+hdmi_force_hotplug=1
 
-# Set GPU memory (minimum for headless)
-gpu_mem=64
+# CEA mode: group=1 mode=16 = 1080p60  (change mode=4 for 720p60)
+hdmi_group=1
+hdmi_mode=16
 
-# Additional settings for Pi 5
-[pi5]
-kernel=kernel_2712.img
+# Boost signal for longer cables / adapters
+config_hdmi_boost=4
+
+# ---- GPU / framebuffer memory ----
+# Must be >= 128MB for the mailbox legacy framebuffer to work reliably.
+# DO NOT reduce below 128.
+gpu_mem=128
+
+# ---- DO NOT add any of the following ----
+# dtoverlay=vc4-kms-v3d      <- BREAKS mailbox framebuffer
+# dtoverlay=vc4-fkms-v3d     <- BREAKS mailbox framebuffer
+# disable_splash=1            <- May skip display pipeline init
 
 [all]
+hdmi_force_hotplug=1
