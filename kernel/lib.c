@@ -10,64 +10,101 @@ extern void uart_puts(const char *str);
 extern void uart_hex(uint64_t value);
 extern void uart_dec(int64_t value);
 
+/* Forward declare console function (may not be ready yet) */
+extern void con_putc(char c);
+
+static int _fb_up = 0;   /* set to 1 after gpu_init() completes */
+
+void fb_mark_ready(void)  { _fb_up = 1; }
+void fb_mark_unready(void){ _fb_up = 0; }
+
+static void _put(char c) {
+    /* Always send to UART */
+    if (c == '\n') uart_putc('\r');
+    uart_putc(c);
+    /* Mirror to screen console once framebuffer is up */
+    if (_fb_up) con_putc(c);
+}
+
 /* Real debug print with UART */
 void debug_print(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    
+
     while (*fmt) {
         if (*fmt == '%') {
             fmt++;
             switch (*fmt) {
                 case 's': {
                     const char *s = va_arg(args, const char *);
-                    uart_puts(s ? s : "(null)");
+                    const char *p = s ? s : "(null)";
+                    while (*p) _put(*p++);
                     break;
                 }
                 case 'd': {
                     int val = va_arg(args, int);
-                    uart_dec(val);
+                    if (val < 0) { _put('-'); val = -val; }
+                    if (val == 0) { _put('0'); break; }
+                    char buf[16]; int n = 0;
+                    while (val > 0) { buf[n++] = '0' + val%10; val /= 10; }
+                    for (int k = n-1; k >= 0; k--) _put(buf[k]);
+                    break;
+                }
+                case 'u': {
+                    unsigned val = va_arg(args, unsigned);
+                    if (val == 0) { _put('0'); break; }
+                    char buf[16]; int n = 0;
+                    while (val > 0) { buf[n++] = '0' + val%10; val /= 10; }
+                    for (int k = n-1; k >= 0; k--) _put(buf[k]);
                     break;
                 }
                 case 'x': {
                     unsigned int val = va_arg(args, unsigned int);
-                    uart_hex(val);
+                    const char *h = "0123456789abcdef";
+                    _put('0'); _put('x');
+                    for (int sh = 28; sh >= 0; sh -= 4) _put(h[(val>>sh)&0xF]);
                     break;
                 }
                 case 'p': {
                     void *ptr = va_arg(args, void *);
-                    uart_hex((uint64_t)ptr);
+                    uint64_t v = (uint64_t)ptr;
+                    const char *h = "0123456789abcdef";
+                    _put('0'); _put('x');
+                    for (int sh = 60; sh >= 0; sh -= 4) _put(h[(v>>sh)&0xF]);
                     break;
                 }
                 case 'l': {
-                    if (*(fmt + 1) == 'l') {
-                        fmt++;
-                        if (*(fmt + 1) == 'd') {
-                            fmt++;
-                            int64_t val = va_arg(args, int64_t);
-                            uart_dec(val);
-                        } else if (*(fmt + 1) == 'x') {
-                            fmt++;
-                            uint64_t val = va_arg(args, uint64_t);
-                            uart_hex(val);
-                        }
+                    fmt++;
+                    if (*fmt == 'l') fmt++;
+                    if (*fmt == 'd') {
+                        int64_t val = va_arg(args, int64_t);
+                        if (val < 0) { _put('-'); val = -val; }
+                        if (val == 0) { _put('0'); break; }
+                        char buf[24]; int n = 0;
+                        while (val > 0) { buf[n++] = '0' + (int)(val%10); val /= 10; }
+                        for (int k = n-1; k >= 0; k--) _put(buf[k]);
+                    } else if (*fmt == 'x') {
+                        uint64_t val = va_arg(args, uint64_t);
+                        const char *h = "0123456789abcdef";
+                        _put('0'); _put('x');
+                        for (int sh = 60; sh >= 0; sh -= 4) _put(h[(val>>sh)&0xF]);
                     }
                     break;
                 }
                 case '%':
-                    uart_putc('%');
+                    _put('%');
                     break;
                 default:
-                    uart_putc('%');
-                    uart_putc(*fmt);
+                    _put('%');
+                    _put(*fmt);
                     break;
             }
         } else {
-            uart_putc(*fmt);
+            _put(*fmt);
         }
         fmt++;
     }
-    
+
     va_end(args);
 }
 
@@ -194,4 +231,11 @@ int __aarch64_ldadd4_acq_rel(int val, int *ptr) {
     int old = *ptr;
     *ptr += val;
     return old;
+}
+
+/* Get current CPU ID from MPIDR_EL1 */
+int get_cpu_id(void) {
+    uint64_t mpidr;
+    __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (int)(mpidr & 0xFF);
 }
