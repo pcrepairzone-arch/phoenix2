@@ -13,9 +13,6 @@ primary_cpu_entry:
 0:  wfe
     b       0b
 1:
-    /* NOTE: LED blink removed from assembly - will be done in C
-     * after we detect the peripheral base address */
-
     /* Check EL, drop to EL1 */
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
@@ -43,6 +40,11 @@ el1_mode:
     adrp    x1, __kernel_stack_top
     add     x1, x1, :lo12:__kernel_stack_top
     mov     sp, x1
+
+    /* CRITICAL: Install exception vectors BEFORE doing anything else */
+    adr     x1, exception_vectors
+    msr     vbar_el1, x1
+    isb
 
     /* Zero BSS */
     adrp    x1, __bss_start

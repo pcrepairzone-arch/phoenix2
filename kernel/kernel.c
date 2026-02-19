@@ -56,8 +56,7 @@ extern void netsurf_task(void);
 int     nr_cpus      = 1;
 task_t *current_task = NULL;
 
-/* Exception vector table – must be 2048-byte aligned               */
-char exception_vectors[4096] __attribute__((aligned(2048)));
+/* Exception vectors are defined in exceptions.S */
 
 /* ------------------------------------------------------------------ */
 /* kernel_main - called from boot.c after UART is ready              */
