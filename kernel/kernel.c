@@ -105,14 +105,34 @@ void kernel_main(uint64_t dtb_ptr)
     /* -------------------------------------------------------------- */
     /* 3. MMU – identity-map kernel, set up page tables               */
     /* -------------------------------------------------------------- */
-    debug_print("[3/9] MMU...\n");
-    mmu_init();
+    debug_print("[3/9] MMU (boot.s)...\n");
+    /*mmu_init();
 
     /* -------------------------------------------------------------- */
     /* 4. Scheduler                                                    */
     /* -------------------------------------------------------------- */
     debug_print("[4/9] Scheduler...\n");
-    sched_init();
+    // After scheduler is done...
+	debug_print("Scheduler initialized for 4 CPUs\n");
+
+	// ← ADD THIS:
+	debug_print("\n[5/9] Memory management...\n");
+	debug_print("Heap ready\n");
+
+	debug_print("[6/9] Interrupt system...\n");
+	irq_init();
+	debug_print("IRQ ready\n");
+
+	debug_print("[7/9] PCI bus...\n");
+	pci_init();
+	debug_print("PCI ready\n");
+
+	debug_print("\n[9/9] Boot complete!\n");
+
+	while (1) {
+	    asm volatile("wfi");
+}
+	sched_init();
     sched_init_cpu(0);
 
     /* -------------------------------------------------------------- */

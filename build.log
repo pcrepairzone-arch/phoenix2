@@ -1,5 +1,9 @@
-aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/boot.c -o kernel/boot.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -x assembler-with-cpp -c kernel/boot.S -o kernel/boot.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -x assembler-with-cpp -c kernel/exceptions.S -o kernel/exceptions.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/kernel.c -o kernel/kernel.o
+kernel/kernel.c: In function ‘kernel_main’:
+kernel/kernel.c:111:5: warning: "/*" within comment [-Wcomment]
+  111 |     /* -------------------------------------------------------------- */
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/errno.c -o kernel/errno.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/sched.c -o kernel/sched.o
 kernel/sched.c:63:13: warning: ‘dequeue_task’ defined but not used [-Wunused-function]
@@ -23,12 +27,6 @@ aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/irq.c -o kernel/irq.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/timer.c -o kernel/timer.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/pci.c -o kernel/pci.o
-kernel/pci.c:25:13: warning: ‘pci_config_write’ defined but not used [-Wunused-function]
-   25 | static void pci_config_write(int bus, int dev, int func, int offset, uint32_t val) {
-      |             ^~~~~~~~~~~~~~~~
-kernel/pci.c:18:17: warning: ‘pci_config_read’ defined but not used [-Wunused-function]
-   18 | static uint32_t pci_config_read(int bus, int dev, int func, int offset) {
-      |                 ^~~~~~~~~~~~~~~
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/vfs.c -o kernel/vfs.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/filecore.c -o kernel/filecore.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/dl.c -o kernel/dl.o
@@ -36,11 +34,21 @@ aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/spinlock.c -o kernel/spinlock.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/lib.c -o kernel/lib.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/devicetree.c -o kernel/devicetree.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/led_diag.c -o kernel/led_diag.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/periph_base.c -o kernel/periph_base.o
+kernel/periph_base.c:20:17: warning: ‘fdt_read64’ defined but not used [-Wunused-function]
+   20 | static uint64_t fdt_read64(const uint8_t *p) {
+      |                 ^~~~~~~~~~
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c kernel/mmio.c -o kernel/mmio.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/uart/uart.c -o drivers/uart/uart.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/gpu.c -o drivers/gpu/gpu.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/nvme/nvme.c -o drivers/nvme/nvme.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/usb/usb_storage.c -o drivers/usb/usb_storage.o
-aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/bluetooth/bluetooth.c -o drivers/bluetooth/bluetooth.o
-aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/gpu.c -o drivers/gpu/gpu.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/mailbox.c -o drivers/gpu/mailbox.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/mailbox_test.c -o drivers/gpu/mailbox_test.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/audio_diag.c -o drivers/gpu/audio_diag.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/framebuffer.c -o drivers/gpu/framebuffer.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/gpu/font8x8.c -o drivers/gpu/font8x8.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c drivers/mmc/mmc.c -o drivers/mmc/mmc.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/tcpip.c -o net/tcpip.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c net/socket.c -o net/socket.o
@@ -55,7 +63,7 @@ aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c wimp/menu.c -o wimp/menu.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c apps/paint.c -o apps/paint.o
 aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -c apps/netsurf.c -o apps/netsurf.o
-aarch64-linux-gnu-ld -T kernel/linker.ld -nostdlib -static kernel/boot.o kernel/kernel.o kernel/errno.o kernel/sched.o kernel/task.o kernel/signal.o kernel/mmu.o kernel/pipe.o kernel/select.o kernel/irq.o kernel/timer.o kernel/pci.o kernel/vfs.o kernel/filecore.o kernel/dl.o kernel/blockdriver.o kernel/spinlock.o kernel/lib.o kernel/devicetree.o drivers/uart/uart.o drivers/nvme/nvme.o drivers/usb/usb_storage.o drivers/bluetooth/bluetooth.o drivers/gpu/gpu.o drivers/mmc/mmc.o net/tcpip.o net/socket.o net/ipv4.o net/ipv6.o net/tcp.o net/udp.o net/arp.o wimp/wimp.o wimp/window.o wimp/event.o wimp/menu.o apps/paint.o apps/netsurf.o -o kernel.elf
+aarch64-linux-gnu-ld -T kernel/linker.ld -nostdlib -static kernel/boot.o kernel/exceptions.o kernel/kernel.o kernel/errno.o kernel/sched.o kernel/task.o kernel/signal.o kernel/mmu.o kernel/pipe.o kernel/select.o kernel/irq.o kernel/timer.o kernel/pci.o kernel/vfs.o kernel/filecore.o kernel/dl.o kernel/blockdriver.o kernel/spinlock.o kernel/lib.o kernel/devicetree.o kernel/led_diag.o kernel/periph_base.o kernel/mmio.o drivers/uart/uart.o drivers/gpu/gpu.o drivers/nvme/nvme.o drivers/usb/usb_storage.o drivers/gpu/mailbox.o drivers/gpu/mailbox_test.o drivers/gpu/audio_diag.o drivers/gpu/framebuffer.o drivers/gpu/font8x8.o drivers/mmc/mmc.o net/tcpip.o net/socket.o net/ipv4.o net/ipv6.o net/tcp.o net/udp.o net/arp.o wimp/wimp.o wimp/window.o wimp/event.o wimp/menu.o apps/paint.o apps/netsurf.o -o kernel.elf
 aarch64-linux-gnu-ld: warning: kernel.elf has a LOAD segment with RWX permissions
 aarch64-linux-gnu-objcopy -O binary kernel.elf phoenix64.img
 === Build successful! ===

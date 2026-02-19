@@ -38,11 +38,11 @@ OBJS = \
     kernel/devicetree.o \
     kernel/led_diag.o \
     kernel/periph_base.o \
+	kernel/mmio.o \
     drivers/uart/uart.o \
-    drivers/nvme/nvme.o \
-    drivers/usb/usb_storage.o \
-    drivers/bluetooth/bluetooth.o \
     drivers/gpu/gpu.o \
+	drivers/nvme/nvme.o \
+    drivers/usb/usb_storage.o \
     drivers/gpu/mailbox.o \
     drivers/gpu/mailbox_test.o \
     drivers/gpu/audio_diag.o \
