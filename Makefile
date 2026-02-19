@@ -17,6 +17,7 @@ LDFLAGS = -T kernel/linker.ld -nostdlib -static
 
 OBJS = \
     kernel/boot.o \
+    kernel/exceptions.o \
     kernel/kernel.o \
     kernel/errno.o \
     kernel/sched.o \
@@ -43,6 +44,8 @@ OBJS = \
     drivers/bluetooth/bluetooth.o \
     drivers/gpu/gpu.o \
     drivers/gpu/mailbox.o \
+    drivers/gpu/mailbox_test.o \
+    drivers/gpu/audio_diag.o \
     drivers/gpu/framebuffer.o \
     drivers/gpu/font8x8.o \
     drivers/mmc/mmc.o \

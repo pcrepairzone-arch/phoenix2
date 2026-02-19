@@ -14,17 +14,17 @@ void led_blink_pattern(int count, int reps) {
     val |= (0x1 << 6);
     *gpfsel4 = val;
     
-    /* Blink */
+    /* Blink with longer delays */
     for (int r = 0; r < reps; r++) {
         *gpclr1 = (1 << 10);  /* ON */
-        for (volatile int i = 0; i < count * 200000; i++);
+        for (volatile int i = 0; i < count * 500000; i++);  /* Longer ON time */
         *gpset1 = (1 << 10);  /* OFF */
-        for (volatile int i = 0; i < count * 200000; i++);
+        for (volatile int i = 0; i < count * 500000; i++);  /* Longer OFF time */
     }
 }
 
-void led_signal_kernel_main(void)  { led_blink_pattern(1, 2); for(volatile int i=0;i<400000;i++); led_blink_pattern(3, 1); }
-void led_signal_gpu_start(void)    { led_blink_pattern(1, 4); for(volatile int i=0;i<600000;i++); }
-void led_signal_gpu_ok(void)       { led_blink_pattern(1, 5); for(volatile int i=0;i<600000;i++); }
+void led_signal_kernel_main(void)  { led_blink_pattern(1, 2); for(volatile int i=0;i<1000000;i++); led_blink_pattern(3, 1); }
+void led_signal_gpu_start(void)    { led_blink_pattern(1, 4); for(volatile int i=0;i<1500000;i++); }
+void led_signal_gpu_ok(void)       { led_blink_pattern(1, 5); for(volatile int i=0;i<1500000;i++); }
 void led_signal_hang(void)         { while(1) { led_blink_pattern(5, 1); } }
-void led_signal_boot_ok(void)      { led_blink_pattern(1, 3); for(volatile int i=0;i<600000;i++); }
+void led_signal_boot_ok(void)      { led_blink_pattern(1, 3); for(volatile int i=0;i<1500000;i++); }
