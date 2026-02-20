@@ -1,0 +1,30 @@
+=== ADD TO kernel_main() after scheduler_init() ===
+
+    debug_print("\n[5/9] Memory management...\n");
+    /* Memory allocator already initialized (static) */
+    heap_stats();
+    
+    debug_print("[6/9] Interrupt system...\n");
+    irq_init();
+    
+    debug_print("[7/9] PCI bus...\n");
+    pci_init();
+    
+    debug_print("[8/9] Testing allocator...\n");
+    void *test = kmalloc(1024);
+    if (test) {
+        debug_print("kmalloc: Allocated 1KB at %p\n", test);
+        kfree(test);
+    }
+    heap_stats();
+    
+    debug_print("\n[9/9] Boot complete!\n");
+    debug_print("===========================================\n");
+    debug_print("Phoenix RISC OS kernel is ready!\n");
+    debug_print("===========================================\n\n");
+    
+    /* Idle loop */
+    while (1) {
+        /* Wait for interrupts */
+        asm volatile("wfi");  /* Wait For Interrupt */
+    }

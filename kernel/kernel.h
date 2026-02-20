@@ -188,3 +188,28 @@ extern task_t *current_task;
 extern int nr_cpus;
 
 #endif /* KERNEL_H */
+/* Memory management */
+void *kmalloc(size_t size);
+void kfree(void *ptr);
+void *kcalloc(size_t nmemb, size_t size);
+void heap_stats(void);
+
+/* MMIO helpers */
+void *ioremap(uint64_t phys_addr, size_t size);
+void iounmap(void *virt_addr);
+uint8_t readb(const void *addr);
+uint16_t readw(const void *addr);
+uint32_t readl(const void *addr);
+uint64_t readq(const void *addr);
+void writeb(uint8_t val, void *addr);
+void writew(uint16_t val, void *addr);
+void writel(uint32_t val, void *addr);
+void writeq(uint64_t val, void *addr);
+uint64_t virt_to_phys(void *virt);
+void *phys_to_virt(uint64_t phys);
+
+/* IRQ system */
+#include "irq.h"
+
+/* PCI system */
+#include "pci.h"

@@ -1,85 +1,106 @@
 /*
- * irq.c – GICv3 Interrupt Controller (Simplified stub)
- * Author: R Andrews Grok 4 – 26 Nov 2025
- * Updated: 15 Feb 2026 - Stub version for compilation
+ * irq.c - IRQ Handler for Phoenix RISC OS
+ * Adapted from GitHub repo for Pi 4
  */
 
 #include "kernel.h"
-#include "spinlock.h"
-#include "errno.h"
-#include <stdint.h>
+#include "irq.h"
 
-/* IRQ handler type */
-typedef void (*irq_handler_t)(int vector, void *private);
+#define MAX_IRQ_VECTORS 256
 
-/* Per-vector handlers */
-static irq_handler_t irq_handlers[1024];
-static void *irq_priv[1024];
-static spinlock_t irq_lock = SPINLOCK_INIT;
+typedef struct {
+    irq_handler_t handler;
+    void *private;
+    int enabled;
+} irq_entry_t;
 
-/* Stub: Initialize IRQ subsystem */
-void irq_init(void) {
-    for (int i = 0; i < 1024; i++) {
-        irq_handlers[i] = NULL;
-        irq_priv[i] = NULL;
-    }
-    spinlock_init(&irq_lock);
-    debug_print("IRQ: Subsystem initialized (stub)\n");
-}
+static irq_entry_t irq_table[MAX_IRQ_VECTORS];
 
-/* Stub: Register IRQ handler */
-int irq_register(int vector, irq_handler_t handler, void *private) {
-    if (vector < 0 || vector >= 1024) {
-        errno = EINVAL;
-        return -1;
+void irq_init(void)
+{
+    debug_print("[IRQ] Initializing interrupt system\n");
+    
+    /* Clear all handlers */
+    for (int i = 0; i < MAX_IRQ_VECTORS; i++) {
+        irq_table[i].handler = NULL;
+        irq_table[i].private = NULL;
+        irq_table[i].enabled = 0;
     }
     
-    unsigned long flags;
-    spin_lock_irqsave(&irq_lock, &flags);
-    irq_handlers[vector] = handler;
-    irq_priv[vector] = private;
-    spin_unlock_irqrestore(&irq_lock, flags);
+    /* TODO: Set up GIC (Generic Interrupt Controller) */
+    /* For now, basic setup */
     
-    return 0;
+    debug_print("[IRQ] Interrupt system ready\n");
 }
 
-/* Stub: Unregister IRQ handler */
-void irq_unregister(int vector) {
-    if (vector < 0 || vector >= 1024) return;
+void irq_set_handler(int vector, irq_handler_t handler, void *private)
+{
+    if (vector < 0 || vector >= MAX_IRQ_VECTORS) {
+        debug_print("[IRQ] Invalid vector %d\n", vector);
+        return;
+    }
     
-    unsigned long flags;
-    spin_lock_irqsave(&irq_lock, &flags);
-    irq_handlers[vector] = NULL;
-    irq_priv[vector] = NULL;
-    spin_unlock_irqrestore(&irq_lock, flags);
+    irq_table[vector].handler = handler;
+    irq_table[vector].private = private;
+    
+    debug_print("[IRQ] Handler registered for vector %d\n", vector);
 }
 
-/* Stub: Unmask IRQ */
-void irq_unmask(int vector) {
-    // TODO: Implement GIC unmask
+void irq_unmask(int vector)
+{
+    if (vector < 0 || vector >= MAX_IRQ_VECTORS) return;
+    
+    irq_table[vector].enabled = 1;
+    
+    /* TODO: Unmask in GIC */
+}
+
+void irq_mask(int vector)
+{
+    if (vector < 0 || vector >= MAX_IRQ_VECTORS) return;
+    
+    irq_table[vector].enabled = 0;
+    
+    /* TODO: Mask in GIC */
+}
+
+void irq_eoi(int vector)
+{
+    /* TODO: Send End-of-Interrupt to GIC */
     (void)vector;
 }
 
-/* Stub: Mask IRQ */
-void irq_mask(int vector) {
-    // TODO: Implement GIC mask
-    (void)vector;
+/* Called from exception handler */
+void irq_dispatch(int vector)
+{
+    if (vector < 0 || vector >= MAX_IRQ_VECTORS) {
+        debug_print("[IRQ] Invalid IRQ vector %d\n", vector);
+        return;
+    }
+    
+    irq_entry_t *entry = &irq_table[vector];
+    
+    if (entry->handler && entry->enabled) {
+        entry->handler(vector, entry->private);
+    } else {
+        debug_print("[IRQ] Spurious IRQ %d\n", vector);
+    }
+    
+    irq_eoi(vector);
 }
 
-/* Stub: End of interrupt */
-void irq_eoi(int vector) {
-    // TODO: Implement GIC EOI
-    (void)vector;
+/* IPI support (for SMP) */
+void send_ipi(uint64_t target_cpus, int ipi_id, uint64_t arg)
+{
+    /* TODO: Implement IPI for multi-core */
+    (void)target_cpus;
+    (void)ipi_id;
+    (void)arg;
 }
 
-/* Stub: IRQ handler entry point */
-void irq_handler(void) {
-    // TODO: Implement IRQ dispatcher
-    debug_print("IRQ handler called (stub)\n");
-}
-
-/* Stub: IPI handler */
-void ipi_handler(void) {
-    // TODO: Implement IPI handling
-    debug_print("IPI handler called (stub)\n");
+void ipi_handler(int ipi_id, uint64_t arg)
+{
+    /* TODO: Handle IPI */
+    (void)ipi_id;
+    (void)arg;
 }

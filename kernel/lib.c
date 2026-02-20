@@ -217,7 +217,7 @@ void net_init(void) {}
 void wimp_task(void) {}
 void paint_task(void) {}
 void netsurf_task(void) {}
-void send_ipi(uint64_t cpus, int ipi, uint64_t arg) { (void)cpus; (void)ipi; (void)arg; }
+
 void mmu_free_pagetable(task_t *task) { (void)task; }
 void mmu_free_usermemory(task_t *task) { (void)task; }
 
