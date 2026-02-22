@@ -19,6 +19,7 @@ OBJS = \
     kernel/boot.o \
     kernel/exceptions.o \
     kernel/kernel.o \
+    kernel/malloc.o \
     kernel/errno.o \
     kernel/sched.o \
     kernel/task.o \
@@ -38,11 +39,15 @@ OBJS = \
     kernel/devicetree.o \
     kernel/led_diag.o \
     kernel/periph_base.o \
-	kernel/mmio.o \
-    drivers/uart/uart.o \
+    kernel/mmio.o \
+    kernel/pcie_bridge.o \
+	drivers/uart/uart.o \
     drivers/gpu/gpu.o \
 	drivers/nvme/nvme.o \
+	drivers/usb/vl805_init.o \
     drivers/usb/usb_storage.o \
+    drivers/usb/usb_xhci.o \
+    drivers/usb/usb_init.o \
     drivers/gpu/mailbox.o \
     drivers/gpu/mailbox_test.o \
     drivers/gpu/audio_diag.o \
