@@ -113,6 +113,7 @@ typedef struct {
 } cpu_sched_t;
 
 extern cpu_sched_t cpu_sched[MAX_CPUS];   // SINGLE extern
+extern int vl805_init(void);		// second extern
 
 /* Function Prototypes */
 void kernel_main(uint64_t dtb_ptr);
@@ -150,17 +151,17 @@ void mmu_free_pagetable(task_t *task);
 void timer_init(void);
 void timer_init_cpu(void);
 void timer_tick(void);
-
 void irq_init(void);
 
 void device_tree_parse(uint64_t dtb_ptr);
 int detect_nr_cpus(void);
 int get_cpu_id(void);
-
 void filecore_init(void);
 
-void *kmalloc(size_t size);
+void *kcalloc(size_t nmemb, size_t size);
 void kfree(void *ptr);
+void *kmalloc(size_t size);
+void heap_stats(void);
 
 /* String functions (minimal implementations) */
 size_t strlen(const char *s);
@@ -190,8 +191,9 @@ extern int nr_cpus;
 #endif /* KERNEL_H */
 /* Memory management */
 void *kmalloc(size_t size);
-void kfree(void *ptr);
 void *kcalloc(size_t nmemb, size_t size);
+void kfree(void *ptr);
+
 void heap_stats(void);
 
 /* MMIO helpers */

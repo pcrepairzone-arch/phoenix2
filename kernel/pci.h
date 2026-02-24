@@ -1,4 +1,4 @@
-/*
+ /*
  * pci.h - PCI/PCIe Bus Headers for Phoenix RISC OS
  * Adapted for Raspberry Pi 4 PCIe
  */
@@ -8,8 +8,12 @@
 
 #include <stdint.h>
 
-#define PCI_MAX_DEVICES     256
-#define PCI_BAR_COUNT       6
+#define PCI_MAX_DEVICES     256  // Optional, for max scan limits
+#define PCI_BAR_COUNT       6    // Standard PCI BARs
+
+// Optional PCI class constants (for matching, e.g., VL805 xHCI)
+#define PCI_CLASS_SERIAL_USB 0x0C0300  // Base for USB controllers
+#define PCI_CLASS_USB_XHCI   0x0C0330  // Specific for xHCI (VL805)
 
 typedef struct pci_dev {
     uint8_t  bus;
@@ -17,7 +21,7 @@ typedef struct pci_dev {
     uint8_t  func;
     uint16_t vendor_id;
     uint16_t device_id;
-    uint16_t class_code;
+    uint32_t class_code;  // Changed to uint32_t for full 24-bit (base/sub/prog IF)
     uint64_t bar[PCI_BAR_COUNT];
     int      irq_line;
 } pci_dev_t;

@@ -110,39 +110,10 @@ void debug_print(const char *fmt, ...) {
 
 /* Real memory allocation with bump allocator */
 #define HEAP_SIZE (16 * 1024 * 1024)  // 16MB heap
-static char heap[HEAP_SIZE] __attribute__((aligned(16)));
-static size_t heap_used = 0;
-static spinlock_t heap_lock = {0};
 
-void *kmalloc(size_t size) {
-    if (size == 0) return NULL;
-    
-    // Align to 16 bytes
-    size = (size + 15) & ~15;
-    
-    unsigned long flags;
-    spin_lock_irqsave(&heap_lock, &flags);
-    
-    if (heap_used + size > HEAP_SIZE) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        debug_print("ERROR: kmalloc() - out of memory! Requested: %lld, Available: %lld\n",
-                   (int64_t)size, (int64_t)(HEAP_SIZE - heap_used));
-        return NULL;
-    }
-    
-    void *ptr = &heap[heap_used];
-    heap_used += size;
-    
-    spin_unlock_irqrestore(&heap_lock, flags);
-    
-    return ptr;
-}
 
-void kfree(void *ptr) {
-    // Simple bump allocator doesn't support free
-    // TODO: Implement real allocator with free support
-    (void)ptr;
-}
+
+
 
 /* String functions */
 void *memset(void *s, int c, size_t n) {

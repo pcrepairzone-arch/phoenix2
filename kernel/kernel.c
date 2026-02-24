@@ -27,6 +27,7 @@
 /* Forward declarations for subsystem init functions                  */
 /* ------------------------------------------------------------------ */
 extern void uart_init(void);           /* drivers/uart/uart.c     */
+extern int vl805_init(void);		/* drivers/usb/vl805_init.c */
 extern void gpu_init(void);             /* drivers/gpu/gpu.c        */
 extern void device_tree_parse(uint64_t);/* kernel/devicetree.c      */
 extern int  detect_nr_cpus(void);       /* kernel/devicetree.c      */
@@ -37,6 +38,8 @@ extern void irq_init(void);             /* kernel/irq.c             */
 extern void timer_init(void);           /* kernel/timer.c           */
 extern void timer_init_cpu(void);       /* kernel/timer.c           */
 extern void pci_scan_bus(void);         /* kernel/pci.c (stub)      */
+
+extern int usb_init(void);
 extern void vfs_init(void);             /* kernel/vfs.c (stub)      */
 extern void filecore_init(void);        /* kernel/filecore.c (stub) */
 extern void net_init(void);             /* net/tcpip.c (stub)       */
@@ -70,123 +73,85 @@ void kernel_main(uint64_t dtb_ptr)
     
     /* Now we can use GPIO/UART/Mailbox with correct addresses */
     extern void led_signal_boot_ok(void);
-    led_signal_boot_ok();  /* 3 blinks = boot.S → kernel_main OK */
+    led_signal_boot_ok();
 
-    /* Belt-and-suspenders: ensure UART is initialised even if boot.S
-     * forgot to call uart_init() before branching here.           */
     uart_init();
 
-    /* LED diagnostic: prove C code reached (VISUAL confirmation) */
     extern void led_signal_kernel_main(void);
     led_signal_kernel_main();
 
-    /* UART is already up – first messages go to serial immediately  */
     debug_print("\n");
     debug_print("========================================\n");
     debug_print("  RISC OS Phoenix Kernel Starting\n");
     debug_print("========================================\n\n");
 
-    /* -------------------------------------------------------------- */
-    /* 1. VIDEO – bring up framebuffer so all subsequent messages     */
-    /*    appear BOTH on serial AND on screen.                        */
-    /* -------------------------------------------------------------- */
+    /* [1/9] GPU / framebuffer */
     debug_print("[1/9] GPU / framebuffer...\n");
     gpu_init();
-    /* From here on debug_print() mirrors to screen console too      */
 
-    /* -------------------------------------------------------------- */
-    /* 2. Device tree – find RAM size, CPU count, peripherals         */
-    /* -------------------------------------------------------------- */
+    /* [2/9] Device tree */
     debug_print("[2/9] Device tree (DTB at 0x%llx)...\n", dtb_ptr);
     device_tree_parse(dtb_ptr);
     nr_cpus = detect_nr_cpus();
     debug_print("      CPUs detected: %d\n", nr_cpus);
 
-    /* -------------------------------------------------------------- */
-    /* 3. MMU – identity-map kernel, set up page tables               */
-    /* -------------------------------------------------------------- */
+    /* [3/9] MMU */
     debug_print("[3/9] MMU (boot.s)...\n");
-    /*mmu_init();
 
-    /* -------------------------------------------------------------- */
-    /* 4. Scheduler                                                    */
-    /* -------------------------------------------------------------- */
-    debug_print("[4/9] Scheduler...\n");
-    // After scheduler is done...
-	debug_print("Scheduler initialized for 4 CPUs\n");
-
-	// ← ADD THIS:
-	debug_print("\n[5/9] Memory management...\n");
-	debug_print("Heap ready\n");
-
-	debug_print("[6/9] Interrupt system...\n");
-	irq_init();
-	debug_print("IRQ ready\n");
-
-	debug_print("[7/9] PCI bus...\n");
-	pci_init();
-	debug_print("PCI ready\n");
-
-	debug_print("\n[9/9] Boot complete!\n");
-
-	while (1) {
-	    asm volatile("wfi");
-}
+    /// [4/9] Scheduler... (temporarily disabled)
+	#if 0  // Re-enable when scheduler is ready
+	debug_print("[4/9] Scheduler...\n");
+	debug_print("  Calling sched_init()...\n");
 	sched_init();
-    sched_init_cpu(0);
+	debug_print("  sched_init() done\n");
+	debug_print("  Calling sched_init_cpu(0)...\n");
+	sched_init_cpu(0);
+	debug_print("  sched_init_cpu(0) done\n");
+	debug_print("Scheduler initialized for %d CPUs\n\n", nr_cpus);
+	#endif
+   
+ /* [5/9] Memory management */
+    debug_print("\n[5/9] Memory management...\n");
+    debug_print("Heap ready\n");
 
-    /* -------------------------------------------------------------- */
-    /* 5. Interrupt controller (GIC)                                  */
-    /* -------------------------------------------------------------- */
-    debug_print("[5/9] IRQ controller...\n");
+    /* [6/9] Interrupt system */
+    debug_print("[6/9] Interrupt system...\n");
     irq_init();
+    debug_print("IRQ ready\n");
 
-    /* -------------------------------------------------------------- */
-    /* 6. Timer                                                        */
-    /* -------------------------------------------------------------- */
-    debug_print("[6/9] Timer...\n");
-    timer_init();
-    timer_init_cpu();
-
-    /* -------------------------------------------------------------- */
-    /* 7. Storage (PCI/NVMe/FileCore)                                 */
-    /* -------------------------------------------------------------- */
-    debug_print("[7/9] Storage...\n");
-    pci_scan_bus();
-    vfs_init();
-    filecore_init();
-
-    /* -------------------------------------------------------------- */
-    /* 8. Network                                                      */
-    /* -------------------------------------------------------------- */
-    debug_print("[8/9] Network...\n");
-    net_init();
-
-    /* -------------------------------------------------------------- */
-    /* 9. Signals                                                      */
-    /* -------------------------------------------------------------- */
-    debug_print("[9/9] Signal handlers...\n");
-    register_default_handlers();
-
-    /* -------------------------------------------------------------- */
-    /* Done – print banner and launch init task                        */
-    /* -------------------------------------------------------------- */
-    debug_print("\n");
+   /* [7/9] PCI bus - TEST 3: Just enable bridge */
+    debug_print("\n[7/9] PCI bus...\n");
     debug_print("========================================\n");
-    debug_print("  RISC OS Phoenix Kernel Ready!\n");
+    debug_print("  TEST 3: Re-Enable PCIe Bridge\n");
+    debug_print("  (VL805 already initialized by firmware)\n");
+    debug_print("========================================\n");
+    
+    /* Don't touch VL805 - firmware already did it! */
+    debug_print("[TEST3] Skipping VL805 init - firmware did it\n");
+    
+    /* Just re-enable the bridge */
+    debug_print("[TEST3] Re-enabling PCIe bridge...\n");
+    // Skip bridge init - firmware already did it!
+    
+    /* Scan */
+    debug_print("[TEST3] Scanning bus...\n");
+    pci_init();
+    debug_print("PCI ready\n");
+
+    debug_print("\n[8/9] USB subsystem...\n");
+    usb_init();
+    debug_print("USB ready\n");
+
+    debug_print("\n========================================\n");
+    debug_print("  Boot complete!\n");
     debug_print("========================================\n\n");
 
-    task_t *init_task = task_create("init", init_process, 10, 0);
-    if (!init_task) {
-        debug_print("FATAL: Cannot create init task (errno=%d)\n", errno);
-        halt_system();
+    /* Enter idle loop */
+    while (1) {
+        asm volatile("wfi");
     }
-
-    current_task = init_task;
-    schedule();   /* never returns */
-
-    while (1) __asm__ volatile ("wfi");
 }
+
 
 /* ------------------------------------------------------------------ */
 /* init_process - first user-space task                               */
