@@ -96,60 +96,65 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("      CPUs detected: %d\n", nr_cpus);
 
     /* [3/9] MMU */
-    debug_print("[3/9] MMU (boot.s)...\n");
+    debug_print("[3/9] MMU...\n");
+    mmu_init();
+    debug_print("MMU ready\n");
 
-    /// [4/9] Scheduler... (temporarily disabled)
-	#if 0  // Re-enable when scheduler is ready
-	debug_print("[4/9] Scheduler...\n");
-	debug_print("  Calling sched_init()...\n");
-	sched_init();
-	debug_print("  sched_init() done\n");
-	debug_print("  Calling sched_init_cpu(0)...\n");
-	sched_init_cpu(0);
-	debug_print("  sched_init_cpu(0) done\n");
-	debug_print("Scheduler initialized for %d CPUs\n\n", nr_cpus);
-	#endif
-   
- /* [5/9] Memory management */
+    /* [4/9] Scheduler — data structures only, no tasks yet.
+     * task_create() uses spin_lock_irqsave which restores DAIF, potentially
+     * unmasking IRQs before the GIC is ready. Defer sched_init_cpu until
+     * after irq_init().                                                     */
+    debug_print("[4/9] Scheduler...\n");
+    sched_init();
+    debug_print("Scheduler data structures ready\n");
+
+    /* [5/9] Memory management */
     debug_print("\n[5/9] Memory management...\n");
+    heap_stats();
     debug_print("Heap ready\n");
 
-    /* [6/9] Interrupt system */
+    /* [6/9] Interrupt system — must come before any task_create call */
     debug_print("[6/9] Interrupt system...\n");
     irq_init();
-    debug_print("IRQ ready\n");
+    timer_init();
+    timer_init_cpu();
+    debug_print("IRQ/Timer ready\n");
 
-   /* [7/9] PCI bus - TEST 3: Just enable bridge */
+    /* Now safe to create the idle task (IRQs are masked/managed) */
+    debug_print("Creating idle task...\n");
+    sched_init_cpu(0);
+    debug_print("sched_init_cpu returned OK\n");
+    debug_print("Scheduler initialized for %d CPUs\n\n", nr_cpus);
+
+    /* [7/9] PCI bus */
     debug_print("\n[7/9] PCI bus...\n");
-    debug_print("========================================\n");
-    debug_print("  TEST 3: Re-Enable PCIe Bridge\n");
-    debug_print("  (VL805 already initialized by firmware)\n");
-    debug_print("========================================\n");
-    
-    /* Don't touch VL805 - firmware already did it! */
-    debug_print("[TEST3] Skipping VL805 init - firmware did it\n");
-    
-    /* Just re-enable the bridge */
-    debug_print("[TEST3] Re-enabling PCIe bridge...\n");
-    // Skip bridge init - firmware already did it!
-    
-    /* Scan */
-    debug_print("[TEST3] Scanning bus...\n");
     pci_init();
     debug_print("PCI ready\n");
 
+    /* [8/9] USB subsystem */
     debug_print("\n[8/9] USB subsystem...\n");
     usb_init();
     debug_print("USB ready\n");
 
+    /* [9/9] VFS + Network + Signals */
+    debug_print("\n[9/9] VFS / Network / Signals...\n");
+    vfs_init();
+    filecore_init();
+    net_init();
+    register_default_handlers();
+    debug_print("Subsystems ready\n");
+
     debug_print("\n========================================\n");
-    debug_print("  Boot complete!\n");
+    debug_print("  Boot complete – launching init\n");
     debug_print("========================================\n\n");
 
-    /* Enter idle loop */
-    while (1) {
-        asm volatile("wfi");
-    }
+    /* Create the init task and start scheduling */
+    task_create("init", init_process, TASK_MAX_PRIORITY, (1ULL << 0));
+    schedule();
+
+    /* Should never reach here */
+    halt_system();
+    while (1) { asm volatile("wfi"); }
 }
 
 

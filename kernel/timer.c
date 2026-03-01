@@ -50,14 +50,25 @@ void timer_init_cpu(void) {
     timer_lists[cpu] = NULL;
     spinlock_init(&timer_locks[cpu]);
     
-    // Enable timer interrupt
-    uint32_t ctl;
-    __asm__ volatile ("mrs %0, cntp_ctl_el0" : "=r"(ctl));
-    ctl |= 1;  // Enable timer
+    /* NOTE: We deliberately do NOT enable the physical timer interrupt here.
+     * The GIC (Generic Interrupt Controller) has not been configured yet —
+     * irq_init() is currently a stub.  Arming the timer before the GIC is
+     * ready causes a spurious IRQ exception that halts the kernel.
+     *
+     * Once irq_init() properly configures the GIC distributor and CPU
+     * interface, re-enable these lines:
+     *
+     *   uint32_t ctl;
+     *   __asm__ volatile ("mrs %0, cntp_ctl_el0" : "=r"(ctl));
+     *   ctl |= 1;  // ENABLE bit
+     *   __asm__ volatile ("msr cntp_ctl_el0, %0" :: "r"(ctl));
+     *   __asm__ volatile ("msr cntp_tval_el0, %0"
+     *       :: "r"(ns_to_ticks(TICK_INTERVAL * 1000000ULL)));
+     *
+     * For now, make sure the timer is masked (IMASK bit set, ENABLE clear).
+     */
+    uint32_t ctl = 0x2;  /* IMASK=1, ENABLE=0 — timer masked and disabled */
     __asm__ volatile ("msr cntp_ctl_el0, %0" :: "r"(ctl));
-    
-    // Set initial tick
-    __asm__ volatile ("msr cntp_tval_el0, %0" :: "r"(ns_to_ticks(TICK_INTERVAL * 1000000ULL)));
     
     debug_print("Timer initialized for CPU %d\n", cpu);
 }

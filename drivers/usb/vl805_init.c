@@ -1,193 +1,108 @@
-/**
- * @file drivers/usb/vl805_init.c
- * @brief VL805 USB Controller Initialization
- * 
- * The Pi 4 firmware normally loads vl805.bin to initialize the USB controller.
- * If that's missing, we can initialize it ourselves by writing to the mailbox.
- * 
- * @author Phoenix RISC OS Team
- * @since v56
+/*
+ * vl805_init.c – VL805 xHCI firmware init via VideoCore mailbox
+ *
+ * The Pi 4 bootloader normally loads vl805.bin to the VL805 via the
+ * VideoCore before handing off to the kernel.  If that doesn't happen
+ * (vl805.bin missing from SD, or we're doing our own boot), the xHCI
+ * registers read as garbage until we tell the VC firmware to initialise
+ * the controller via mailbox tag 0x00030058 (NOTIFY_XHCI_RESET).
+ *
+ * Mailbox buffer addresses sent to the GPU must use the ARM→GPU bus alias:
+ * GPU_addr = (ARM_phys & 0x3FFFFFFF) | 0xC0000000
+ *
+ * Author: R Andrews – 27 Feb 2026
  */
 
 #include "kernel.h"
 
-/* Mailbox channels */
-#define MAILBOX_CHANNEL_PROPERTY  8
+extern void uart_puts(const char *s);
+extern void uart_putc(char c);
 
-/* Mailbox tags */
-#define MAILBOX_TAG_SET_DEVICE_POWER  0x00028001
-#define MAILBOX_TAG_NOTIFY_XHCI_RESET 0x00030058
+/* ── Peripheral addresses ──────────────────────────────────────── */
+#define PI4_PERIPH_BASE     0xFE000000ULL
+#define MBOX_BASE           (PI4_PERIPH_BASE + 0xB880)
 
-/* VL805 USB controller device ID */
-#define DEVICE_ID_USB_HCD  3
+#define MBOX_READ_REG       0x00
+#define MBOX_STATUS_REG     0x18
+#define MBOX_WRITE_REG      0x20
 
-/* Power states */
-#define POWER_STATE_OFF    (0 << 0)
-#define POWER_STATE_ON     (1 << 0)
-#define POWER_STATE_WAIT   (1 << 1)
+#define MBOX_FULL           0x80000000U
+#define MBOX_EMPTY          0x40000000U
+#define MBOX_CHAN_PROP      8
 
-/**
- * @brief Mailbox property buffer (must be 16-byte aligned)
- */
-static volatile uint32_t __attribute__((aligned(16))) mailbox_buffer[256];
+/* ── Low-level mailbox ─────────────────────────────────────────── */
 
-/**
- * @brief Write to mailbox
- */
-static void mailbox_write(uint32_t channel, uint32_t data)
+static void mbox_write(uint32_t chan, uint32_t gpu_addr)
 {
-    extern uint64_t peripheral_base;
-    volatile uint32_t *mailbox = (volatile uint32_t *)(peripheral_base + 0xB880);
-    
-    /* Wait until we can write */
-    while (mailbox[6] & 0x80000000) {
-        asm volatile("nop");
-    }
-    
-    /* Write data + channel */
-    mailbox[8] = (data & 0xFFFFFFF0) | (channel & 0xF);
+    volatile uint32_t *status = (volatile uint32_t *)(MBOX_BASE + MBOX_STATUS_REG);
+    volatile uint32_t *write  = (volatile uint32_t *)(MBOX_BASE + MBOX_WRITE_REG);
+    while (*status & MBOX_FULL) asm volatile("nop");
+    asm volatile("dmb sy" ::: "memory");
+    *write = (gpu_addr & ~0xFU) | (chan & 0xFU);
 }
 
-/**
- * @brief Read from mailbox
- */
-static uint32_t mailbox_read(uint32_t channel)
+static uint32_t mbox_read(uint32_t chan)
 {
-    extern uint64_t peripheral_base;
-    volatile uint32_t *mailbox = (volatile uint32_t *)(peripheral_base + 0xB880);
-    
+    volatile uint32_t *status = (volatile uint32_t *)(MBOX_BASE + MBOX_STATUS_REG);
+    volatile uint32_t *read   = (volatile uint32_t *)(MBOX_BASE + MBOX_READ_REG);
     while (1) {
-        /* Wait for data */
-        while (mailbox[6] & 0x40000000) {
-            asm volatile("nop");
-        }
-        
-        uint32_t data = mailbox[0];
-        
-        /* Check if it's for our channel */
-        if ((data & 0xF) == channel) {
-            return data & 0xFFFFFFF0;
-        }
+        while (*status & MBOX_EMPTY) asm volatile("nop");
+        asm volatile("dmb sy" ::: "memory");
+        uint32_t v = *read;
+        if ((v & 0xFU) == chan) return v & ~0xFU;
     }
 }
 
-/**
- * @brief Send property message to mailbox
- */
-static int mailbox_property(void *buf)
+static int mbox_property(volatile uint32_t *buf)
 {
-    uint32_t addr = virt_to_phys(buf);
-    
-    /* Ensure buffer is written to memory */
+    uint32_t arm_phys = (uint32_t)((uintptr_t)buf & 0xFFFFFFFFU);
+    if (arm_phys & 0xFU) { uart_puts("[MBOX] not aligned\n"); return -1; }
+    uint32_t gpu_addr = (arm_phys & 0x3FFFFFFFU) | 0xC0000000U;
+
+    buf[1] = 0;
     asm volatile("dmb sy" ::: "memory");
-    
-    /* Write to mailbox */
-    mailbox_write(MAILBOX_CHANNEL_PROPERTY, addr);
-    
-    /* Read response */
-    uint32_t response = mailbox_read(MAILBOX_CHANNEL_PROPERTY);
-    
-    /* Ensure we read the response */
+    mbox_write(MBOX_CHAN_PROP, gpu_addr);
+    (void)mbox_read(MBOX_CHAN_PROP);
     asm volatile("dmb sy" ::: "memory");
-    
-    /* Check if request was successful */
-    volatile uint32_t *buf32 = (volatile uint32_t *)buf;
-    if (buf32[1] != 0x80000000) {
+
+    if (buf[1] != 0x80000000U) {
+        uart_puts("[MBOX] call failed code=");
+        uint32_t c = buf[1];
+        for (int i = 28; i >= 0; i -= 4) {
+            int n = (c >> i) & 0xF;
+            uart_putc(n < 10 ? '0' + n : 'a' + n - 10);
+        }
+        uart_puts("\n");
         return -1;
     }
-    
     return 0;
 }
 
-/**
- * @brief Power on VL805 USB controller
- */
-static int vl805_power_on(void)
-{
-    mailbox_buffer[0] = 8 * 4;  /* Buffer size */
-    mailbox_buffer[1] = 0;      /* Request */
-    
-    /* Tag: Set device power */
-    mailbox_buffer[2] = MAILBOX_TAG_SET_DEVICE_POWER;
-    mailbox_buffer[3] = 8;      /* Value buffer size */
-    mailbox_buffer[4] = 8;      /* Request size */
-    mailbox_buffer[5] = DEVICE_ID_USB_HCD;
-    mailbox_buffer[6] = POWER_STATE_ON | POWER_STATE_WAIT;
-    
-    /* End tag */
-    mailbox_buffer[7] = 0;
-    
-    if (mailbox_property((void *)mailbox_buffer) < 0) {
-        debug_print("[VL805] Failed to power on USB controller\n");
-        return -1;
-    }
-    
-    /* Check power state */
-    if ((mailbox_buffer[6] & POWER_STATE_ON) == 0) {
-        debug_print("[VL805] USB controller did not power on\n");
-        return -1;
-    }
-    
-    debug_print("[VL805] USB controller powered on\n");
-    return 0;
-}
+/* ── VL805 init ────────────────────────────────────────────────── */
 
-/**
- * @brief Notify firmware that we're resetting xHCI
- */
-static int vl805_notify_xhci_reset(uint32_t pci_addr)
-{
-    mailbox_buffer[0] = 7 * 4;  /* Buffer size */
-    mailbox_buffer[1] = 0;      /* Request */
-    
-    /* Tag: Notify xHCI reset */
-    mailbox_buffer[2] = MAILBOX_TAG_NOTIFY_XHCI_RESET;
-    mailbox_buffer[3] = 4;      /* Value buffer size */
-    mailbox_buffer[4] = 4;      /* Request size */
-    mailbox_buffer[5] = pci_addr;
-    
-    /* End tag */
-    mailbox_buffer[6] = 0;
-    
-    if (mailbox_property((void *)mailbox_buffer) < 0) {
-        debug_print("[VL805] Failed to notify xHCI reset\n");
-        return -1;
-    }
-    
-    debug_print("[VL805] Notified firmware of xHCI reset\n");
-    return 0;
-}
-
-/**
- * @brief Initialize VL805 USB controller
- * 
- * This must be called BEFORE scanning the PCI bus.
- * The firmware normally does this with vl805.bin, but we can do it manually.
- * 
- * @return 0 on success, negative on error
- * @since v56
- */
 int vl805_init(void)
 {
-    debug_print("[VL805] Initializing USB controller via mailbox\n");
-    
-    /* Power on the USB controller */
-    if (vl805_power_on() < 0) {
+    uart_puts("[VL805] Requesting firmware via mailbox 0x00030058...\n");
+
+    static volatile uint32_t __attribute__((aligned(16))) buf[8];
+    buf[0] = 8 * 4;
+    buf[1] = 0;
+    buf[2] = 0x00030058U;   /* NOTIFY_XHCI_RESET */
+    buf[3] = 4;
+    buf[4] = 4;
+    buf[5] = 0;             /* PCIe function addr: 0 = auto */
+    buf[6] = 0;
+    buf[7] = 0;
+
+    if (mbox_property(buf) < 0) {
+        uart_puts("[VL805] Firmware load failed\n");
         return -1;
     }
-    
-   /* Wait for controller to be ready - needs ~100ms */
-debug_print("[VL805] Waiting for PCIe link...\n");
-for (volatile int i = 0; i < 10000000; i++) {  // 10x longer!
-    asm volatile("nop");
-}
-debug_print("[VL805] Wait complete\n");
-    
-    /* Notify that we'll be resetting it */
-    /* PCI address: bus=1, device=0, function=0 */
-    uint32_t pci_addr = (1 << 20) | (0 << 15) | (0 << 12);
-    vl805_notify_xhci_reset(pci_addr);
-    
-    debug_print("[VL805] Initialization complete\n");
+
+    uart_puts("[VL805] Firmware loaded OK\n");
+
+    /* VL805 needs ~100ms to come out of reset */
+    for (volatile int i = 0; i < 1000000; i++) asm volatile("nop");
+
     return 0;
 }

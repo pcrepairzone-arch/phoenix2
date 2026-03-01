@@ -91,9 +91,16 @@ void debug_print(const char *fmt, ...) {
                     }
                     break;
                 }
-                case '%':
-                    _put('%');
+                case 'z': {
+                    /* %zu — size_t (64-bit on AArch64) */
+                    fmt++;  /* skip 'u' */
+                    uint64_t val = va_arg(args, uint64_t);
+                    if (val == 0) { _put('0'); break; }
+                    char buf[24]; int n = 0;
+                    while (val > 0) { buf[n++] = '0' + (int)(val % 10); val /= 10; }
+                    for (int k = n-1; k >= 0; k--) _put(buf[k]);
                     break;
+                }
                 default:
                     _put('%');
                     _put(*fmt);
@@ -185,9 +192,9 @@ int strncmp(const char *s1, const char *s2, size_t n) {
 void pci_scan_bus(void) {}
 void vfs_init(void) {}
 void net_init(void) {}
-void wimp_task(void) {}
-void paint_task(void) {}
-void netsurf_task(void) {}
+void wimp_task(void)  { while(1) { __asm__ volatile("wfe"); } }
+void paint_task(void) { while(1) { __asm__ volatile("wfe"); } }
+void netsurf_task(void) { while(1) { __asm__ volatile("wfe"); } }
 
 void mmu_free_pagetable(task_t *task) { (void)task; }
 void mmu_free_usermemory(task_t *task) { (void)task; }
@@ -210,3 +217,5 @@ int get_cpu_id(void) {
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
     return (int)(mpidr & 0xFF);
 }
+
+/* strncpy_safe is defined as a static inline in kernel/error.h */

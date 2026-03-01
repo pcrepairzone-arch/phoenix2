@@ -1,7 +1,8 @@
 /*
  * spinlock.c – Spinlock Implementation for RISC OS Phoenix
- * Simple ticket spinlock with interrupt save/restore for SMP safety
+ * Simple test-and-set spinlock with interrupt save/restore for SMP safety
  * Author: Grok 4 – 06 Feb 2026
+ * Fixed: 27 Feb 2026 - separate registers for ldaxr value and stxr status
  */
 
 #include "kernel.h"
@@ -16,68 +17,57 @@ void spinlock_init(spinlock_t *lock)
 /* Acquire spinlock and save current interrupt state (DAIF) */
 void spin_lock_irqsave(spinlock_t *lock, unsigned long *flags)
 {
-    unsigned long temp;
-
-    /* Save current interrupt state */
+    /* Save current interrupt state then disable IRQ+FIQ */
     __asm__ volatile ("mrs %0, daif" : "=r"(*flags));
-
-    /* Disable interrupts (IRQ and FIQ) */
     __asm__ volatile ("msr daifset, #3" ::: "memory");
 
-    /* Acquire the spinlock using test-and-set */
+    /* Acquire spinlock: %w0=loaded value, %w1=stxr status (separate regs) */
+    uint32_t loaded, status;
     do {
         __asm__ volatile (
-            "ldaxr %w0, [%1]\n"
-            "cmp %w0, #0\n"
-            "b.ne 1f\n"
-            "mov %w0, #1\n"
-            "stxr %w2, %w0, [%1]\n"
-            "1:"
-            : "=&r"(temp), "+r"(lock->value), "=&r"(temp)
-            :
+            "ldaxr  %w0, [%2]\n"   /* exclusive load                     */
+            "cbnz   %w0, 1f\n"     /* if non-zero: lock held, retry       */
+            "mov    %w0, #1\n"     /* prepare value to store              */
+            "stxr   %w1, %w0, [%2]\n" /* attempt store; status→%w1       */
+            "b      2f\n"
+            "1: mov %w1, #1\n"     /* lock held: force status=1 to retry  */
+            "2:"
+            : "=&r"(loaded), "=&r"(status)
+            : "r"(&lock->value)
             : "memory"
         );
-    } while (temp != 0);
+    } while (status != 0);
 }
 
 /* Release spinlock and restore previous interrupt state */
 void spin_unlock_irqrestore(spinlock_t *lock, unsigned long flags)
 {
-    /* Release the lock */
-    __asm__ volatile (
-        "stlr wzr, [%0]"
-        : : "r"(&lock->value) : "memory"
-    );
-
-    /* Restore previous interrupt state */
-    __asm__ volatile ("msr daif, %0" :: "r"(flags) : "memory");
+    __asm__ volatile ("stlr wzr, [%0]" :: "r"(&lock->value) : "memory");
+    __asm__ volatile ("msr daif, %0"   :: "r"(flags)        : "memory");
 }
 
 /* Simple spinlock acquire (no interrupt save) */
 void spin_lock(spinlock_t *lock)
 {
-    unsigned long temp;
-
+    uint32_t loaded, status;
     do {
         __asm__ volatile (
-            "ldaxr %w0, [%1]\n"
-            "cmp %w0, #0\n"
-            "b.ne 1f\n"
-            "mov %w0, #1\n"
-            "stxr %w2, %w0, [%1]\n"
-            "1:"
-            : "=&r"(temp), "+r"(lock->value), "=&r"(temp)
-            :
+            "ldaxr  %w0, [%2]\n"
+            "cbnz   %w0, 1f\n"
+            "mov    %w0, #1\n"
+            "stxr   %w1, %w0, [%2]\n"
+            "b      2f\n"
+            "1: mov %w1, #1\n"     /* lock held: status=1 → retry */
+            "2:"
+            : "=&r"(loaded), "=&r"(status)
+            : "r"(&lock->value)
             : "memory"
         );
-    } while (temp != 0);
+    } while (status != 0);
 }
 
 /* Simple spinlock release */
 void spin_unlock(spinlock_t *lock)
 {
-    __asm__ volatile (
-        "stlr wzr, [%0]"
-        : : "r"(&lock->value) : "memory"
-    );
+    __asm__ volatile ("stlr wzr, [%0]" :: "r"(&lock->value) : "memory");
 }

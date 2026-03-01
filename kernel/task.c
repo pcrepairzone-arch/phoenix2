@@ -11,13 +11,16 @@
 #include "errno.h"
 #include "error.h"
 
-#define KERNEL_STACK_SIZE   (16 * 1024)
+#define KERNEL_STACK_SIZE   (32 * 1024)
 #define USER_STACK_SIZE     (8 * 1024 * 1024)
 
 static volatile int next_pid = 1;
 
 task_t *task_create(const char *name, void (*entry)(void), int priority, uint64_t cpu_affinity)
 {
+    extern void uart_puts(const char *s);
+    uart_puts("[TC] enter\r\n");
+
     /* Validate parameters */
     if (!name || !entry) {
         errno = EINVAL;
@@ -25,6 +28,7 @@ task_t *task_create(const char *name, void (*entry)(void), int priority, uint64_
                    name, entry);
         return NULL;
     }
+    uart_puts("[TC] kmalloc task\r\n");
 
     task_t *task = kmalloc(sizeof(task_t));
     if (!task) {
@@ -32,6 +36,7 @@ task_t *task_create(const char *name, void (*entry)(void), int priority, uint64_
         debug_print("ERROR: task_create - failed to allocate task structure\n");
         return NULL;
     }
+    uart_puts("[TC] kmalloc kstack\r\n");
 
     uint8_t *kernel_stack = kmalloc(KERNEL_STACK_SIZE);
     if (!kernel_stack) {
@@ -40,17 +45,28 @@ task_t *task_create(const char *name, void (*entry)(void), int priority, uint64_
         kfree(task);
         return NULL;
     }
+    uart_puts("[TC] user stack check\r\n");
 
-    uint8_t *user_stack = kmalloc(USER_STACK_SIZE);
-    if (!user_stack) {
-        errno = ENOMEM;
-        debug_print("ERROR: task_create - failed to allocate user stack\n");
-        kfree(kernel_stack);
-        kfree(task);
-        return NULL;
+    uint8_t *user_stack = NULL;
+    /* Only allocate a user stack for tasks that will run at EL0.
+     * Kernel tasks (idle, etc.) have their entry point inside the kernel
+     * image (<1 GB physical), never drop to EL0, and don't need 8 MB of
+     * user-mode stack. This saves memory and avoids touching a huge region
+     * before the page allocator exists.                                    */
+    if ((uint64_t)entry >= 0x40000000ULL) {
+        user_stack = kmalloc(USER_STACK_SIZE);
+        if (!user_stack) {
+            errno = ENOMEM;
+            debug_print("ERROR: task_create - failed to allocate user stack\n");
+            kfree(kernel_stack);
+            kfree(task);
+            return NULL;
+        }
     }
 
+    uart_puts("[TC] memset task\r\n");
     memset(task, 0, sizeof(task_t));
+    uart_puts("[TC] strncpy\r\n");
     strncpy_safe(task->name, name, TASK_NAME_LEN);
     task->pid = __atomic_add_fetch(&next_pid, 1, __ATOMIC_SEQ_CST);
     task->priority = priority;
@@ -58,23 +74,25 @@ task_t *task_create(const char *name, void (*entry)(void), int priority, uint64_
     task->cpu_affinity = cpu_affinity ? cpu_affinity : (1ULL << get_cpu_id());
 
     task->stack_top = (uint64_t)(kernel_stack + KERNEL_STACK_SIZE);
-    task->sp_el0 = (uint64_t)(user_stack + USER_STACK_SIZE);
+    task->sp_el0 = user_stack ? (uint64_t)(user_stack + USER_STACK_SIZE) : 0;
 
     memset(task->regs, 0, sizeof(task->regs));
     task->regs[0] = 0;
     task->elr_el1 = (uint64_t)entry;
     task->spsr_el1 = 0;
 
+    uart_puts("[TC] mmu_init_task\r\n");
     mmu_init_task(task);
 
-    int cpu = __builtin_ctzll(task->cpu_affinity);
+    uart_puts("[TC] enqueue\r\n");
+    int cpu = (int)__builtin_ctzll(task->cpu_affinity);
+    if (cpu >= MAX_CPUS) cpu = 0;   /* guard against affinity=0 or out-of-range */
     cpu_sched_t *sched = &cpu_sched[cpu];
-    unsigned long flags;
-    spin_lock_irqsave(&sched->lock, &flags);
+    spin_lock(&sched->lock);
     enqueue_task(sched, task);
-    spin_unlock_irqrestore(&sched->lock, flags);
+    spin_unlock(&sched->lock);
 
-    debug_print("Task created: '%s' PID=%d on CPU %d\n", task->name, task->pid, cpu);
+    uart_puts("[TC] done\r\n");
 
     return task;
 }

@@ -1,8 +1,34 @@
 /*
- * mmu.c – Full AArch64 Memory Management Unit for RISC OS Phoenix
- * Includes page table management, mapping, faults, copy-on-write, TLB management
- * Author: R Andrews Grok 4 – 26 Nov 2025
- * Updated: 15 Feb 2026 - Added error handling
+ * mmu.c – AArch64 MMU for RISC OS Phoenix
+ *
+ * Design: flat identity map, MMU + caches on, no per-task page tables yet.
+ *
+ * ARM architecture note (DDI0487, Table D5-11):
+ *   With 4 KB granule and T0SZ = 25 (39-bit VA), the translation walk
+ *   starts at LEVEL 1.  TTBR0 must point directly to a 512-entry L1
+ *   table where each entry is a 1 GB block descriptor.
+ *   Adding an extra L0→L1 indirection causes an immediate translation
+ *   fault when the MMU is enabled — that was the previous hang.
+ *
+ * Pi 4 memory map (physical):
+ *   0x000000000 –  0x0FFFFFFFF  4 GB RAM          Normal WB
+ *   0x0C0000000 –  0x0EFFFFFFF  (within 4th GB)   Normal WB
+ *   0x0F0000000 –  0x0FFFFFFFF  peripherals zone   Device nGnRnE
+ *     └ Pi 4 UART/GPIO/mailbox base: 0xFE000000
+ *   0x600000000                 Pi 4 VL805 BAR0    Device nGnRnE  (L1 index 24)
+ *
+ * Pi 5 additions:
+ *   0x107C000000               Pi 5 peripherals    Device nGnRnE  (L1 index 65)
+ *   0x1F00000000               Pi 5 PCIe RC        Device nGnRnE  (L1 index 124)
+ *
+ * MAIR_EL1:
+ *   index 0 = 0xFF  Normal memory (WB/WA, inner+outer)
+ *   index 1 = 0x00  Device nGnRnE
+ *
+ * TCR_EL1:
+ *   T0SZ = 25  → 39-bit VA, initial walk at L1
+ *   IPS  = 010 → 40-bit physical address (covers 0x600000000)
+ *   4 KB granules, WB+WA cacheable walks, inner-shareable
  */
 
 #include "kernel.h"
@@ -11,328 +37,326 @@
 #include "error.h"
 #include <stdint.h>
 
-/* Forward declarations */
-static uint64_t *pt_alloc_level(void);
-static uint64_t phys_alloc_page(void);
-static void phys_free_page(uint64_t page);
-static uint64_t *mmu_walk_pte(task_t *task, uint64_t va, int create);
-static void pt_free(uint64_t *l0);
-void page_ref_inc(uint64_t phys);
-void mmu_tlb_invalidate_all(void);
-void mmu_tlb_invalidate_addr(uint64_t virt, uint64_t size);
-void mmu_map_kernel(uint64_t virt, uint64_t size, int prot);
-// // #include <string.h> /* removed - use kernel.h */ /* removed - use kernel.h */
+/* ── Constants ───────────────────────────────────────────────────── */
 
-/* Page table definitions – 4KB granules, 48-bit VA */
-#define PAGE_SHIFT      12
-#define PAGE_SIZE       (1ULL << PAGE_SHIFT)
-#define PAGE_MASK       (~(PAGE_SIZE - 1))
+#define PAGE_SHIFT   12
+#ifndef PAGE_SIZE
+#define PAGE_SIZE    (1ULL << PAGE_SHIFT)
+#endif
+#ifndef PAGE_MASK
+#define PAGE_MASK    (~(PAGE_SIZE - 1ULL))
+#endif
+#define PT_ENTRIES   512
+#define GB           (1ULL << 30)
 
-#define PT_ENTRIES      512
-
-#define L0_SHIFT        39
-#define L1_SHIFT        30
-#define L2_SHIFT        21
-#define L3_SHIFT        12
-
-/* PTE attributes */
+/* AArch64 block/page descriptor bits */
 #define PTE_VALID       (1ULL << 0)
-#define PTE_TABLE       (1ULL << 1)
-#define PTE_BLOCK       (0ULL)
-#define PTE_PAGE        (1ULL << 1)  // For L3
-#define PTE_AF          (1ULL << 10) // Access flag
-#define PTE_SH_INNER    (3ULL << 8)  // Inner shareable
-#define PTE_USER        (1ULL << 6)  // Privileged execute never
-#define PTE_PXN         (1ULL << 53) // Privileged execute never
-#define PTE_UXN         (1ULL << 54) // User execute never
-#define PTE_RO          (1ULL << 7)  // Read-only (AP[1]=1)
-#define PTE_RW          (0ULL << 7)  // Read-write
-#define PTE_COW         (1ULL << 55) // Custom COW bit (unused in AArch64)
+#define PTE_BLOCK       (0ULL << 1)   /* L1/L2 block entry          */
+#define PTE_TABLE       (1ULL << 1)   /* table pointer              */
+#define PTE_PAGE        (1ULL << 1)   /* L3 page entry              */
+#define PTE_ATTRINDX(n) ((uint64_t)(n) << 2)
+#define PTE_AP_RW       (0ULL << 6)
+#define PTE_SH_INNER    (3ULL << 8)
+#define PTE_SH_OUTER    (2ULL << 8)
+#define PTE_AF          (1ULL << 10)
+#define PTE_PXN         (1ULL << 53)
+#define PTE_UXN         (1ULL << 54)
 
-/* Protection flags */
-#define PROT_NONE       0
-#define PROT_READ       1
-#define PROT_WRITE      2
-#define PROT_EXEC       4
+/* MAIR indices */
+#define MAIR_NORMAL  0   /* Normal WB cacheable */
+#define MAIR_DEVICE  1   /* Device nGnRnE       */
 
-/* Global kernel page table – mapped at boot */
-static uint64_t *kernel_pgt_l0;
+#define MAIR_VALUE   ((0xFFULL << (MAIR_NORMAL * 8)) | \
+                      (0x00ULL << (MAIR_DEVICE * 8)))
 
-/* Physical memory allocator stub */
-static uint64_t phys_alloc_page(void) {
-    void *ptr = kmalloc(PAGE_SIZE);
-    if (!ptr) return 0;  // Return 0 on failure
-    // TODO: Implement real physical allocator
-    // For now, use virtual address as physical (identity mapping)
-    return (uint64_t)ptr;
-}
+/* TCR_EL1 */
+#define TCR_T0SZ    (25ULL << 0)    /* 39-bit VA, walk starts at L1 */
+#define TCR_IRGN0   (1ULL  << 8)    /* inner WB+WA                 */
+#define TCR_ORGN0   (1ULL  << 10)   /* outer WB+WA                 */
+#define TCR_SH0     (3ULL  << 12)   /* inner-shareable             */
+#define TCR_TG0     (0ULL  << 14)   /* 4 KB granule                */
+#define TCR_T1SZ    (25ULL << 16)   /* 39-bit kernel VA (unused)   */
+#define TCR_IRGN1   (1ULL  << 24)
+#define TCR_ORGN1   (1ULL  << 26)
+#define TCR_SH1     (3ULL  << 28)
+#define TCR_TG1     (2ULL  << 30)   /* 4 KB granule                */
+#define TCR_IPS     (2ULL  << 32)   /* 40-bit PA (1 TB)            */
+#define TCR_VALUE   (TCR_T0SZ | TCR_IRGN0 | TCR_ORGN0 | TCR_SH0 | TCR_TG0 | \
+                     TCR_T1SZ | TCR_IRGN1 | TCR_ORGN1 | TCR_SH1 | TCR_TG1 | \
+                     TCR_IPS)
 
-static void phys_free_page(uint64_t page) {
-    // TODO: Implement
-}
+/* Protection flags (public API) */
+#define PROT_NONE    0
+#define PROT_READ    1
+#define PROT_WRITE   2
+#define PROT_EXEC    4
 
-/* Allocate new page table level */
-static uint64_t *pt_alloc_level(void) {
-    uint64_t *pt = kmalloc(PAGE_SIZE);
-    if (!pt) {
-        errno = ENOMEM;
-        debug_print("ERROR: pt_alloc_level - failed to allocate page table\n");
-        return NULL;
-    }
-    memset(pt, 0, PAGE_SIZE);
-    return pt;
-}
+/* ── Static page tables ──────────────────────────────────────────── */
 
-/* Page table walker – traverses L0-L3 to find PTE for a VA */
-static uint64_t *mmu_walk_pte(task_t *task, uint64_t va, int create)
+/*
+ * l1_table: the SINGLE table TTBR0 points to.
+ *   With T0SZ=25, each entry covers 1 GB.  512 entries × 1 GB = 512 GB total.
+ *   All blocks are identity-mapped (VA == PA).
+ */
+static uint64_t l1_table[512] __attribute__((aligned(4096)));
+
+/*
+ * l2_periph4: splits the 3rd GB (0xC0000000–0xFFFFFFFF) into
+ *   2 MB blocks so we can mark 0xF0000000+ as Device.
+ *   Pi 4 peripherals sit at 0xFE000000 — inside this region.
+ */
+static uint64_t l2_periph4[512] __attribute__((aligned(4096)));
+
+/*
+ * l2_first_gb: splits the FIRST 1 GB (l1_table[0]) into 512 × 2 MB blocks.
+ *   Required so we can carve out a single 2 MB region containing the
+ *   .xhci_dma section and further split it into 4 KB pages.
+ *   All entries default to Normal WB; the entry covering .xhci_dma is
+ *   replaced with a TABLE pointer to l3_dma_2mb below.
+ */
+static uint64_t l2_first_gb[512] __attribute__((aligned(4096)));
+
+/*
+ * l3_dma_2mb: splits the 2 MB block that contains .xhci_dma into
+ *   512 × 4 KB pages.  Pages inside [__xhci_dma_start, __xhci_dma_end)
+ *   are marked Device nGnRnE (non-cacheable); all others are Normal WB.
+ *
+ *   This ensures the xHCI DMA ring buffers (DCBAA, command ring, event
+ *   ring, ERST) require NO explicit cache maintenance — the hardware
+ *   observes writes immediately without D-cache involvement.
+ */
+static uint64_t l3_dma_2mb[512] __attribute__((aligned(4096)));
+
+/*
+ * Linker-exported symbols bracketing the .xhci_dma section.
+ * Declared as zero-length arrays so taking their address gives the PA/VA.
+ */
+extern char __xhci_dma_start[];
+extern char __xhci_dma_end[];
+
+/* ── mmu_init ────────────────────────────────────────────────────── */
+
+void mmu_init(void)
 {
-    uint64_t *pgd = task->pgtable_l0;
-    uint64_t *pud, *pmd, *pte;
+    debug_print("[MMU] Building identity page tables...\n");
 
-    // L0
-    uint64_t idx = (va >> L0_SHIFT) & (PT_ENTRIES - 1);
-    if (!(pgd[idx] & PTE_VALID)) {
-        if (!create) return NULL;
-        pud = pt_alloc_level();
-        if (!pud) {
-            debug_print("ERROR: mmu_walk_pte - failed to allocate L1 table\n");
-            return NULL;
-        }
-        pgd[idx] = (uint64_t)pud | PTE_VALID | PTE_TABLE;
-    } else {
-        pud = (uint64_t*)(pgd[idx] & PAGE_MASK);
+    /* Zero all tables */
+    for (int i = 0; i < 512; i++) {
+        l1_table[i]   = 0;
+        l2_periph4[i] = 0;
+        l2_first_gb[i] = 0;
+        l3_dma_2mb[i]  = 0;
     }
 
-    // L1
-    idx = (va >> L1_SHIFT) & (PT_ENTRIES - 1);
-    if (!(pud[idx] & PTE_VALID)) {
-        if (!create) return NULL;
-        pmd = pt_alloc_level();
-        if (!pmd) {
-            debug_print("ERROR: mmu_walk_pte - failed to allocate L2 table\n");
-            return NULL;
-        }
-        pud[idx] = (uint64_t)pmd | PTE_VALID | PTE_TABLE;
-    } else {
-        pmd = (uint64_t*)(pud[idx] & PAGE_MASK);
+    /* ── Descriptor helpers ──────────────────────────────────────── */
+
+    /* 1 GB L1 block descriptor (Normal WB) */
+#define L1_NORMAL(pa)  ((pa) | PTE_VALID | PTE_BLOCK | PTE_AF | \
+                         PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NORMAL))
+    /* 1 GB L1 block descriptor (Device nGnRnE) */
+#define L1_DEVICE(pa)  ((pa) | PTE_VALID | PTE_BLOCK | PTE_AF | \
+                         PTE_SH_OUTER | PTE_AP_RW | PTE_ATTRINDX(MAIR_DEVICE) | \
+                         PTE_PXN | PTE_UXN)
+    /* 2 MB L2 block descriptor (Normal WB) */
+#define L2_NORMAL(pa)  ((pa) | PTE_VALID | PTE_BLOCK | PTE_AF | \
+                         PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NORMAL))
+    /* 2 MB L2 block descriptor (Device nGnRnE) */
+#define L2_DEVICE(pa)  ((pa) | PTE_VALID | PTE_BLOCK | PTE_AF | \
+                         PTE_SH_OUTER | PTE_AP_RW | PTE_ATTRINDX(MAIR_DEVICE) | \
+                         PTE_PXN | PTE_UXN)
+    /* 4 KB L3 page descriptor (Normal WB) */
+#define L3_NORMAL(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
+                         PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NORMAL))
+    /* 4 KB L3 page descriptor (Device nGnRnE) */
+#define L3_DEVICE(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
+                         PTE_SH_OUTER | PTE_AP_RW | PTE_ATTRINDX(MAIR_DEVICE) | \
+                         PTE_PXN | PTE_UXN)
+    /* L1/L2 table (pointer-to-next-level) descriptor */
+#define TABLE_DESC(pa) ((pa) | PTE_VALID | PTE_TABLE)
+
+    /* ── .xhci_dma location ──────────────────────────────────────── */
+
+    /*
+     * Identity map means VA == PA.  Get the physical extent of the
+     * .xhci_dma section from the linker-exported symbols.
+     */
+    uint64_t dma_start = (uint64_t)__xhci_dma_start;
+    uint64_t dma_end   = (uint64_t)__xhci_dma_end;
+
+    /*
+     * All DMA memory must be within the first 1 GB and within a single
+     * 2 MB L2 block, so we only need one L3 table.  Panic if violated.
+     */
+    if ((dma_start >> 30) != 0 || (dma_end >> 30) != 0) {
+        debug_print("[MMU] PANIC: .xhci_dma spans beyond first 1 GB "
+                    "(start=0x%llx end=0x%llx)\n",
+                    (unsigned long long)dma_start,
+                    (unsigned long long)dma_end);
+        for (;;) {}
+    }
+    uint64_t dma_l2_idx = (dma_start >> 21) & 0x1FF;
+    if (((dma_end - 1) >> 21) != dma_l2_idx) {
+        debug_print("[MMU] PANIC: .xhci_dma crosses 2 MB boundary "
+                    "(start=0x%llx end=0x%llx)\n",
+                    (unsigned long long)dma_start,
+                    (unsigned long long)dma_end);
+        for (;;) {}
     }
 
-    // L2
-    idx = (va >> L2_SHIFT) & (PT_ENTRIES - 1);
-    if (!(pmd[idx] & PTE_VALID)) {
-        if (!create) return NULL;
-        pte = pt_alloc_level();
-        if (!pte) {
-            debug_print("ERROR: mmu_walk_pte - failed to allocate L3 table\n");
-            return NULL;
-        }
-        pmd[idx] = (uint64_t)pte | PTE_VALID | PTE_TABLE;
-    } else {
-        pte = (uint64_t*)(pmd[idx] & PAGE_MASK);
+    debug_print("[MMU] .xhci_dma: 0x%llx – 0x%llx  (L2[%llu], Device pages)\n",
+                (unsigned long long)dma_start,
+                (unsigned long long)dma_end,
+                (unsigned long long)dma_l2_idx);
+
+    /* ── Build l3_dma_2mb: 4 KB pages for the 2 MB block holding DMA buf ── */
+
+    uint64_t l2_block_base = dma_l2_idx << 21;   /* PA of first byte in this 2MB */
+    uint64_t dma_l3_first  = (dma_start >> 12) & 0x1FF;
+    /* Round dma_end up to next page, then compute index within this 2MB block.
+     * Cap at 512 in case dma_end is exactly 2MB-aligned (& 0x1FF would wrap to 0). */
+    uint64_t dma_end_page  = (dma_end + 0xFFFULL) & ~0xFFFULL;  /* ceil to 4KB */
+    uint64_t dma_l3_last   = (dma_end_page - l2_block_base) >> 12;
+    if (dma_l3_last > 512) dma_l3_last = 512;
+
+    for (int i = 0; i < 512; i++) {
+        uint64_t pa = l2_block_base + ((uint64_t)i << 12);
+        if ((uint64_t)i >= dma_l3_first && (uint64_t)i < dma_l3_last)
+            l3_dma_2mb[i] = L3_DEVICE(pa);   /* DMA pages — non-cacheable */
+        else
+            l3_dma_2mb[i] = L3_NORMAL(pa);   /* Everything else — Normal WB */
+    }
+    debug_print("[MMU] L3 DMA pages: entries %llu–%llu marked Device\n",
+                (unsigned long long)dma_l3_first,
+                (unsigned long long)dma_l3_last - 1);
+
+    /* ── Build l2_first_gb: 2 MB blocks for the first 1 GB ─────── */
+
+    for (int i = 0; i < 512; i++) {
+        uint64_t pa = (uint64_t)i << 21;   /* 2 MB each, starting at 0 */
+        if ((uint64_t)i == dma_l2_idx)
+            /* Replace with table pointer to the L3 table we just built */
+            l2_first_gb[i] = TABLE_DESC((uint64_t)l3_dma_2mb);
+        else
+            l2_first_gb[i] = L2_NORMAL(pa);
     }
 
-    // L3
-    idx = (va >> L3_SHIFT) & (PT_ENTRIES - 1);
-    if (!(pte[idx] & PTE_VALID)) {
-        if (!create) return NULL;
-        uint64_t page = phys_alloc_page();
-        if (!page) {
-            errno = ENOMEM;
-            debug_print("ERROR: mmu_walk_pte - failed to allocate physical page\n");
-            return NULL;
-        }
-        pte[idx] = page | PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER | PTE_USER | PTE_RW;  // Default RW
+    /* ── L1 table ────────────────────────────────────────────────── */
+
+    /*
+     * Index 0: first 1 GB — now a TABLE pointer (so we can mark .xhci_dma
+     *           as Device at 4 KB granularity via l2_first_gb).
+     */
+    l1_table[0] = TABLE_DESC((uint64_t)l2_first_gb);
+
+    /* 1 GB: 0x040000000 – 0x07FFFFFFF  Normal WB (RAM) */
+    l1_table[1] = L1_NORMAL(0x040000000ULL);
+
+    /* 2 GB: 0x080000000 – 0x0BFFFFFFF  Normal WB (RAM) */
+    l1_table[2] = L1_NORMAL(0x080000000ULL);
+
+    /*
+     * 3 GB: 0x0C0000000 – 0x0FFFFFFFF
+     * Split via l2_periph4 so the Pi 4 peripheral window (0xFE000000+)
+     * gets Device attributes.  Everything below 0xF0000000 stays Normal.
+     */
+    l1_table[3] = TABLE_DESC((uint64_t)l2_periph4);
+
+    for (int i = 0; i < 512; i++) {
+        uint64_t pa = 0xC0000000ULL + ((uint64_t)i << 21);
+        if (pa >= 0xF0000000ULL)
+            l2_periph4[i] = L2_DEVICE(pa);
+        else
+            l2_periph4[i] = L2_NORMAL(pa);
     }
 
-    return &pte[idx];
-}
+    /* ── Pi 4: VL805 PCIe BAR0 @ 0x600000000  (index 24) ────────── */
+    l1_table[24] = L1_DEVICE(0x600000000ULL);
 
-/* Walk page table and free all levels */
-static void pt_free(uint64_t *l0) {
-    for (int i = 0; i < PT_ENTRIES; i++) {
-        if (l0[i] & PTE_VALID) {
-            uint64_t *l1 = (uint64_t*)(l0[i] & PAGE_MASK);
-            for (int j = 0; j < PT_ENTRIES; j++) {
-                if (l1[j] & PTE_VALID) {
-                    uint64_t *l2 = (uint64_t*)(l1[j] & PAGE_MASK);
-                    for (int k = 0; k < PT_ENTRIES; k++) {
-                        if (l2[k] & PTE_VALID) {
-                            uint64_t *l3 = (uint64_t*)(l2[k] & PAGE_MASK);
-                            for (int m = 0; m < PT_ENTRIES; m++) {
-                                if (l3[m] & PTE_VALID && !(l3[m] & PTE_TABLE)) {
-                                    phys_free_page(l3[m] & PAGE_MASK);
-                                }
-                            }
-                            kfree(l3);
-                        }
-                    }
-                    kfree(l2);
-                }
-            }
-            kfree(l1);
-        }
-    }
-    kfree(l0);
-}
+    /* ── Pi 5: peripherals @ 0x107C000000  (index 65) ───────────── */
+    l1_table[65] = L1_DEVICE(0x107C000000ULL);
 
-/* Initialize kernel page table (1:1 identity map) */
-void mmu_init(void) {
-    kernel_pgt_l0 = pt_alloc_level();
+    /* ── Pi 5: PCIe RC @ 0x1F00000000  (index 124) ──────────────── */
+    l1_table[124] = L1_DEVICE(0x1F00000000ULL);
 
-    // Map 4GB kernel space (example)
-    uint64_t kernel_base = 0xFFFF000000000000ULL;
-    uint64_t kernel_size = 0x100000000ULL;  // 4GB
+#undef L1_NORMAL
+#undef L1_DEVICE
+#undef L2_NORMAL
+#undef L2_DEVICE
+#undef L3_NORMAL
+#undef L3_DEVICE
+#undef TABLE_DESC
 
-    mmu_map_kernel(kernel_base, kernel_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+    debug_print("[MMU] Tables ready, enabling MMU + caches...\n");
 
-    // Enable MMU
-    uint64_t tcr = (25ULL << 0) | (25ULL << 16) | (1ULL << 32);  // 48-bit VA, 4KB granule
-    __asm__ volatile (
-        "msr ttbr0_el1, %0\n"  // User
-        "msr ttbr1_el1, %1\n"  // Kernel
-        "msr tcr_el1, %2\n"
+    /* Drain all data writes before loading page tables */
+    asm volatile("dsb ishst; isb" ::: "memory");
+
+    uint64_t ttbr  = (uint64_t)l1_table;
+    uint64_t tcr   = TCR_VALUE;
+    uint64_t mair  = MAIR_VALUE;
+    uint64_t sctlr;
+
+    asm volatile(
+        /*
+         * 1. Program MAIR and TCR first so the hardware knows the
+         *    memory type encodings before we load TTBR.
+         */
+        "msr mair_el1, %[mair]\n"
+        "msr tcr_el1,  %[tcr]\n"
         "isb\n"
-        "mrs %3, sctlr_el1\n"
-        "orr %3, %3, #1\n"     // Enable MMU
-        "msr sctlr_el1, %3\n"
+
+        /*
+         * 2. Load TTBR0 (and TTBR1 with the same table — they share
+         *    the same identity map so kernel addresses work too).
+         */
+        "msr ttbr0_el1, %[ttbr]\n"
+        "msr ttbr1_el1, %[ttbr]\n"
         "isb\n"
-        : : "r"(0), "r"(kernel_pgt_l0), "r"(tcr), "r"(0) : "memory"
+
+        /*
+         * 3. Invalidate all TLB entries before the MMU is switched on
+         *    so there are no stale entries from the firmware.
+         */
+        "tlbi vmalle1is\n"
+        "dsb ish\n"
+        "isb\n"
+
+        /*
+         * 4. Enable MMU (M), D-cache (C), and I-cache (I) in one write.
+         *    Read-modify-write so we don't disturb other SCTLR bits set
+         *    by the firmware (e.g. alignment check, SP alignment).
+         */
+        "mrs  %[sctlr], sctlr_el1\n"
+        "orr  %[sctlr], %[sctlr], #(1 << 0)\n"   /* M – MMU on    */
+        "orr  %[sctlr], %[sctlr], #(1 << 2)\n"   /* C – D-cache   */
+        "orr  %[sctlr], %[sctlr], #(1 << 12)\n"  /* I – I-cache   */
+        "msr  sctlr_el1, %[sctlr]\n"
+        "isb\n"                                    /* pipeline flush */
+
+        : [sctlr] "=&r" (sctlr)
+        : [ttbr]  "r"   (ttbr),
+          [tcr]   "r"   (tcr),
+          [mair]  "r"   (mair)
+        : "memory"
     );
 
-    debug_print("MMU enabled – full protection active\n");
+    debug_print("[MMU] Enabled (identity map, caches on)\n");
 }
 
-/* Map range in kernel table */
-void mmu_map_kernel(uint64_t virt, uint64_t size, int prot)
-{
-    uint64_t phys = virt;  // Identity mapping
-    uint64_t end = virt + size;
+/* ── Stubs — future per-task page table support ──────────────────── */
 
-    for (; virt < end; virt += (1ULL << L1_SHIFT), phys += (1ULL << L1_SHIFT)) {
-        uint64_t l0_idx = (virt >> L0_SHIFT) & 0x1FF;
-        kernel_pgt_l0[l0_idx] = phys | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | PTE_RW;
-    }
-
-    mmu_tlb_invalidate_all();
-}
-
-/* Initialize per-task page table */
-void mmu_init_task(task_t *task) {
-    task->pgtable_l0 = pt_alloc_level();
-
-    // Copy kernel mappings (upper half)
-    memcpy(task->pgtable_l0 + 256, kernel_pgt_l0 + 256, 256 * 8);
-
-    // Map user stack
-    uint64_t stack_base = 0x0000fffffffff000ULL;
-    mmu_map(task, stack_base - USER_STACK_SIZE, USER_STACK_SIZE, PROT_READ | PROT_WRITE, 0);
-
-    // Guard page below stack
-    mmu_map(task, stack_base - USER_STACK_SIZE - PAGE_SIZE, PAGE_SIZE, PROT_NONE, 1);
-
-    debug_print("MMU: Task %s page table initialized\n", task->name);
-}
-
-/* Map virtual range in task table */
-int mmu_map(task_t *task, uint64_t virt, uint64_t size, int prot, int guard)
-{
-    uint64_t end = virt + size;
-
-    for (; virt < end; virt += PAGE_SIZE) {
-        uint64_t *pte = mmu_walk_pte(task, virt, 1);
-        if (!pte) {
-            errno = ENOMEM;
-            debug_print("ERROR: mmu_map - failed to walk page table for VA 0x%llx\n", virt);
-            return -1;
-        }
-
-        uint64_t phys = phys_alloc_page();
-        if (!phys) {
-            errno = ENOMEM;
-            debug_print("ERROR: mmu_map - failed to allocate physical page for VA 0x%llx\n", virt);
-            return -1;
-        }
-        page_ref_inc(phys);  // Initial refcount = 1
-
-        uint64_t attr = PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER | PTE_USER;
-        if (prot & PROT_WRITE) attr |= PTE_RW;
-        if (!(prot & PROT_EXEC)) attr |= PTE_UXN;
-        if (guard) attr &= ~PTE_VALID;  // Invalid for fault
-
-        *pte = phys | attr;
-    }
-
-    mmu_tlb_invalidate_addr(virt, size);
-    return 0;
-}
-
-/* Duplicate page table with COW */
-int mmu_duplicate_pagetable(task_t *parent, task_t *child)
-{
-    uint64_t *new_l0 = pt_alloc_level();
-    if (!new_l0) {
-        errno = ENOMEM;
-        debug_print("ERROR: mmu_duplicate_pagetable - failed to allocate L0 table\n");
-        return -1;
-    }
-
-    uint64_t *parent_l0 = (uint64_t *)parent->pgtable_l0;
-
-    // Copy kernel mappings (upper half)
-    memcpy(new_l0 + 256, parent_l0 + 256, 256 * 8);
-
-    // COW user pages (lower half) - simplified version
-    for (int i = 0; i < 256; i++) {
-        if (parent_l0[i] & PTE_VALID) {
-            uint64_t *new_l1 = pt_alloc_level();
-            if (!new_l1) {
-                errno = ENOMEM;
-                debug_print("ERROR: mmu_duplicate_pagetable - failed to allocate L1 table\n");
-                return -1;
-            }
-            
-            uint64_t *old_l1 = (uint64_t*)(parent_l0[i] & PAGE_MASK);
-            
-            // Copy L1 entries
-            for (int j = 0; j < PT_ENTRIES; j++) {
-                if (old_l1[j] & PTE_VALID) {
-                    new_l1[j] = old_l1[j];
-                    // Mark as COW if writable
-                    if (old_l1[j] & PTE_RW) {
-                        new_l1[j] |= PTE_COW;
-                        new_l1[j] &= ~PTE_RW;  // Make read-only
-                        old_l1[j] |= PTE_COW;
-                        old_l1[j] &= ~PTE_RW;
-                    }
-                }
-            }
-            
-            new_l0[i] = (uint64_t)new_l1 | PTE_VALID | PTE_TABLE;
-        }
-    }
-
-    child->pgtable_l0 = new_l0;
-    mmu_tlb_invalidate_all();
-    return 0;
-}
-
-/* Stub implementations for missing functions */
-void page_ref_inc(uint64_t phys) {
-    // TODO: Implement reference counting
-    (void)phys;
-}
+void mmu_init_task(task_t *task)         { (void)task; }
+int  mmu_map(task_t *task, uint64_t virt, uint64_t size, int prot, int guard)
+     { (void)task; (void)virt; (void)size; (void)prot; (void)guard; return 0; }
+int  mmu_duplicate_pagetable(task_t *p, task_t *c) { (void)p; (void)c; return 0; }
+void mmu_map_kernel(uint64_t v, uint64_t s, int p)  { (void)v; (void)s; (void)p; }
+void page_ref_inc(uint64_t phys)                     { (void)phys; }
 
 void mmu_tlb_invalidate_all(void) {
-    __asm__ volatile("tlbi vmalle1is");
-    __asm__ volatile("dsb ish");
-    __asm__ volatile("isb");
+    asm volatile("tlbi vmalle1is\ndsb ish\nisb" ::: "memory");
 }
 
 void mmu_tlb_invalidate_addr(uint64_t virt, uint64_t size) {
     (void)size;
-    uint64_t addr = virt >> 12;
-    __asm__ volatile("tlbi vae1is, %0" : : "r"(addr));
-    __asm__ volatile("dsb ish");
-    __asm__ volatile("isb");
+    asm volatile("tlbi vae1is, %0\ndsb ish\nisb" :: "r"(virt >> 12) : "memory");
 }
-

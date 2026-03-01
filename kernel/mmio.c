@@ -65,8 +65,11 @@ void writeq(uint64_t val, void *addr)
 /* DMA helpers */
 uint64_t virt_to_phys(void *virt)
 {
-    /* Identity mapped for now */
-    return (uint64_t)virt;
+    /* Identity mapped, but the GPU/VideoCore mailbox requires the ARM→GPU
+     * bus alias: physical addresses must have the 0xC0000000 offset so the
+     * VC can find the buffer in its own address space.  The bottom 30 bits
+     * are the actual ARM physical address within the first 1 GB.          */
+    return ((uint64_t)virt & 0x3FFFFFFFULL) | 0xC0000000ULL;
 }
 
 void *phys_to_virt(uint64_t phys)

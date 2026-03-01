@@ -18,7 +18,7 @@ typedef int32_t pid_t;
 /* Constants */
 #define TASK_NAME_LEN       32
 #define MAX_CPUS            8
-#define MAX_FD              1024
+#define MAX_FD              64
 #define PAGE_SIZE           4096
 #define PAGE_MASK           (~(PAGE_SIZE - 1))
 
@@ -96,6 +96,7 @@ struct task {
     spinlock_t      children_lock;
     int             exit_status;
     void           *pgtable_l0;
+    int             started;        /* 0 = never scheduled, 1 = has run */
     void           *files[MAX_FD];
     void           *cwd;
     signal_state_t  signal_state;
@@ -157,17 +158,24 @@ void device_tree_parse(uint64_t dtb_ptr);
 int detect_nr_cpus(void);
 int get_cpu_id(void);
 void filecore_init(void);
+void vfs_init(void);
+void net_init(void);
+void wimp_init(void);
+void register_default_handlers(void);
+int  usb_init(void);
 
 void *kcalloc(size_t nmemb, size_t size);
 void kfree(void *ptr);
 void *kmalloc(size_t size);
 void heap_stats(void);
+void malloc_init(void);
 
 /* String functions (minimal implementations) */
 size_t strlen(const char *s);
 size_t strnlen(const char *s, size_t maxlen);
 char *strcpy(char *dest, const char *src);
 char *strncpy(char *dest, const char *src, size_t n);
+/* strncpy_safe is a static inline defined in error.h */
 int strcmp(const char *s1, const char *s2);
 int strncmp(const char *s1, const char *s2, size_t n);
 void *memset(void *s, int c, size_t n);
@@ -185,16 +193,14 @@ void wimp_task(void);
 void paint_task(void);
 void netsurf_task(void);
 
-extern task_t *current_task;
-extern int nr_cpus;
-
-#endif /* KERNEL_H */
-/* Memory management */
-void *kmalloc(size_t size);
-void *kcalloc(size_t nmemb, size_t size);
-void kfree(void *ptr);
-
-void heap_stats(void);
+/* Board detection (periph_base.c) */
+extern uint64_t peripheral_base;
+extern int      pi_model;
+uint64_t get_gpio_base(void);
+uint64_t get_uart_base(void);
+uint64_t get_mailbox_base(void);
+int      get_pi_model(void);
+void     detect_peripheral_base(uint64_t dtb_ptr);
 
 /* MMIO helpers */
 void *ioremap(uint64_t phys_addr, size_t size);
@@ -210,8 +216,13 @@ void writeq(uint64_t val, void *addr);
 uint64_t virt_to_phys(void *virt);
 void *phys_to_virt(uint64_t phys);
 
+extern task_t *current_task;
+extern int nr_cpus;
+
 /* IRQ system */
 #include "irq.h"
 
 /* PCI system */
 #include "pci.h"
+
+#endif /* KERNEL_H */

@@ -29,13 +29,37 @@ void sched_init(void) {
 }
 
 /* Initialize scheduler on a specific CPU */
+/* Static idle task for CPU 0 — avoids kmalloc during early boot.
+ * Using a static struct sidesteps any heap/spinlock issues while we
+ * diagnose what's killing task_create.                               */
+static task_t idle_task_storage[MAX_CPUS];
+static uint8_t idle_stacks[MAX_CPUS][4096] __attribute__((aligned(16)));
+
 void sched_init_cpu(int cpu_id) {
     cpu_sched_t *sched = &cpu_sched[cpu_id];
-    
-    // Create idle task for this CPU
-    sched->idle_task = task_create("idle", idle_task_fn, TASK_MIN_PRIORITY, (1ULL << cpu_id));
-    
-    debug_print("CPU %d scheduler ready\n", cpu_id);
+
+    debug_print("[SCHED] sched_init_cpu(%d) enter\n", cpu_id);
+
+    task_t *task = &idle_task_storage[cpu_id];
+    /* task_t is in BSS — already zeroed by boot.S */
+    task->pid          = 0;
+    task->priority     = TASK_MIN_PRIORITY;
+    task->state        = TASK_READY;
+    task->cpu_affinity = (1ULL << cpu_id);
+    task->started      = 0;
+    task->stack_top    = (uint64_t)(idle_stacks[cpu_id] + sizeof(idle_stacks[0]));
+    task->elr_el1      = (uint64_t)idle_task_fn;
+    task->spsr_el1     = 0;
+
+    /* Copy name safely without strncpy_safe (avoids errno dependency) */
+    task->name[0] = 'i'; task->name[1] = 'd'; task->name[2] = 'l';
+    task->name[3] = 'e'; task->name[4] = '\0';
+
+    sched->idle_task = task;
+    enqueue_task(sched, task);
+
+    debug_print("[SCHED] CPU %d idle task ready at stack_top=0x%llx\n",
+                cpu_id, task->stack_top);
 }
 
 /* Idle task function */
@@ -95,58 +119,59 @@ static task_t *pick_next_task(cpu_sched_t *sched) {
 /* Context switch implementation */
 static void context_switch(task_t *prev, task_t *next) {
     if (prev == next) return;
-    
-    // Save previous task's context
-    __asm__ volatile (
-        "stp x0, x1, [sp, #-16]!\n"
-        "stp x2, x3, [sp, #-16]!\n"
-        "stp x4, x5, [sp, #-16]!\n"
-        "stp x6, x7, [sp, #-16]!\n"
-        "stp x8, x9, [sp, #-16]!\n"
-        "stp x10, x11, [sp, #-16]!\n"
-        "stp x12, x13, [sp, #-16]!\n"
-        "stp x14, x15, [sp, #-16]!\n"
-        "stp x16, x17, [sp, #-16]!\n"
-        "stp x18, x19, [sp, #-16]!\n"
-        "stp x20, x21, [sp, #-16]!\n"
-        "stp x22, x23, [sp, #-16]!\n"
-        "stp x24, x25, [sp, #-16]!\n"
-        "stp x26, x27, [sp, #-16]!\n"
-        "stp x28, x29, [sp, #-16]!\n"
-        "str x30, [sp, #-16]!\n"
-        "mrs %0, sp_el0\n"
-        "mrs %1, elr_el1\n"
-        "mrs %2, spsr_el1\n"
-        "mov %3, sp\n"
-        : "=r"(prev->sp_el0), "=r"(prev->elr_el1), 
-          "=r"(prev->spsr_el1), "=r"(prev->stack_top)
-    );
-    
-    // Restore next task's context
-    __asm__ volatile (
-        "mov sp, %3\n"
-        "msr sp_el0, %0\n"
-        "msr elr_el1, %1\n"
-        "msr spsr_el1, %2\n"
-        "ldr x30, [sp], #16\n"
-        "ldp x28, x29, [sp], #16\n"
-        "ldp x26, x27, [sp], #16\n"
-        "ldp x24, x25, [sp], #16\n"
-        "ldp x22, x23, [sp], #16\n"
-        "ldp x20, x21, [sp], #16\n"
-        "ldp x18, x19, [sp], #16\n"
-        "ldp x16, x17, [sp], #16\n"
-        "ldp x14, x15, [sp], #16\n"
-        "ldp x12, x13, [sp], #16\n"
-        "ldp x10, x11, [sp], #16\n"
-        "ldp x8, x9, [sp], #16\n"
-        "ldp x6, x7, [sp], #16\n"
-        "ldp x4, x5, [sp], #16\n"
-        "ldp x2, x3, [sp], #16\n"
-        "ldp x0, x1, [sp], #16\n"
-        :: "r"(next->sp_el0), "r"(next->elr_el1), 
-           "r"(next->spsr_el1), "r"(next->stack_top)
-    );
+
+    /* ── Save previous task ─────────────────────────────────────────
+     * Push callee-saved registers onto the current (prev) kernel stack
+     * and record the SP.  schedule() is a normal C function so the
+     * compiler already saved caller-saved regs; we only need x19-x30. */
+    if (prev) {
+        __asm__ volatile (
+            "stp x19, x20, [sp, #-16]!\n"
+            "stp x21, x22, [sp, #-16]!\n"
+            "stp x23, x24, [sp, #-16]!\n"
+            "stp x25, x26, [sp, #-16]!\n"
+            "stp x27, x28, [sp, #-16]!\n"
+            "stp x29, x30, [sp, #-16]!\n"
+            "mov %0, sp\n"
+            : "=r"(prev->stack_top)
+            :: "memory"
+        );
+        prev->started = 1;
+    }
+
+    /* ── Restore / launch next task ─────────────────────────────────
+     * First run: launch via eret at entry point (elr_el1).
+     * Subsequent runs: restore callee-saved regs and ret into schedule(). */
+    if (!next->started) {
+        /* First run — jump to entry via eret (stays at EL1 since spsr=0) */
+        __asm__ volatile (
+            "mov  sp,      %0\n"   /* switch to next task's kernel stack  */
+            "msr  sp_el0,  %1\n"   /* EL0 SP (0 for pure kernel tasks)    */
+            "msr  elr_el1, %2\n"   /* entry point                         */
+            "msr  spsr_el1,%3\n"   /* PSTATE: EL1h, all interrupts masked */
+            "eret\n"
+            :: "r"(next->stack_top), "r"(next->sp_el0),
+               "r"(next->elr_el1),   "r"((uint64_t)0x3C5)
+               /* spsr 0x3C5 = EL1h, DAIF all masked — task unmasks when ready */
+            : "memory"
+        );
+        __builtin_unreachable();
+    } else {
+        /* Resume — restore callee-saved regs and ret back into schedule() */
+        __asm__ volatile (
+            "mov  sp,  %0\n"
+            "ldp  x29, x30, [sp], #16\n"
+            "ldp  x27, x28, [sp], #16\n"
+            "ldp  x25, x26, [sp], #16\n"
+            "ldp  x23, x24, [sp], #16\n"
+            "ldp  x21, x22, [sp], #16\n"
+            "ldp  x19, x20, [sp], #16\n"
+            "ret\n"
+            :: "r"(next->stack_top)
+            : "memory"
+        );
+        __builtin_unreachable();
+    }
 }
 
 /* Main scheduler function */
@@ -154,8 +179,7 @@ void schedule(void) {
     int cpu_id = get_cpu_id();
     cpu_sched_t *sched = &cpu_sched[cpu_id];
     
-    unsigned long flags;
-    spin_lock_irqsave(&sched->lock, &flags);
+    spin_lock(&sched->lock);
     
     task_t *prev = sched->current;
     task_t *next = pick_next_task(sched);
@@ -172,7 +196,7 @@ void schedule(void) {
     
     sched->schedule_count++;
     
-    spin_unlock_irqrestore(&sched->lock, flags);
+    spin_unlock(&sched->lock);
     
     if (prev != next) {
         context_switch(prev, next);

@@ -7,8 +7,10 @@
 #ifndef _ERRNO_H
 #define _ERRNO_H
 
-/* Thread-local errno for each task */
-extern __thread int errno;
+/* Global errno — bare metal has no TLS, so this is a plain global.
+ * The scheduler will save/restore it per-task once context switching
+ * is implemented.                                                    */
+extern int errno;
 
 /* Error codes (POSIX-compatible) */
 #define EPERM           1       /* Operation not permitted */
