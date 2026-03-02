@@ -7,7 +7,7 @@ LD = aarch64-linux-gnu-ld
 OBJCOPY = aarch64-linux-gnu-objcopy
 
 CFLAGS = -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only \
-         -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp
+         -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Idrivers/usb -Inet -Iwimp
 ASFLAGS = -mcpu=cortex-a72
 # Use GCC to assemble .S files so we get the C preprocessor and
 # ldr x0, =symbol  pseudo-instruction support via the GNU assembler
@@ -45,7 +45,7 @@ OBJS = \
 	drivers/nvme/nvme.o \
 	drivers/usb/vl805_init.o \
     drivers/usb/usb_storage.o \
-    drivers/usb/usb_xhci.o \
+    kernel/usb_xhci.o \
     drivers/usb/usb_init.o \
     drivers/gpu/mailbox.o \
     drivers/gpu/mailbox_test.o \

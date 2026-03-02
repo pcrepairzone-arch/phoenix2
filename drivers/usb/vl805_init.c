@@ -57,7 +57,7 @@ static int mbox_property(volatile uint32_t *buf)
 {
     uint32_t arm_phys = (uint32_t)((uintptr_t)buf & 0xFFFFFFFFU);
     if (arm_phys & 0xFU) { uart_puts("[MBOX] not aligned\n"); return -1; }
-    uint32_t gpu_addr = (arm_phys & 0x3FFFFFFFU) | 0xC0000000U;
+    uint32_t gpu_addr = gpu_bus_addr((void *)buf);
 
     buf[1] = 0;
     asm volatile("dmb sy" ::: "memory");

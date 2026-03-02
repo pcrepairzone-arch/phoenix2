@@ -214,6 +214,7 @@ void writew(uint16_t val, void *addr);
 void writel(uint32_t val, void *addr);
 void writeq(uint64_t val, void *addr);
 uint64_t virt_to_phys(void *virt);
+uint32_t gpu_bus_addr(void *virt);   /* ARM→GPU bus alias for mailbox calls */
 void *phys_to_virt(uint64_t phys);
 
 extern task_t *current_task;
