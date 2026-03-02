@@ -58,7 +58,15 @@
  *
  * ─── KEY FIXES IN THIS VERSION ───────────────────────────────────────────
  *
- *  1. BAR0 is NOT programmed via EXT_CFG (impossible on BCM2711).
+ *  1. WIN0_LO = 0xf8000000 — the BCM2711 DTS-defined PCIe base address.
+ *     The DTS ranges property maps CPU 0x600000000 <-> PCI 0xf8000000 (64MB).
+ *     start4.elf enumerates the VL805, assigns BAR0=0xf8000000, issues a
+ *     secondary bus reset, then RE-ENUMERATES and re-assigns BAR0=0xf8000000.
+ *     Our kernel inherits BAR=0xf8000000.  Five boots proved every other value
+ *     (0x00000000, 0x80000000, 0xC0000000) causes 0xdeaddead.
+ *     The BCM2711 MISC ATU is the ONLY outbound routing mechanism — Linux
+ *     pcie-brcmstb.c never touches pcie_base+0x20 (bridge window is irrelevant).
+ *  2. BAR0 is NOT programmed via EXT_CFG (impossible on BCM2711).
  *     Instead, after ATU setup, xhci_base is set directly to VL805_BAR0_CPU.
  *  2. Command register (Memory Space + Bus Master) IS written via EXT_CFG
  *     because EXT_CFG does forward offset 0x04 to the VL805.
@@ -169,8 +177,9 @@ static void delay_ms(int ms) {
 
 /*
  * VL805_BAR0_CPU: the CPU-side address of the VL805 MMIO window.
- * This is where xHCI registers appear after the ATU is configured.
- * ATU maps CPU:0x600000000 → PCIe:0x00000000 (= VL805 BAR0 default after reset).
+ * ATU WIN0_LO = pci_bar (0x80000000), BASE_LIMIT covers CPU 0x600000000.
+ * So CPU reads at 0x600000000 generate PCIe TLPs to 0x80000000 = VL805 BAR0.
+ * start4.elf assigns this BAR and it persists across our RC link re-training.
  */
 #define VL805_BAR0_CPU       0x600000000ULL
 
@@ -294,6 +303,35 @@ static int pcie_bring_up_link(void) {
     uart_puts("[PCI] HARD_DEBUG after  L1ss fix="); print_hex32(readl(pcie_base + MISC_HARD_DEBUG_OFF));
     uart_puts(" (L1ss disabled — link stays in L0)\n");
 
+    /*
+     * Belt-and-suspenders: also clear ASPM L0s+L1 enable bits in the RC's
+     * PCIe capability LNKCTL register (cap+0x10, bits [1:0]).
+     * Even with L1ss cleared in HARD_DEBUG the link can still enter standard
+     * L1 ASPM if LNKCTL allows it.  Linux brcm_pcie_setup() clears these too.
+     *
+     * Walk the RC's capability list starting at offset 0x34 to find cap 0x10
+     * (PCIe capability), then clear LNKCTL bits [1:0].
+     * The RC config space is accessed directly via pcie_base+offset (not EXT_CFG).
+     */
+    {
+        uint8_t cap_ptr = readl(pcie_base + 0x34) & 0xFC;
+        int safety = 32;
+        while (cap_ptr && cap_ptr < 0xFF && safety-- > 0) {
+            uint32_t cap_hdr = readl(pcie_base + cap_ptr);
+            if ((cap_hdr & 0xFF) == 0x10) {   /* PCIe capability */
+                uint32_t lnkctl = readl(pcie_base + cap_ptr + 0x10);
+                uart_puts("[PCI] RC LNKCTL before ASPM clear: "); print_hex32(lnkctl); uart_puts("\n");
+                lnkctl &= ~0x3U;   /* clear L0s+L1 ASPM enable bits */
+                writel(lnkctl, pcie_base + cap_ptr + 0x10);
+                asm volatile("dsb sy; isb" ::: "memory");
+                uart_puts("[PCI] RC LNKCTL after  ASPM clear: ");
+                print_hex32(readl(pcie_base + cap_ptr + 0x10)); uart_puts("\n");
+                break;
+            }
+            cap_ptr = (cap_hdr >> 8) & 0xFC;
+        }
+    }
+
     /* RC Class Code fixup (BCM2711 ships with wrong class code) */
     uint32_t ccr = readl(pcie_base + RC_CFG_PRIV1_ID_VAL3_OFF);
     ccr = (ccr & 0xFF000000U) | RC_CORRECT_CLASS;
@@ -372,7 +410,10 @@ static void pcie_setup_outbound_window(void) {
     uart_puts("[PCI] MISC_CTRL after setup="); print_hex32(ctrl);
     uart_puts(ctrl & (1U << 12) ? "  SCB_ACCESS_EN=1 OK\n" : "  SCB_ACCESS_EN=0 PROBLEM\n");
 
-    /* 2. Outbound window registers — raw PCIe address, no size encoding */
+    /* 2. Outbound window registers.
+     * WIN0_LO (PCIe destination address) is intentionally left 0 here;
+     * pci_init_pi4() overwrites it with the real VL805 BAR address
+     * once it has decoded the firmware memory window.               */
     writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
     writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_HI);
     writel(0x603F6000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT);
@@ -510,54 +551,53 @@ static void pci_init_pi4(void) {
      * these registers.  The EXT_CFG BAR read always returns 0 (EXT_CFG limitation),
      * but the RC's own memory window at offset 0x20 tells us the real BAR base.
      *
-     * Decode: bits[15:4] of the 32-bit register hold PCI base address [31:20].
-     * Example: register = 0xbff08000 -> bits[15:4] = 0x800 -> base = 0x80000000.
+     * WHAT THE BOOT LOGS TAUGHT US (5 boots, every WIN0_LO candidate tried):
      *
-     * If the window shows base > limit (register = 0x000XXXXX pattern where
-     * limit < base) the firmware left it disabled and the real BAR is 0.
+     * The BCM2711 DTS defines the PCIe outbound range as:
+     *   ranges = <0x02000000 0x0 0xf8000000  0x6 0x00000000  0x0 0x04000000>
+     * Meaning: CPU 0x600000000 maps to PCI 0xf8000000 (64MB window).
+     *
+     * start4.elf enumerates the VL805 using this range, assigning BAR0=0xf8000000.
+     * start4.elf then issues "PCI0 reset" (secondary bus reset) which resets VL805
+     * config space.  Crucially, start4.elf RE-ENUMERATES after this reset and
+     * reassigns BAR0=0xf8000000.  Boot log evidence: all boots where WIN0_LO=0
+     * returned 0xdeaddead even with a wide-open bridge window — the VL805 was
+     * returning UR because its BAR was 0xf8000000, not 0.
+     *
+     * The RC's standard Type-1 bridge window (pcie_base+0x20) is NOT used by the
+     * BCM2711 for outbound TLP routing — Linux pcie-brcmstb.c never writes it.
+     * Outbound routing is controlled solely by the MISC ATU (WIN0_LO/BASE_LIMIT).
+     * All our previous writes to pcie_base+0x20 were irrelevant.
+     *
+     * CORRECT CONFIGURATION:
+     *   WIN0_LO    = 0xf8000000  (BCM2711 DTS PCIe base address)
+     *   BASE_LIMIT = CPU 0x600000000 for 64MB = (0x603F << 16) | 0x6000
+     *   VL805 BAR0 = 0xf8000000  (assigned by start4.elf, persists to our kernel)
+     *   CPU 0x600000000 → ATU → PCIe 0xf8000000 → VL805 decodes it ✓
      */
-    uint32_t fw_win = readl(pcie_base + 0x20);
-    uint32_t fw_base_field = (fw_win >> 4) & 0xFFF;       /* PCI base [31:20] */
-    uint32_t fw_limit_field = (fw_win >> 20) & 0xFFF;     /* PCI limit [31:20] */
-    uint32_t pci_bar = (fw_base_field <= fw_limit_field) ? (fw_base_field << 20) : 0;
+    uint32_t fw_win = readl(pcie_base + 0x20);  /* informational only */
+    uart_puts("[PCI] FW bridge win (informational): "); print_hex32(fw_win); uart_puts("\n");
 
-    uart_puts("[PCI] FW memory window: "); print_hex32(fw_win);
-    uart_puts("  -> VL805 BAR = "); print_hex32(pci_bar); uart_puts("\n");
+    /* BCM2711 DTS-defined PCIe address: CPU 0x600000000 = PCI 0xf8000000 */
+    uint32_t pci_bar = 0xf8000000U;
+    uart_puts("[PCI] Using VL805 BAR = 0xf8000000 (BCM2711 DTS PCIe range base)\n");
 
     /*
      * Step 2: Configure the outbound ATU window.
-     *
-     * After pcie_bring_up_link() de-asserts PERST# (clears RGR1 bit 0),
-     * VL805 undergoes a full power-on reset.  Its BAR0 returns to the PCI
-     * spec default of 0x00000000.  The firmware had assigned BAR0=0x80000000
-     * (visible in fw_win above), but that assignment is lost on reset.
-     *
-     * EXT_CFG cannot reprogram BAR0 — it only forwards offsets 0x00 and
-     * 0x04 to the downstream device; BAR writes go to the RC and are silently
-     * ignored (see file header).  So VL805 BAR0 = 0x00000000 after reset and
-     * there is no way to change it via our EXT_CFG mechanism.
-     *
-     * Therefore WIN0_LO must target PCIe 0x00000000 so that CPU accesses at
-     * 0x600000000 generate TLPs addressed to 0x00000000 where VL805 lives.
-     *
-     * NOTE: WIN0_LO holds a raw PCIe address — no size encoding.  Window size
-     * is set by BASE_LIMIT alone.  (brcm_pcie_encode_ibar_size() applies to
-     * inbound DMA windows only, not to this outbound register.)
+     * WIN0_LO = 0xf8000000, BASE_LIMIT = CPU 0x600000000 .. 0x603FFFFF (64MB).
+     * BCM2711 ignores pcie_base+0x20 for outbound TLP routing; MISC ATU only.
      */
-    pcie_setup_outbound_window();   /* SCB_ACCESS_EN + BASE_LIMIT = 0x603F6000 */
-    writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);  /* PCIe base = VL805 BAR0 default */
+    pcie_setup_outbound_window();   /* SCB_ACCESS_EN + BASE_LIMIT */
+
+    writel(0xf8000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
     asm volatile("dsb sy; isb" ::: "memory");
-    uart_puts("[PCI] ATU WIN0_LO written=0x00000000  readback=");
+    uart_puts("[PCI] ATU WIN0_LO=0xf8000000  readback=");
     print_hex32(readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO));
     uart_puts("\n");
     uart_puts("[PCI] ATU WIN0_HI=");
     print_hex32(readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_HI));
     uart_puts("  BASE_LIMIT=");
     print_hex32(readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT));
-    uart_puts("  BASE_HI=");
-    print_hex32(readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI));
-    uart_puts("  LIMIT_HI=");
-    print_hex32(readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI));
     uart_puts("\n");
 
     /*
@@ -579,8 +619,10 @@ static void pci_init_pi4(void) {
      * B) Bus numbers (0x18): secondary=1, subordinate=1 enables forwarding of TYPE-1
      *    config TLPs to bus 1 (required for EXT_CFG bus=1 accesses to reach VL805).
      *
-     * C) Memory window (0x20): if the firmware already set a valid window (pci_bar != 0)
-     *    we trust it and leave it alone.  Otherwise we open a default window.
+     * C) Memory window (pcie_base+0x20): BCM2711 does NOT use this register for
+     *    outbound TLP routing — Linux pcie-brcmstb.c never writes it.  Outbound
+     *    routing is controlled solely by MISC ATU (WIN0_LO/BASE_LIMIT).  We log
+     *    the current value for diagnostics but do not modify it.
      */
 
     /* A) RC Command */
@@ -597,18 +639,9 @@ static void pci_init_pi4(void) {
     delay_ms(5);
     uart_puts("[PCI] RC buses: "); print_hex32(readl(pcie_base + 0x18)); uart_puts("\n");
 
-    /* C) Memory window — only override if firmware left it disabled */
-    if (pci_bar == 0) {
-        uart_puts("[PCI] Opening default RC mem window (FW had none)\n");
-        writel(0x03F00000U, pcie_base + 0x20);
-        writel(0x03F10001U, pcie_base + 0x24);
-        writel(0x00000000U, pcie_base + 0x28);
-        writel(0x00000000U, pcie_base + 0x2C);
-        asm volatile("dsb sy; isb" ::: "memory");
-    } else {
-        uart_puts("[PCI] Keeping FW RC mem window (covers VL805 BAR)\n");
-    }
-    uart_puts("[PCI] RC mem win: "); print_hex32(readl(pcie_base + 0x20)); uart_puts("\n");
+    /* C) Log bridge window (informational - BCM2711 ignores it for TLP routing) */
+    uart_puts("[PCI] RC bridge win: "); print_hex32(readl(pcie_base + 0x20));
+    uart_puts(" (BCM2711 uses MISC ATU only — not modified)\n");
 
     /*
      * Step 5: Verify VL805 via EXT_CFG bus=1 (TYPE-1 config TLPs now forwarded).
@@ -629,9 +662,8 @@ static void pci_init_pi4(void) {
     /*
      * Step 6: Enable VL805 Memory Space + Bus Master.
      *
-     * VL805 BAR0 = 0x00000000 after PERST# reset (PCI spec default).
-     * Our ATU WIN0_LO = 0x00000000, so CPU reads at 0x600000000 generate
-     * PCIe TLPs to address 0x00000000 — exactly where VL805 decodes.
+     * VL805 BAR0 = 0xf8000000 (assigned by start4.elf per BCM2711 DTS ranges).
+     * ATU WIN0_LO = 0xf8000000: CPU reads at 0x600000000 → PCIe TLPs to 0xf8000000.
      *
      * We do NOT reprogram BAR0 via EXT_CFG because EXT_CFG only forwards
      * offsets 0x00 and 0x04 to the downstream device; BAR writes at 0x10
@@ -691,64 +723,36 @@ static void pci_init_pi4(void) {
     }
 
     /* ── Diagnostic 2: RC inbound BAR registers ───────────────────────────
-     * If any inbound BAR maps PCIe 0x80000000 -> CPU RAM, the RC captures
-     * outbound TLPs to that address as DMA rather than forwarding to VL805.
-     * offsets: BAR0=0x402c/0x4030, BAR1=0x4034/0x4038, BAR2=0x403c/0x4040
+     * Verify no inbound BAR is mapping PCIe 0x80000000 back to CPU RAM
+     * (which would cause the RC to capture our outbound TLPs as inbound DMA).
      */
     uart_puts("[PCI] RC inbound BARs:\n");
     uart_puts("[PCI]   BAR0: LO="); print_hex32(readl(pcie_base + 0x402c));
     uart_puts(" HI="); print_hex32(readl(pcie_base + 0x4030)); uart_puts("\n");
     uart_puts("[PCI]   BAR1: LO="); print_hex32(readl(pcie_base + 0x4034));
     uart_puts(" HI="); print_hex32(readl(pcie_base + 0x4038)); uart_puts("\n");
-    uart_puts("[PCI]   BAR2: LO="); print_hex32(readl(pcie_base + 0x403c));
-    uart_puts(" HI="); print_hex32(readl(pcie_base + 0x4040)); uart_puts("\n");
 
-    /* ── Diagnostic 3: ATU sweep ──────────────────────────────────────────
-     * Try reading MMIO with WIN0_LO at four candidate PCI base addresses.
-     * 0xF8000000 is from the bcm2711-rpi-4-b DTS ranges property (the
-     * hardware-defined PCIe aperture start). Previous sweeps missed this.
-     * Whichever gives non-0xdeaddead is where the VL805 actually lives.
+    /* ── Diagnostic 3: First MMIO read at the correct BAR address ─────────
+     * WIN0_LO is already set to pci_bar.  The first read tells us if the
+     * VL805 is responding.  Valid xHCI CAPLENGTH is 0x20 in byte [7:0].
      */
-    uart_puts("[PCI] RGR1 at sweep time="); print_hex32(readl(pcie_base + RGR1_SW_INIT_1_OFF)); uart_puts("\n");
-    /*
-     * ATU sweep: raw PCIe addresses only — no size encoding in WIN0_LO.
-     * Window size is set by BASE_LIMIT; WIN0_LO is a plain PCIe base address.
-     * Expected winner: 0x00000000 (VL805 BAR0 default after PERST# reset).
-     */
-    static const uint32_t sweep_bases[] = {
-        0x00000000, 0x80000000, 0xC0000000, 0xF8000000
-    };
-    uint32_t live_bar = 0xFFFFFFFF;
-    for (int s = 0; s < 4; s++) {
-        writel(sweep_bases[s], pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
-        asm volatile("dsb sy; isb" ::: "memory");
-        delay_ms(5);
-        uint32_t v = readl(xhci_base);
-        uart_puts("[PCI] ATU sweep WIN0_LO="); print_hex32(sweep_bases[s]);
-        uart_puts("  MMIO[0]="); print_hex32(v); uart_puts("\n");
-        if (v != 0xdeaddead && v != 0xFFFFFFFF && live_bar == 0xFFFFFFFF)
-            live_bar = sweep_bases[s];
-    }
-    uint32_t use_base = (live_bar != 0xFFFFFFFF) ? live_bar : 0x00000000;
-    writel(use_base, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
-    asm volatile("dsb sy; isb" ::: "memory");
-    if (live_bar != 0xFFFFFFFF) {
-        uart_puts("[PCI] ATU sweep found VL805 at PCIe="); print_hex32(live_bar); uart_puts("\n");
-    } else {
-        uart_puts("[PCI] ATU sweep: all candidates dead\n");
-    }
+    uart_puts("[PCI] RGR1 at MMIO time="); print_hex32(readl(pcie_base + RGR1_SW_INIT_1_OFF)); uart_puts("\n");
+    uint32_t first_read = readl(xhci_base);
+    uart_puts("[xHCI] Raw[0] @0x600000000 (PCIe="); print_hex32(pci_bar); uart_puts("): ");
+    print_hex32(first_read); uart_puts("\n");
 
-    /* Final raw dump */
-    uart_puts("[xHCI] Raw @0x600000000 (PCIe base="); print_hex32(use_base); uart_puts("): ");
-    for (int i = 0; i < 4; i++) {
-        print_hex32(readl(xhci_base + i * 4));
-        uart_puts(" ");
+    if (first_read == 0xdeaddead || first_read == 0xFFFFFFFF) {
+        uart_puts("[PCI] ERROR: VL805 not responding — 0xdeaddead\n");
+        uart_puts("[PCI] Check: RC bridge window covers PCIe ");
+        print_hex32(pci_bar); uart_puts("?\n");
+        uart_puts("[PCI] RC mem win="); print_hex32(readl(pcie_base + 0x20)); uart_puts("\n");
+        /* Don't give up — still attempt xhci_init so we see full diagnostics */
     }
-    uart_puts("\n");
 
     uart_puts("[PCI] 4/4 Full xHCI init (§4.2)\n");
     extern int xhci_init(uint64_t base_addr);
-    if (xhci_init(VL805_BAR0_CPU) != 0) {
+    uint64_t xhci_cpu_addr = VL805_BAR0_CPU;  /* CPU 0x600000000 -> PCIe pci_bar */
+    if (xhci_init(xhci_cpu_addr) != 0) {
         uart_puts("[PCI] ERROR: xhci_init failed\n");
         return;
     }

@@ -34,6 +34,12 @@ void debug_print(const char *fmt, ...) {
     while (*fmt) {
         if (*fmt == '%') {
             fmt++;
+            /* Parse optional flags and width (e.g. %04x, %02x) */
+            char pad_char = ' ';
+            int width = 0;
+            if (*fmt == '0') { pad_char = '0'; fmt++; }
+            while (*fmt >= '1' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+
             switch (*fmt) {
                 case 's': {
                     const char *s = va_arg(args, const char *);
@@ -61,8 +67,13 @@ void debug_print(const char *fmt, ...) {
                 case 'x': {
                     unsigned int val = va_arg(args, unsigned int);
                     const char *h = "0123456789abcdef";
-                    _put('0'); _put('x');
-                    for (int sh = 28; sh >= 0; sh -= 4) _put(h[(val>>sh)&0xF]);
+                    /* Build hex string */
+                    char buf[8]; int n = 0;
+                    if (val == 0) { buf[n++] = '0'; }
+                    else { unsigned v = val; while (v) { buf[n++] = h[v & 0xF]; v >>= 4; } }
+                    /* Pad to width */
+                    for (int k = n; k < width; k++) _put(pad_char);
+                    for (int k = n-1; k >= 0; k--) _put(buf[k]);
                     break;
                 }
                 case 'p': {
@@ -92,7 +103,6 @@ void debug_print(const char *fmt, ...) {
                     break;
                 }
                 case 'z': {
-                    /* %zu — size_t (64-bit on AArch64) */
                     fmt++;  /* skip 'u' */
                     uint64_t val = va_arg(args, uint64_t);
                     if (val == 0) { _put('0'); break; }
