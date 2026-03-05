@@ -16,8 +16,8 @@
  *  The BCM2711 RC uses an EXT_CFG sideband to provide access to the
  *  downstream endpoint's config space:
  *
- *    PCIE_EXT_CFG_INDEX  (RC+0x9000): selects target BDF + dword offset
- *    PCIE_EXT_CFG_DATA   (RC+0x8000): fixed 4KB config space window base
+ *    PCIE_EXT_CFG_INDEX  (RC+0x9000): selects the target slot
+ *    PCIE_EXT_CFG_DATA   (RC+0x9004): base of a 4KB config space window
  *
  *  Index format:  bits[27:20]=bus, bits[19:12]=devfn, rest=ignored
  *  Data  format:  DATA + (config_offset & 0xFFF) = that config register
@@ -124,8 +124,8 @@ static void delay_ms(int ms) {
 #define MISC_PCIE_CTRL_OFF      0x4064   /* L23 request, etc. */
 #define MISC_RC_BAR2_CFG_LO     0x4034   /* Inbound BAR2 (DMA from endpoint) */
 #define MISC_RC_BAR2_CFG_HI     0x4038
-#define PCIE_EXT_CFG_INDEX_OFF  0x9000   /* selects target BDF + offset */
-#define PCIE_EXT_CFG_DATA_OFF   0x8000   /* 4KB config window — fixed base, NOT sliding */
+#define PCIE_EXT_CFG_INDEX_OFF  0x9000
+#define PCIE_EXT_CFG_DATA_OFF   0x9004
 #define PCIE_LINK_STATUS_OFF    0x00BC   /* RC PCIe Link Status/Control (std cap) */
 
 /* BCM2711 outbound ATU registers — configure CPU→PCIe address translation */
@@ -185,36 +185,24 @@ static void delay_ms(int ms) {
  * For the VL805 (always bus=0, dev=0, func=0 from EXT_CFG's perspective),
  * only offsets 0x00 (ID) and 0x04 (Command) are reliably forwarded.
  */
-/*
- * EXT_CFG config access — matches Linux pcie-brcmstb.c brcm_pcie_map_bus():
- *   INDEX = bus<<20 | dev<<15 | fn<<12 | (offset & ~3)
- *   DATA  = EXT_CFG_DATA_BASE + (offset & ~3)   ← fixed base, full offset
- *
- * The full dword-aligned offset goes into BOTH the INDEX register AND is
- * added to the fixed DATA base (RC+0x8000).  The INDEX selects which device
- * and which dword; DATA+offset is where the actual read/write lands.
- * This is NOT a sliding window — DATA base is always RC+0x8000.
- */
 uint32_t pci_read_config(pci_dev_t *dev, uint32_t offset) {
-    uint32_t aligned = offset & ~3U;
     uint32_t idx = ((uint32_t)dev->bus  << 20) |
                    ((uint32_t)dev->dev  << 15) |
                    ((uint32_t)dev->func << 12) |
-                   aligned;
+                   (offset & ~0xFFFU);
     writel(idx, pcie_base + PCIE_EXT_CFG_INDEX_OFF);
     asm volatile("dsb sy; isb" ::: "memory");
-    return readl(pcie_base + PCIE_EXT_CFG_DATA_OFF + aligned);
+    return readl(pcie_base + PCIE_EXT_CFG_DATA_OFF + (offset & 0xFFF));
 }
 
 void pci_write_config(pci_dev_t *dev, uint32_t offset, uint32_t value) {
-    uint32_t aligned = offset & ~3U;
     uint32_t idx = ((uint32_t)dev->bus  << 20) |
                    ((uint32_t)dev->dev  << 15) |
                    ((uint32_t)dev->func << 12) |
-                   aligned;
+                   (offset & ~0xFFFU);
     writel(idx, pcie_base + PCIE_EXT_CFG_INDEX_OFF);
     asm volatile("dsb sy; isb" ::: "memory");
-    writel(value, pcie_base + PCIE_EXT_CFG_DATA_OFF + aligned);
+    writel(value, pcie_base + PCIE_EXT_CFG_DATA_OFF + (offset & 0xFFF));
     asm volatile("dsb sy; isb" ::: "memory");
 }
 
@@ -324,98 +312,61 @@ static int pcie_bring_up_link(void) {
     }
 
     /*
-     * SKIP-RESET DECISION
+     * BCM2711 RGR1_SW_INIT_1 — empirically confirmed register behaviour:
      *
-     * start4.elf initialises the VL805 (loads firmware, enables xHCI) then
-     * does "PCI0 reset" (RGR1=0x3) before handing off to our kernel.
-     * This PCI0 reset clears the ATU registers (WIN0_LO, MISC_CTRL, etc.)
-     * but does NOT wipe the VL805's own firmware or its BAR assignment.
+     *   RGR1 = 0x00000000  →  LINK UP  (RC active, PERST# deasserted)
+     *   RGR1 = 0x00000001  →  LINK FAILED (boots 16-17)
      *
-     * If RC_WIN (offset 0x20) is non-zero, firmware completed full PCIe
-     * init and the VL805 has its BAR programmed.  We can skip PERST# and
-     * go straight to ATU re-arm, avoiding the fatal combination of:
-     *   (a) PERST# wiping VL805 firmware from SRAM
-     *   (b) vl805.bin absent from SD → mailbox tag 0x00030058 fails
-     *   (c) VL805 stuck at bare-metal reset, xHCI unresponsive
+     * Firmware leaves RGR1 = 0x00000003 (both bits set).
+     * Clearing BOTH bits (→ 0x00000000) produces a working link.
+     * Clearing only bit 1 (→ 0x00000001) fails.
      *
-     * PCIE_STATUS bits 4+5 (pcie_link_up + pcie_dl_up) survive start4.elf's
-     * "PCI0 reset".  If both set at entry: VL805 is alive, BAR assigned by
-     * the VC — skip PERST# and mailbox entirely.
-     * If link is down: cold boot (CM4 rpiboot etc) — do full PERST# + mailbox.
-     *
-     * RC_WIN (offset 0x20) is NOT a reliable signal: start4.elf's PCI0 reset
-     * clears it to 0 before handoff regardless of board or firmware state.
+     * Sequence:
+     *   Step 1 — Clear bit 1 (RC soft reset): RC comes out of reset.
+     *   Step 2 — Clear bit 0 (PERST#): VL805 is released / link trains.
      */
-    uint32_t entry_status = readl(pcie_base + MISC_PCIE_STATUS_OFF);
-    int link_up_at_entry  = (entry_status & (1U << 4)) && (entry_status & (1U << 5));
-    uint32_t fw_rc_win    = readl(pcie_base + 0x20);  /* logging only */
-    uart_puts("[PCI] PCIE_STATUS at entry="); print_hex32(entry_status);
-    uart_puts(link_up_at_entry
-        ? "  -> link UP — firmware left VL805 running, SKIPPING PERST#\n"
-        : "  -> link DOWN — cold boot, doing PERST# reset\n");
-    uart_puts("[PCI] RC_WIN at entry="); print_hex32(fw_rc_win); uart_puts("\n");
+    rgr1 &= ~(1U << 1);
+    writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
+    asm volatile("dsb sy; isb" ::: "memory");
+    delay_ms(1);
 
-    if (!link_up_at_entry) {
-        /*
-         * BCM2711 RGR1_SW_INIT_1 — empirically confirmed register behaviour:
-         *
-         *   RGR1 = 0x00000000  →  LINK UP  (RC active, PERST# deasserted)
-         *   RGR1 = 0x00000001  →  LINK FAILED (boots 16-17)
-         *
-         * Firmware leaves RGR1 = 0x00000003 (both bits set).
-         * Clearing BOTH bits (→ 0x00000000) produces a working link.
-         * Clearing only bit 1 (→ 0x00000001) fails.
-         *
-         * Sequence:
-         *   Step 1 — Clear bit 1 (RC soft reset): RC comes out of reset.
-         *   Step 2 — Clear bit 0 (PERST#): VL805 is released / link trains.
-         */
-        rgr1 &= ~(1U << 1);
-        writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
-        asm volatile("dsb sy; isb" ::: "memory");
-        delay_ms(1);
+    rgr1 &= ~(1U << 0);
+    writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
+    asm volatile("dsb sy; isb" ::: "memory");
 
-        rgr1 &= ~(1U << 0);
-        writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
-        asm volatile("dsb sy; isb" ::: "memory");
-    }
-
-    if (!link_up_at_entry) {
-        /* Step 3: wait for PCIe link layer to come up after PERST# (~650 ms) */
-        uint32_t reg;
-        int link_ms = 0;
-        for (int t = 200; t > 0; t--) {
-            delay_ms(10);
-            link_ms += 10;
-            reg = readl(pcie_base + MISC_PCIE_STATUS_OFF);
-            if ((reg & (1U << 4)) && (reg & (1U << 5))) {
-                uart_puts("[PCI]   LINK UP after ");
-                if (link_ms >= 100) uart_putc('0' + link_ms / 100);
-                uart_putc('0' + (link_ms / 10) % 10);
-                uart_putc('0' + link_ms % 10);
-                uart_puts(" ms\n");
-                break;
-            }
-            if (t == 1) { uart_puts("[PCI]   LINK FAILED\n"); return -1; }
+    /* Step 3: wait for PCIe link layer to come up (~50–100 ms typical) */
+    uint32_t reg;
+    int link_ms = 0;
+    for (int t = 200; t > 0; t--) {
+        delay_ms(10);
+        link_ms += 10;
+        reg = readl(pcie_base + MISC_PCIE_STATUS_OFF);
+        if ((reg & (1U << 4)) && (reg & (1U << 5))) {
+            uart_puts("[PCI]   LINK UP after ");
+            /* print link_ms decimal */
+            if (link_ms >= 100) uart_putc('0' + link_ms / 100);
+            uart_putc('0' + (link_ms / 10) % 10);
+            uart_putc('0' + link_ms % 10);
+            uart_puts(" ms\n");
+            break;
         }
-
-        /* Minimum wait after link-up — actual SPI-ready polling happens later
-         * in pci_init_pi4() once EXT_CFG is armed and we can read VL805 Command. */
-        uart_puts("[PCI]   Waiting 100ms minimum after link-up...\n");
-        delay_ms(100);
-
-        uart_puts("[PCI] RGR1 post-link=");
-        print_hex32(readl(pcie_base + RGR1_SW_INIT_1_OFF));
-        uart_puts("\n");
-    } else {
-        uart_puts("[PCI]   Link already up — no wait needed\n");
+        if (t == 1) { uart_puts("[PCI]   LINK FAILED\n"); return -1; }
     }
+
+    uart_puts("[PCI]   Waiting 500ms for VL805 SPI firmware load...\n");
+    delay_ms(500);
+
+    /* Print RGR1 so we can verify the PERST# state at MMIO access time */
+    uart_puts("[PCI] RGR1 post-link=");
+    print_hex32(readl(pcie_base + RGR1_SW_INIT_1_OFF));
+    uart_puts("\n");
 
     /*
-     * POST-RESET ATU SNAPSHOT — only meaningful after PERST#.
-     * Shows what the hardware reset-defaults to before our writes.
+     * POST-RESET ATU SNAPSHOT — compare with pre-reset values above.
+     * Any register that changed was wiped by the RC soft reset / PERST#.
+     * These are the registers we need to restore to re-arm the AXI bridge.
      */
-    if (!link_up_at_entry) {
+    {
         uart_puts("[POST-RESET] ATU state after link-up (before our writes):\n");
         uint32_t post_win0_lo    = readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
         uint32_t post_win0_hi    = readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_HI);
@@ -469,9 +420,7 @@ static int pcie_bring_up_link(void) {
     ccr = (ccr & 0xFF000000U) | RC_CORRECT_CLASS;
     writel(ccr, pcie_base + RC_CFG_PRIV1_ID_VAL3_OFF);
 
-    /* Return 2 = skip-reset (firmware already inited VL805, no PERST# done)
-     *        1 = did PERST# reset (cold boot, need mailbox to reload firmware) */
-    return link_up_at_entry ? 2 : 1;
+    return 0;
 }
 
 /* ── FLR ────────────────────────────────────────────────────────── */
@@ -502,29 +451,6 @@ static void pcie_setup_outbound_window(void) {
     uart_puts("[PCI] Configuring outbound ATU window...\n");
 
     /*
-     * CRITICAL ORDERING: Enable SCB_ACCESS_EN (MISC_CTRL bit 12) BEFORE
-     * writing any WIN0 registers.
-     *
-     * On BCM2711 the MISC_CPU_2_PCIE_MEM_WIN0_* registers are guarded by
-     * the SCB (System Crossbar Bridge) access enable gate.  Writing them
-     * with SCB_ACCESS_EN=0 causes an AXI SLVERR on the write bus, which
-     * triggers a synchronous data abort.  With no exception vectors
-     * installed the CPU hangs silently — exactly what we see on CM4.
-     *
-     * Linux pcie-brcmstb.c writes MISC_CTRL first, then WIN0.  We must
-     * do the same.
-     */
-    uart_puts("[PCI] ATU: MISC_CTRL before="); print_hex32(readl(pcie_base + MISC_MISC_CTRL_OFF)); uart_puts("\n");
-    uint32_t ctrl = readl(pcie_base + MISC_MISC_CTRL_OFF);
-    ctrl |= (1U << 12);         /* SCB_ACCESS_EN — gate must open first */
-    ctrl |= (1U << 2);          /* CFG_READ_UR_MODE */
-    ctrl  = (ctrl & ~0x1F0U) | 0x0F0U; /* SCB0_SIZE=15 = 1GB inbound */
-    writel(ctrl, pcie_base + MISC_MISC_CTRL_OFF);
-    asm volatile("dsb sy; isb" ::: "memory");
-    uart_puts("[PCI] ATU: MISC_CTRL after ="); print_hex32(readl(pcie_base + MISC_MISC_CTRL_OFF)); uart_puts("\n");
-
-    /*
-     * Now safe to write the CPU-side window registers.
      * BCM2711 outbound ATU register encoding — verified against Linux
      * pcie-brcmstb.c and cross-checked against 25+ boots of diagnostics.
      *
@@ -546,61 +472,35 @@ static void pcie_setup_outbound_window(void) {
      *   equal to the access address. BCM2711 lower bound check is exclusive
      *   (addr > base), so access at exactly base FAILS â 0xdeaddead in 0 ticks.
      *
-
-
-
+     * BASE_HI / LIMIT_HI â upper bits of cpu_xxx_mb beyond bit 15
+     *   0x6000 and 0x603F both fit in 16 bits â HI fields are 0x00000000.
+     *   PREVIOUS BUG: writing 0x6 shifted the window to wrong addresses.
      *
      * WIN0_LO is also written in pci_init_pi4() with the confirmed BAR value.
      */
-    /*
-     * Now safe to write the CPU-side window registers.
-     *
-     * BCM2711 Pi 4B DTS outbound window (from bcm2711-rpi-4-b.dts ranges):
-     *   CPU  address: 0x600000000  (34-bit)
-     *   PCI  address: 0xC0000000   (32-bit, VL805 BAR assigned here by firmware)
-     *   Size:         0x40000000   (1 GB)
-     *
-     * WIN0_LO / WIN0_HI — PCI destination address (where TLPs are sent TO):
-     *   WIN0_LO = 0xC0000000  lower 32 bits of PCI dest
-     *   WIN0_HI = 0x00000000  upper 8 bits — VL805 is 32-bit, upper = 0
-     *
-     * BASE_LIMIT — CPU source window bounds, PCI bridge register format:
-     *   bits[31:20] = limit[31:20] i.e. (cpu_limit >> 20) & 0xFFF
-     *   bits[15:4]  = base[31:20]  i.e. (cpu_base  >> 20) & 0xFFF
-     *   cpu_base  = 0x600000000: (0x600000000 >> 20) & 0xFFF = 0x000
-     *   cpu_limit = 0x63FFFFFFF: (0x63FFFFFFF >> 20) & 0xFFF = 0x3FF
-     *   BASE_LIMIT = (0x3FF << 20) | (0x000 << 4) = 0x3FF00000
-     *   NOTE: the upper 4 bits of the MB number (the "0x6" prefix) go into
-     *   BASE_HI / LIMIT_HI — they do NOT fit in BASE_LIMIT's 12-bit fields.
-     *
-     * BASE_HI / LIMIT_HI — upper 32 bits of the 40-bit CPU address:
-     *   cpu_addr >> 32 = 0x600000000 >> 32 = 0x6
-     *   Both BASE_HI and LIMIT_HI = 0x00000006
-     *   These registers read back as 0 (write-only / read-as-zero on BCM2711)
-     *   but the written value IS used by the ATU hardware.
-     */
-    uart_puts("[PCI] ATU: writing WIN0_LO (PCI dest = 0xC0000000)...\n");
-    writel(0xC0000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
-    asm volatile("dsb sy; isb" ::: "memory");
-    uart_puts("[PCI] ATU: WIN0_LO="); print_hex32(readl(pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO)); uart_puts("\n");
+    writel(0x80000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);   /* PCIe dest LO = VL805 BAR */
+    writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_HI);   /* PCIe dest HI = 0 (32-bit device) */
+    writel(0x603F5FFFUL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT); /* base_mb=0x5FFF (1MB below window start) so addr 0x6000 > base_mb, passes strict > check */
+    writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI);   /* base_mb  0x6000 < 0x10000 */
+    writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);  /* limit_mb 0x603F < 0x10000 */
 
-    uart_puts("[PCI] ATU: writing WIN0_HI (0x0 — PCI dest is 32-bit)...\n");
-    writel(0x00000000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_HI);
-    asm volatile("dsb sy; isb" ::: "memory");
-
-    uart_puts("[PCI] ATU: writing BASE_LIMIT (0x3FF00000)...\n");
-    writel(0x3FF00000UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT);
-    asm volatile("dsb sy; isb" ::: "memory");
-
-    uart_puts("[PCI] ATU: writing BASE_HI/LIMIT_HI (0x6 = upper32 of 0x600000000)...\n");
-    /*
-     * BASE_HI / LIMIT_HI = cpu_addr >> 32 = 0x6.
-     * These read back as 0 on BCM2711 (write-only registers) but are
-     * functionally active — without them the ATU window is at 0x000000000
-     * and every access to 0x600000000 gets a fabric abort.
-     */
-    writel(0x00000006UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI);
-    writel(0x00000006UL, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);
+    /* SCB_ACCESS_EN (bit 12): gates the ARM→PCIe outbound path.
+     * THIS IS THE BIT THAT ENABLES MEMORY TLPs FROM THE ARM TO THE VL805.
+     * Without it the BCM2711 AXI→PCIe bridge returns 0xdeaddead INSTANTLY
+     * (measured: 1 clock tick = 18.5ns) — no TLP is ever put on the wire.
+     *
+     * CRITICAL: The bit is BIT(12) = 0x1000, NOT BIT(8) = 0x100.
+     * Linux pcie-brcmstb.c: PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN_MASK = BIT(12)
+     * We were setting bit 8 for 18 boots — the outbound path was never enabled.
+     *
+     * CFG_READ_UR_MODE (bit 2): UR completions return 0xFFFFFFFF not 0xdeaddead.
+     * SCB0_SIZE (bits[4:0] = 0xF): inbound DMA window size = 1GB (log2(1G)-15=15).
+     * Note: SCB0_SIZE=0xF (01111) already sets bit 2 (CFG_READ_UR_MODE). */
+    uint32_t ctrl = readl(pcie_base + MISC_MISC_CTRL_OFF);
+    ctrl |= (1U << 12);         /* SCB_ACCESS_EN — ENABLES outbound ARM→PCIe path */
+    ctrl |= (1U << 2);          /* CFG_READ_UR_MODE: UR → 0xFFFFFFFF not 0xdeaddead */
+    ctrl  = (ctrl & ~0x1F0U) | 0x0F0U; /* SCB0_SIZE=15 at bits[8:4] (Linux GENMASK(8,4)) = 1GB */
+    writel(ctrl, pcie_base + MISC_MISC_CTRL_OFF);
     asm volatile("dsb sy; isb" ::: "memory");
 
     ctrl = readl(pcie_base + MISC_MISC_CTRL_OFF);
@@ -727,22 +627,28 @@ static void pci_init_pi4(void) {
     pcie_base = ioremap(PI4_PCIE_RC_BASE, 0x10000);
     if (!pcie_base) { uart_puts("[PCI] ERROR: ioremap(Pi4 PCIe RC) failed\n"); return; }
 
-    int link_result = pcie_bring_up_link();
-    if (link_result <= 0) return;
-    int fw_already_inited = (link_result == 2);
+    if (pcie_bring_up_link() != 0) return;
 
     /*
-     * Step 1: Determine VL805 BAR address.
+     * Step 1: Determine VL805 BAR address after PERST# reset.
      *
-     * Skip-reset path (fw_already_inited=1):
-     *   start4.elf ran, assigned VL805 BAR, left RC_WIN=0xbff08000.
-     *   RC_WIN encodes PCI base in bits[15:4]: 0xbff08000 → base=0x80000000.
-     *   Use pci_bar=0x80000000 and keep RC_WIN as-is.
+     * Our PERST# cycle resets the VL805. After SPI reload, the VL805 BAR
+     * registers return to 0x00000000 (PCIe spec default — nobody has
+     * re-enumerated and assigned a PCI address since the reset).
      *
-     * PERST# reset path (fw_already_inited=0):
-     *   VL805 was PERST# reset, its BAR reverted to 0x80000000 (the value
-     *   the RC had been presenting it at). RC_WIN hardware-default = 0xbff08000.
-     *   Same pci_bar=0x80000000.
+     * The firmware's RC bridge memory window (pcie_base+0x20) was set by
+     * start4.elf to 0xbff08000 (base=0x80000000) BEFORE our PERST# cycle.
+     * That value is now stale.
+     *
+     * CRITICAL: The BCM2711 RC uses its Type-1 bridge window (config 0x20)
+     * to decide which outbound TLPs to forward downstream. TLPs whose PCI
+     * address falls outside the window are DROPPED, returning 0xdeaddead.
+     *
+     * Boot 21 confirmed: after PERST#, RC_WIN hardware-resets to 0xbff08000
+     * (base=0x80000000, limit=0xBFFF0000).  The VL805 BAR is therefore at
+     * 0x80000000 — this is where the RC presented it during enumeration.
+     *
+     * The fix (boot 22): set WIN0_LO=0x80000000 and DO NOT touch RC_WIN.
      */
     uint32_t fw_win = readl(pcie_base + 0x20);
     uart_puts("[PCI] FW memory window: "); print_hex32(fw_win); uart_puts("\n");
@@ -768,13 +674,7 @@ static void pci_init_pi4(void) {
      * the correct value.  Writing 0x00000000 collapses the bridge window
      * and drops every subsequent TLP — this was the bug across boots 1–21.
      */
-    /*
-     * VL805 PCI BAR address = 0xC0000000.
-     * This is what the Pi 4B DTS specifies (CPU 0x600000000 ↔ PCI 0xC0000000)
-     * and what Linux/firmware assigns.  The RC bridge window and ATU WIN0_LO
-     * both use this value.
-     */
-    uint32_t pci_bar = 0xC0000000U;
+    uint32_t pci_bar = 0x80000000U;
 
     /*
      * Step 2 (CRITICAL SEQUENCE): VL805 firmware notification via mailbox.
@@ -859,14 +759,11 @@ static void pci_init_pi4(void) {
      * The VL805 EXT_CFG writes (Command, FLR) still happen AFTER the mailbox.
      */
 
-    /* A) RC memory window.
-     * After PERST# + SPI auto-load the VL805 BAR = 0x00000000 (reset default).
-     * We cannot assign a BAR via EXT_CFG (silently dropped by BCM2711).
-     * Instead we match the ATU and RC window to BAR=0:
-     *   WIN0_LO = 0x00000000  (TLPs sent to PCI 0x00000000 = VL805 BAR)
-     *   RC window covers PCI 0x00000000–0x0FFFFFFF
-     */
-    writel(0xFFF0C000U, pcie_base + 0x20);
+    /* A) RC memory window — must cover VL805 at PCI 0x80000000.
+     *    On Pi 4B: hardware resets to 0xbff08000 after PERST#.
+     *    On CM4:   stays 0x00000000 after link-up — must be written explicitly.
+     *    Unconditionally write the correct value on all BCM2711 variants. */
+    writel(0xbff08000U, pcie_base + 0x20);
     asm volatile("dsb sy; isb" ::: "memory");
     uart_puts("[PCI] RC mem win set: "); print_hex32(readl(pcie_base + 0x20)); uart_puts("\n");
 
@@ -884,66 +781,29 @@ static void pci_init_pi4(void) {
     delay_ms(5);
     uart_puts("[PCI] RC buses: "); print_hex32(readl(pcie_base + 0x18)); uart_puts("\n");
 
-    /* Initialise vl805_dev BDF — bus=1 dev=0 fn=0 per DTB usb@0,0 node */
-    vl805_dev.bus = 1; vl805_dev.dev = 0; vl805_dev.func = 0;
-
     /*
-     * Step 4a: Poll VL805 Command register until SPI firmware load completes.
+     * Step 4: VL805 firmware notification via mailbox.
      *
-     * After PERST# the VL805 autonomously loads firmware from its SPI flash.
-     * Firmware sets bit 20 of the Command register (0x00100000) when ready.
-     * Until that bit is set, BAR writes are silently dropped and MMIO reads
-     * return 0xdeaddead.  A fixed 500ms wait is not reliable across all boots.
+     * NOW the RC is fully configured — bus numbers assigned, Memory Space
+     * enabled, bridge window open to 0x80000000.  The VC can reach the VL805
+     * at BDF 1:0.0 to load its firmware.
      *
-     * Poll up to 2 seconds in 10ms increments.  On a warm board ~600–700ms
-     * is typical; on a cold board or after a long PERST# it can take longer.
+     * We still call this BEFORE any EXT_CFG writes to VL805 config space
+     * (Command register, FLR) — touching VL805 config via EXT_CFG after the
+     * mailbox call is fine; touching it BEFORE would lock the VC out.
      */
-    if (!fw_already_inited) {
-        uart_puts("[VL805] Polling for SPI firmware ready (Command bit 20)...\n");
-        int spi_ready = 0;
-        int spi_ms = 0;
-        for (int t = 200; t > 0; t--) {
-            uint32_t cmd_poll = pci_read_config(&vl805_dev, 0x04);
-            if (cmd_poll & (1U << 20)) {
-                spi_ready = 1;
-                uart_puts("[VL805] SPI firmware ready after ");
-                if (spi_ms >= 1000) uart_putc('0' + spi_ms / 1000);
-                if (spi_ms >= 100)  uart_putc('0' + (spi_ms / 100) % 10);
-                uart_putc('0' + (spi_ms / 10) % 10);
-                uart_putc('0' + spi_ms % 10);
-                uart_puts("ms  Command=");
-                print_hex32(cmd_poll);
-                uart_puts("\n");
-                break;
-            }
-            delay_ms(10);
-            spi_ms += 10;
-        }
-        if (!spi_ready) {
-            uart_puts("[VL805] WARNING: SPI firmware not ready after 2000ms — proceeding anyway\n");
-        }
-    }
+    extern int vl805_init(void);
+    vl805_init();
 
-    /*
-     * Step 4b: ATU outbound window.
-     * WIN0_LO=0xC0000000 was written in pcie_setup_outbound_window().
-     * RC bridge window = 0xFFF0C000 covers PCI 0xC0000000–0xFFFFFFFF.
-     * Once the SPI poll confirms firmware ready the BAR write in Step 6
-     * assigns BAR=0xC0000000 and the ATU is already aligned.
-     */
-    if (fw_already_inited)
-        uart_puts("[VL805] Firmware already loaded by start4.elf\n");
-
-    uart_puts("[PCI] RC bridge window: ");
-    print_hex32(readl(pcie_base + 0x20)); uart_puts("\n");
+    /* Confirm bridge window is still intact after mailbox */
+    uart_puts("[PCI] RC bridge window after mailbox: ");
+    print_hex32(readl(pcie_base + 0x20)); uart_puts(" (expect 0xbff08000)\n");
 
     /*
      * Step 5: Verify VL805 via EXT_CFG bus=1 (TYPE-1 config TLPs now forwarded).
      * The mailbox call above should have loaded VL805 firmware — give it a moment.
      */
-    /*
-     * Step 5: Verify VL805 via EXT_CFG.
-     */
+    vl805_dev.bus = 1; vl805_dev.dev = 0; vl805_dev.func = 0;
     uint32_t id = 0;
     for (int retry = 0; retry < 10; retry++) {
         id = pci_read_config(&vl805_dev, 0x00);
@@ -1008,8 +868,8 @@ static void pci_init_pi4(void) {
      * Then update the RC memory window and ATU to match.
      * Readback confirms whether EXT_CFG can actually write VL805 BARs.
      */
-    uart_puts("[PCI] Writing BAR0 = 0xC0000004 via EXT_CFG bus=1...\n");
-    pci_write_config(&vl805_dev, 0x10, 0xC0000004U);  /* 64-bit memory, base=0x80000000 */
+    uart_puts("[PCI] Writing BAR0 = 0x80000004 via EXT_CFG bus=1...\n");
+    pci_write_config(&vl805_dev, 0x10, 0x80000004U);  /* 64-bit memory, base=0x80000000 */
     pci_write_config(&vl805_dev, 0x14, 0x00000000U);  /* BAR1 upper 32 = 0 */
     asm volatile("dsb sy; isb" ::: "memory");
     delay_ms(5);
@@ -1018,15 +878,15 @@ static void pci_init_pi4(void) {
     uart_puts("[PCI] BAR0 after write="); print_hex32(bar0_after);
     uart_puts("  BAR1="); print_hex32(bar1_after); uart_puts("\n");
 
-    if ((bar0_after & 0xFFFFFFF0U) == 0xC0000000U) {
+    if ((bar0_after & 0xFFFFFFF0U) == 0x80000000U) {
         /* EXT_CFG CAN write VL805 BAR — update ATU and RC window to match */
-        uart_puts("[PCI] BAR write SUCCESS → VL805 BAR = 0xC0000000\n");
-        pci_bar = 0xC0000000U;
+        uart_puts("[PCI] BAR write SUCCESS → VL805 BAR = 0x80000000\n");
+        pci_bar = 0x80000000U;
         writel(pci_bar, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
         /* Restore firmware's RC memory window (covers 0x80000000-0xBFFFFFFF) */
-        writel(0xFFF0C000U, pcie_base + 0x20);
+        writel(0xbff08000U, pcie_base + 0x20);
         asm volatile("dsb sy; isb" ::: "memory");
-        uart_puts("[PCI] ATU WIN0_LO=0xC0000000, RC window=0xFFF0C000\n");
+        uart_puts("[PCI] ATU WIN0_LO=0x80000000, RC window=0xbff08000\n");
     } else if ((bar0_after & 0xFFFFFFF0U) == 0x00000000U) {
         uart_puts("[PCI] BAR write had NO EFFECT (EXT_CFG can't write BAR) — keeping BAR=0x00000000\n");
     } else {
@@ -1085,104 +945,63 @@ static void pci_init_pi4(void) {
         /* RC_BAR2 already set above (before mailbox) — just confirm it here */
     }
 
-    /* ── TIMING DIAGNOSTIC ───────────────────────────────────────────────────
-     * Measure how long a readl of xhci_base takes to determine whether TLPs
-     * are being sent at all, or whether the BCM2711 fabric returns 0xdeaddead
-     * before the TLP even hits the wire.
+    /* ── TIMING DIAGNOSTIC: measure how long a failing readl takes ──────────
+     * This resolves the key question: are TLPs being sent at all?
+     *
+     * If readl(xhci_base) returns in < 1ms:
+     *   → BCM2711 returns 0xdeaddead BEFORE sending any TLP (AXI bridge issue)
+     *   → The PCIe outbound path is blocked at the SoC level
+     *
+     * If readl(xhci_base) takes ~50ms (PCIe completion timeout):
+     *   → TLP IS sent on the wire, VL805 not responding
+     *   → SerDes / VL805 state issue
      *
      * ARM Generic Timer at 54 MHz: 1ms = 54,000 counts.
-     *   < 1,000 ticks  (~18µs) → fabric abort before TLP sent
-     *   54,000–5,400,000 ticks  → PCIe completion timeout (TLP was sent)
-     *
-     * CRITICAL: must dsb+isb between the load and the second timer read to
-     * prevent speculative execution of the timer read before the load issues.
      */
     {
         uint64_t t0, t1;
-        volatile uint32_t timed_read;
-        asm volatile("dsb sy; isb" ::: "memory");
         asm volatile("mrs %0, cntpct_el0" : "=r"(t0));
-        timed_read = readl(xhci_base);
-        asm volatile("dsb sy; isb" ::: "memory");   /* ← barrier BEFORE t1 read */
+        volatile uint32_t timed_read = readl(xhci_base);
         asm volatile("mrs %0, cntpct_el0" : "=r"(t1));
         (void)timed_read;
         uint64_t elapsed = t1 - t0;
-        uint32_t elapsed_us = (uint32_t)(elapsed / 54);
+        uint32_t elapsed_us = (uint32_t)(elapsed / 54);   /* 54 ticks per µs */
         uint32_t elapsed_ms = elapsed_us / 1000;
         uart_puts("[PCI] TIMING: readl took ");
+        /* print ms */
         if (elapsed_ms >= 1000) { uart_putc('0' + (elapsed_ms/1000)%10); uart_putc(','); }
         uart_putc('0' + (elapsed_ms/100)%10);
         uart_putc('0' + (elapsed_ms/10)%10);
         uart_putc('0' + elapsed_ms%10);
-        uart_puts(" ms (0x");
+        uart_puts(" ms (");
+        /* print raw counts high word */
         print_hex32((uint32_t)(elapsed >> 32));
         uart_putc('_');
         print_hex32((uint32_t)elapsed);
         uart_puts(" ticks @ 54MHz)\n");
-        if (elapsed < 1000ULL)
-            uart_puts("[PCI] TIMING: < 1000 ticks → AXI fabric abort (TLP never sent)\n");
-        else if (elapsed < 54000ULL)
-            uart_puts("[PCI] TIMING: < 1ms → very fast, unexpected\n");
+        if (elapsed_ms < 1)
+            uart_puts("[PCI] TIMING: < 1ms → TLP NOT SENT (AXI→PCIe bridge blocked)\n");
+        else if (elapsed_ms < 10)
+            uart_puts("[PCI] TIMING: < 10ms → very fast timeout (unexpected)\n");
         else
-            uart_puts("[PCI] TIMING: >= 1ms → PCIe completion timeout (TLP WAS sent!)\n");
+            uart_puts("[PCI] TIMING: >= 10ms → PCIe completion timeout (TLP WAS sent)\n");
     }
 
-    /*
-     * ATU sweep: try WIN0_LO candidates.  For each, also temporarily adjust
-     * the RC bridge window (config 0x20) to cover that PCIe address range —
-     * the bridge window gates TLP forwarding independently of the ATU.
-     *
-     * RC bridge window register (config offset 0x20) encoding (PCI spec §3.2.5.6):
-     *   bits[31:20] = Memory Limit  (upper 12 bits, 1MB aligned, inclusive)
-     *   bits[15:4]  = Memory Base   (upper 12 bits, 1MB aligned, inclusive)
-     *   => To cover PCI 0x80000000–0x8FFFFFFF: writel(0x8ff08000, base+0x20)
-     *   => To cover PCI 0x00000000–0x0FFFFFFF: writel(0x0ff00000, base+0x20)
-     *
-     * We save and restore the original RC_WIN value around each probe.
-     */
-    uint32_t orig_rc_win = readl(pcie_base + 0x20);
-    static const uint32_t sweep[] = { 0x00000000, 0xC0000000, 0x80000000, 0xF8000000 };
-    static const uint32_t sweep_rc_win[] = {
-        0x0FF00000,   /* cover PCI 0x00000000–0x0FFFFFFF (VL805 reset BAR) */
-        0xFFF0C000,   /* cover PCI 0xC0000000–0xFFFFFFFF (DTS mapping) */
-        0x8ff08000,   /* cover PCI 0x80000000–0x8FFFFFFF (firmware mapping) */
-        0xfff0f800,   /* cover PCI 0xF8000000–0xFFFFFFFF */
-    };
+    static const uint32_t sweep[] = { 0x00000000, 0x80000000, 0xF8000000, 0xC0000000 };
     uint32_t live_bar = 0xFFFFFFFF;
     for (int s = 0; s < 4; s++) {
-        /* Set RC bridge window to cover this PCIe address range */
-        writel(sweep_rc_win[s], pcie_base + 0x20);
         writel(sweep[s], pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
         asm volatile("dsb sy; isb" ::: "memory");
         delay_ms(5);
-
-        /* Time this read with proper barriers */
-        uint64_t st0, st1;
-        volatile uint32_t v;
-        asm volatile("dsb sy; isb" ::: "memory");
-        asm volatile("mrs %0, cntpct_el0" : "=r"(st0));
-        v = readl(xhci_base);
-        asm volatile("dsb sy; isb" ::: "memory");
-        asm volatile("mrs %0, cntpct_el0" : "=r"(st1));
-        uint64_t sticks = st1 - st0;
-
+        uint32_t v = readl(xhci_base);
         uart_puts("[PCI] ATU sweep WIN0_LO="); print_hex32(sweep[s]);
-        uart_puts(" RC_WIN="); print_hex32(sweep_rc_win[s]);
-        uart_puts(" ticks=0x"); print_hex32((uint32_t)sticks);
-        uart_puts(" MMIO[0]="); print_hex32(v);
-        if (v == 0xFFFFFFFF)      uart_puts(" <- UR\n");
-        else if (v == 0xdeaddead) uart_puts(sticks < 1000 ? " <- fabric abort\n" : " <- PCIe timeout\n");
+        uart_puts("  MMIO[0]="); print_hex32(v);
+        if (v == 0xFFFFFFFF)      uart_puts(" <- UR (TLP reaches VL805)\n");
+        else if (v == 0xdeaddead) uart_puts(" <- TIMEOUT (TLP lost)\n");
         else                      { uart_puts(" <- LIVE DATA!\n"); if (live_bar == 0xFFFFFFFF) live_bar = sweep[s]; }
     }
-
-    /* Restore original RC_WIN or use the live BAR */
+    /* Restore to the BAR we believe is correct */
     uint32_t use_bar = (live_bar != 0xFFFFFFFF) ? live_bar : pci_bar;
-    uint32_t use_rc_win = (live_bar != 0xFFFFFFFF) ? sweep_rc_win[/* find index */0] : orig_rc_win;
-    /* Re-find the matching rc_win for use_bar */
-    for (int s = 0; s < 4; s++) {
-        if (sweep[s] == use_bar) { use_rc_win = sweep_rc_win[s]; break; }
-    }
-    writel(use_rc_win, pcie_base + 0x20);
     writel(use_bar, pcie_base + MISC_CPU_2_PCIE_MEM_WIN0_LO);
     asm volatile("dsb sy; isb" ::: "memory");
     if (live_bar != 0xFFFFFFFF && live_bar != pci_bar) {
@@ -1191,7 +1010,7 @@ static void pci_init_pi4(void) {
         pci_bar = live_bar;
     } else if (live_bar == 0xFFFFFFFF) {
         uart_puts("[PCI] ATU sweep: all candidates dead\n");
-        uart_puts("[PCI] Check ticks: fabric abort = ATU/SCB issue; PCIe timeout = BAR/Memory Space issue\n");
+        uart_puts("[PCI] VL805 Memory Space likely not enabled in device\n");
     }
 
     /* Final raw dump with the winning BAR */

@@ -76,7 +76,7 @@ SECTIONS
          */
         . = ALIGN(64);
         *(.xhci_dma)          /* catch any explicit section()-attributed vars */
-        . += 0x1400;          /* 5120 B minimum: DCBAA+cmd_ring+evt_ring+ERST+scratch */
+        . += 0x42000;         /* DCBAA+rings+ERST+scratch_arr+ctx+ep0+scratch_pages(64×4KB) */
     }
     __xhci_dma_end = .;
     . = ALIGN(4096);
