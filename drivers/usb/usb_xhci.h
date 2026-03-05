@@ -75,16 +75,20 @@ typedef struct xhci_controller {
     void     *op_regs;       /**< Operational registers base */
     void     *runtime_regs;  /**< Runtime registers base */
     void     *doorbell_regs; /**< Doorbell registers base */
-    
+
     uint64_t  cap_regs_phys; /**< Physical address of cap regs */
-    
+
+    uint8_t   cap_len;       /**< CAPLENGTH value */
     uint8_t   max_slots;     /**< Maximum device slots */
     uint8_t   max_ports;     /**< Number of ports */
     uint8_t   num_intrs;     /**< Number of interrupters */
-    
+    uint8_t   scratchpad_count; /**< Scratchpad buffer count */
+    uint8_t   ac64;          /**< 64-bit addressing capable */
+    uint8_t   csz;           /**< Context size: 0=32B, 1=64B */
+
     uint32_t *dcbaa;         /**< Device Context Base Address Array */
     uint64_t  dcbaa_phys;    /**< Physical address of DCBAA */
-    
+
     int       initialized;   /**< Controller is ready */
 } xhci_controller_t;
 

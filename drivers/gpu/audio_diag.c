@@ -56,7 +56,7 @@ int audio_beep(int count)
         
         /* Send message */
         uint32_t phys = (uint32_t)(uint64_t)audio_msg;
-        uint32_t msg = ((phys & 0x0FFFFFFFU) | 0xC0000000U) | 8;
+        uint32_t msg = ((phys & 0x0FFFFFFFU) | 0x40000000U) | 8;  /* Pi4 coherent alias */
         
         /* Wait TX, send, wait RX - with short timeout */
         int timeout = 10000;
