@@ -1,20 +1,45 @@
-# Makefile for RISC OS Phoenix - Optimized for Raspberry Pi 5
-# Run this on the Pi 5 itself
+# Makefile for RISC OS Phoenix
+# Supports Raspberry Pi 4 and Pi 5
+#
+# Usage:
+#   make BOARD=pi4        # Build for Raspberry Pi 4 (default)
+#   make BOARD=pi5        # Build for Raspberry Pi 5
+#   make                  # Defaults to pi4
 
-CC = aarch64-linux-gnu-gcc
-AS = aarch64-linux-gnu-as
-LD = aarch64-linux-gnu-ld
-OBJCOPY = aarch64-linux-gnu-objcopy
+CC       = aarch64-linux-gnu-gcc
+AS       = aarch64-linux-gnu-as
+LD       = aarch64-linux-gnu-ld
+OBJCOPY  = aarch64-linux-gnu-objcopy
 
-CFLAGS = -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only \
-         -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp
-ASFLAGS = -mcpu=cortex-a72
-# Use GCC to assemble .S files so we get the C preprocessor and
-# ldr x0, =symbol  pseudo-instruction support via the GNU assembler
+# ── Board selection ──────────────────────────────────────────────────────────
+BOARD ?= pi4
+
+ifeq ($(BOARD),pi5)
+    CPU      = cortex-a76
+    BOARD_ID = 5
+    $(info Building for Raspberry Pi 5 (cortex-a76))
+else ifeq ($(BOARD),pi4)
+    CPU      = cortex-a72
+    BOARD_ID = 4
+    $(info Building for Raspberry Pi 4 (cortex-a72))
+else
+    $(error Unknown BOARD=$(BOARD). Use BOARD=pi4 or BOARD=pi5)
+endif
+
+# ── Flags ────────────────────────────────────────────────────────────────────
+CFLAGS  = -Wall -O2 -ffreestanding -mcpu=$(CPU) -mgeneral-regs-only \
+          -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp \
+          -DPI_MODEL=$(BOARD_ID)
+
+ASFLAGS = -mcpu=$(CPU)
+
+# Use GCC to assemble .S so we get CPP and ldr x0,=symbol support
 %.o: %.S
 	$(CC) $(CFLAGS) -x assembler-with-cpp -c $< -o $@
+
 LDFLAGS = -T kernel/linker.ld -nostdlib -static
 
+# ── Object files ─────────────────────────────────────────────────────────────
 OBJS = \
     kernel/boot.o \
     kernel/exceptions.o \
@@ -40,11 +65,10 @@ OBJS = \
     kernel/led_diag.o \
     kernel/periph_base.o \
     kernel/mmio.o \
-    kernel/pcie_bridge.o \
-	drivers/uart/uart.o \
+    drivers/uart/uart.o \
     drivers/gpu/gpu.o \
-	drivers/nvme/nvme.o \
-	drivers/usb/vl805_init.o \
+    drivers/nvme/nvme.o \
+    drivers/usb/vl805_init.o \
     drivers/usb/usb_storage.o \
     drivers/usb/usb_xhci.o \
     drivers/usb/usb_init.o \
@@ -70,12 +94,16 @@ OBJS = \
 
 TARGET = phoenix64.img
 
+# ── Rules ────────────────────────────────────────────────────────────────────
 all: $(TARGET)
 
 $(TARGET): kernel.elf
 	$(OBJCOPY) -O binary kernel.elf $(TARGET)
+	@echo ""
 	@echo "=== Build successful! ==="
-	@echo "Output: $(TARGET)"
+	@echo "Board  : $(BOARD) (Pi $(BOARD_ID))"
+	@echo "CPU    : $(CPU)"
+	@echo "Output : $(TARGET)"
 
 kernel.elf: $(OBJS)
 	$(LD) $(LDFLAGS) $(OBJS) -o kernel.elf
@@ -86,4 +114,10 @@ kernel.elf: $(OBJS)
 clean:
 	rm -f *.o */*.o */*/*.o kernel.elf $(TARGET)
 
-.PHONY: all clean
+help:
+	@echo "Usage:"
+	@echo "  make BOARD=pi4   # Raspberry Pi 4 (default)"
+	@echo "  make BOARD=pi5   # Raspberry Pi 5"
+	@echo "  make clean       # Remove build artefacts"
+
+.PHONY: all clean help
