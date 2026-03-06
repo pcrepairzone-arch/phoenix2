@@ -1,0 +1,1 @@
+make: *** No rule to make target 'kernel/boot.o', needed by 'kernel.elf'.  Stop.

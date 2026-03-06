@@ -825,19 +825,18 @@ static void pci_init_pi4(void) {
      * All DMA addresses the VL805 uses must be CPU_phys + 0xC0000000
      * (handled in usb_xhci.c via phys_to_dma()).
      *
-     * BCM2711 ENCODING (from Linux pcie-brcmstb.c encode_ibar_size):
-     *   RC_BAR2_LO = base_addr | (ilog2(size) - 12)
-     *   base = 0xC0000000, size = 1GB (2^30)
-     *   ilog2(2^30) - 12 = 30 - 12 = 18 = 0x12
-     *   LO = 0xC0000000 | 0x12 = 0xC0000012
-     *   HI = 0x00000000
+     * ENCODING: RC_BAR2_LO = base_addr | size_mask  (NOT a log2 field)
+     *   base  = 0xC0000000  (PCIe start of inbound window)
+     *   mask  = size - 1    = 0x40000000 - 1 = 0x3FFFFFFF  (1GB)
+     *   LO    = 0xC0000000 | 0x3FFFFFFF = 0xFFFFFFFF
+     *   HI    = upper 32 bits of base = 0x0
      *
-     * PREVIOUS BUG: wrote 0xFFFFFFFF (PCI BAR mask-OR encoding — wrong for BCM2711).
-     * Hardware decoded as base=0xFFFFF000 with a ~64-byte window, so VL805 DMA
-     * reads to 0xC80bxxxx found no valid inbound mapping → UR → HSE at 10µs.
+     * From Linux brcm_pcie.c pcie_set_rc_bar2():
+     *   writel(lower_32_bits(mask) | lower_32_bits(dma_addr), RC_BAR2_LO)
+     *   writel(upper_32_bits(dma_addr), RC_BAR2_HI)
      */
-    uart_puts("[PCI] RC_BAR2 setup (1GB inbound DMA, PCIe 0xC0000000 -> CPU 0x0)...\n");
-    writel(0xC0000012U, pcie_base + MISC_RC_BAR2_CFG_LO);  /* base=0xC0000000 | ilog2(1GB)-12=0x12 */
+    uart_puts("[PCI] RC_BAR2 setup (1GB inbound DMA, PCIe base 0xC0000000)...\n");
+    writel(0xFFFFFFFFU, pcie_base + MISC_RC_BAR2_CFG_LO);  /* 0xC0000000 | 0x3FFFFFFF */
     writel(0x00000000U, pcie_base + MISC_RC_BAR2_CFG_HI);
     asm volatile("dsb sy; isb" ::: "memory");
     uart_puts("[PCI] RC_BAR2 LO="); print_hex32(readl(pcie_base + MISC_RC_BAR2_CFG_LO));
