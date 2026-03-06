@@ -40,7 +40,7 @@
  *
  * VL805 (from boot logs):
  *   CAPLENGTH=0x20, HCIVERSION=0x0100, MaxPorts=5, MaxSlots=32
- *   AC64=1 (64-bit addresses required), CSZ=0, Scratchpad=0
+ *   AC64=1 (64-bit addresses required), CSZ=0, Scratchpad=31
  */
 
 #include "kernel.h"
@@ -212,6 +212,26 @@ static uint32_t cmd_enqueue = 0;   /* next TRB slot index */
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
 /*
+ * phys_to_dma — convert a CPU physical address to a PCIe DMA bus address.
+ *
+ * On BCM2711 the PCIe inbound DMA window is at PCIe bus address 0xC0000000,
+ * not 0x0.  All addresses given to the VL805 (DCBAAP, CRCR, ERSTBA, ERDP,
+ * scratchpad page pointers, ERST segment base) must use the 0xC0000000 alias:
+ *
+ *   DMA address = CPU physical address + 0xC0000000
+ *
+ * This matches the Linux bcm2711.dtsi dma-ranges entry:
+ *   <0x02000000 0x0 0xC0000000  0x0 0x00000000  0x0 0x40000000>
+ *   (PCIe 32-bit prefetchable, PCI addr 0xC0000000 → CPU addr 0x0, 1 GB)
+ *
+ * RC_BAR2 in pci.c is set to 0xC000000F to match.
+ */
+#define DMA_OFFSET  0xC0000000ULL
+static inline uint64_t phys_to_dma(uint64_t phys) {
+    return phys + DMA_OFFSET;
+}
+
+/*
  * reg_write64 — write a 64-bit xHCI register.
  *
  * The xHCI spec §4.1 says 64-bit registers "shall be written as a Qword".
@@ -354,6 +374,43 @@ static int do_reset(void) {
         }
         if (!(cmd & CMD_HCRST) && !(sts & STS_CNR)) {
             debug_print("[xHCI] HCRST complete (CNR clear)  USBSTS=0x%08x\n", sts);
+
+            /*
+             * Wait for EINT to clear after HCRST.
+             *
+             * USBSTS.EINT (bit 3) is set when the VL805 firmware posts events
+             * to its own internal ring during SPI-reload init.  If EINT is
+             * still set when we write RS=1, the controller tries to deliver
+             * that pending event using its internal (now stale) ring pointer
+             * rather than our ERSTBA → DMA write to unmapped address → HSE
+             * at ~10µs with empty event ring.
+             *
+             * Poll until EINT clears (typically <5ms), then proceed.
+             * Force-clear after 100ms if firmware never drains its ring.
+             */
+            if (sts & STS_EINT) {
+                debug_print("[xHCI] EINT set after HCRST — waiting for "
+                            "firmware to settle (USBSTS=0x%08x)\n", sts);
+                int eint_cleared = 0;
+                for (int w = 0; w < 100; w++) {
+                    delay_ms(1);
+                    uint32_t s2 = readl(op + OP_USBSTS);
+                    if (!(s2 & STS_EINT)) {
+                        debug_print("[xHCI] EINT cleared after %dms  "
+                                    "USBSTS=0x%08x\n", w + 1, s2);
+                        eint_cleared = 1;
+                        break;
+                    }
+                }
+                if (!eint_cleared) {
+                    debug_print("[xHCI] EINT still set after 100ms — "
+                                "force-clearing via RW1C\n");
+                    writel(STS_EINT, op + OP_USBSTS);
+                    asm volatile("dsb sy" ::: "memory");
+                    debug_print("[xHCI] USBSTS after force-clear: 0x%08x\n",
+                                readl(op + OP_USBSTS));
+                }
+            }
             return 0;
         }
     }
@@ -367,6 +424,9 @@ static int setup_dcbaa(void) {
     memset((void *)dcbaa, 0, 2048);
 
     uint32_t n = xhci_ctrl.scratchpad_count;
+
+    debug_print("[xHCI] Scratchpad count = %u\n", n);
+
     if (n > 0) {
         if (n > MAX_SCRATCH_PAGES) {
             debug_print("[xHCI] ERROR: scratchpad count %u > max %u\n",
@@ -389,13 +449,13 @@ static int setup_dcbaa(void) {
 
         for (uint32_t i = 0; i < n; i++) {
             void *pg = pages_base + i * 4096;
-            scratch_arr[i] = (uint64_t)virt_to_phys(pg);
+            scratch_arr[i] = phys_to_dma((uint64_t)virt_to_phys(pg));
         }
         asm volatile("dsb sy" ::: "memory");
 
-        /* DCBAA slot 0 = physical address of scratchpad pointer array */
-        dcbaa[0] = (uint64_t)virt_to_phys((void *)scratch_arr);
-        debug_print("[xHCI] DCBAA[0] = scratchpad array phys=0x%llx\n",
+        /* DCBAA slot 0 = DMA address of scratchpad pointer array */
+        dcbaa[0] = phys_to_dma((uint64_t)virt_to_phys((void *)scratch_arr));
+        debug_print("[xHCI] DCBAA[0] = scratchpad array dma=0x%llx\n",
                     (unsigned long long)dcbaa[0]);
     } else {
         debug_print("[xHCI] No scratchpad required\n");
@@ -405,8 +465,9 @@ static int setup_dcbaa(void) {
     asm volatile("dsb sy" ::: "memory");
 
     uint64_t dcbaa_phys = (uint64_t)virt_to_phys((void *)dcbaa);
-    debug_print("[xHCI] DCBAA phys=0x%llx\n", (unsigned long long)dcbaa_phys);
-    reg_write64(xhci_ctrl.op_regs, OP_DCBAAP_LO, dcbaa_phys);
+    reg_write64(xhci_ctrl.op_regs, OP_DCBAAP_LO, phys_to_dma(dcbaa_phys));
+    debug_print("[xHCI] DCBAA dma=0x%llx\n",
+                (unsigned long long)phys_to_dma(dcbaa_phys));
 
     /* CONFIG.MaxSlotsEn — must be ≤ MaxSlots from HCSPARAMS1 */
     uint32_t cfg = readl(xhci_ctrl.op_regs + OP_CONFIG);
@@ -430,9 +491,10 @@ static int setup_cmd_ring(void) {
      * it inverts the Expected Cycle State, keeping ring sync.
      */
     uint64_t ring_phys = (uint64_t)virt_to_phys((void *)cmd_ring);
+    uint64_t ring_dma  = phys_to_dma(ring_phys);
     uint32_t li = (CMD_RING_TRBS - 1) * 4;   /* dword index of Link TRB */
-    cmd_ring[li + 0] = (uint32_t)(ring_phys);
-    cmd_ring[li + 1] = (uint32_t)(ring_phys >> 32);
+    cmd_ring[li + 0] = (uint32_t)(ring_dma);
+    cmd_ring[li + 1] = (uint32_t)(ring_dma >> 32);
     cmd_ring[li + 2] = 0;
     cmd_ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | cmd_cycle;
 
@@ -492,12 +554,12 @@ static int setup_cmd_ring(void) {
      *
      * Write the value and proceed — do NOT readback-check it.
      */
-    uint64_t crcr = (ring_phys & ~0x3FULL) | (uint64_t)cmd_cycle;
+    uint64_t crcr = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
     reg_write64(xhci_ctrl.op_regs, OP_CRCR_LO, crcr);
 
-    debug_print("[xHCI] Command ring phys=0x%llx  RCS=%u  (%d TRBs)  "
+    debug_print("[xHCI] Command ring dma=0x%llx  RCS=%u  (%d TRBs)  "
                 "[CRCR write-only, no readback]\n",
-                (unsigned long long)ring_phys, cmd_cycle, CMD_RING_TRBS);
+                (unsigned long long)ring_dma, cmd_cycle, CMD_RING_TRBS);
     return 0;
 }
 
@@ -511,15 +573,16 @@ static int setup_event_ring(void) {
 
     uint64_t evt_phys  = (uint64_t)virt_to_phys((void *)evt_ring);
     uint64_t erst_phys = (uint64_t)virt_to_phys((void *)erst);
+    uint64_t evt_dma   = phys_to_dma(evt_phys);
+    uint64_t erst_dma  = phys_to_dma(erst_phys);
 
     /*
      * ERST entry 0 (spec §6.5):
-     *   [63:0]  = ring segment base address (64-byte aligned phys)
+     *   [63:0]  = ring segment base address (DMA address, 64-byte aligned)
      *   [79:64] = ring segment size in TRBs  (stored in erst[1] lo 16 bits)
      *   [127:80]= reserved
-     * Use two 64-bit writes for clarity; hardware reads 16 bytes total.
      */
-    erst[0] = evt_phys;
+    erst[0] = evt_dma;
     erst[1] = (uint64_t)EVT_RING_TRBS;
 
     /* evt_ring and erst are in Device memory — no flush; DSB before runtime reg writes */
@@ -528,18 +591,18 @@ static int setup_event_ring(void) {
     /*
      * Program interrupter 0 runtime registers (spec §4.2 step 6):
      *   ERSTSZ  = 1  (one ERST entry)
-     *   ERSTBA  = erst_phys
-     *   ERDP    = evt_phys | EHB  (EHB=bit3, write 1 to clear; DESI=0)
+     *   ERSTBA  = erst_dma  (DMA address of ERST table)
+     *   ERDP    = evt_dma | EHB  (DMA address of event ring dequeue ptr)
      */
     void *ir0 = ir_base(0);
     writel(1U, ir0 + IR_ERSTSZ);
     asm volatile("dsb sy" ::: "memory");
-    reg_write64(ir0, IR_ERSTBA_LO, erst_phys);
-    reg_write64(ir0, IR_ERDP_LO,  evt_phys | 0x8ULL);
+    reg_write64(ir0, IR_ERSTBA_LO, erst_dma);
+    reg_write64(ir0, IR_ERDP_LO,  evt_dma | 0x8ULL);
 
-    debug_print("[xHCI] Event ring phys=0x%llx  ERST phys=0x%llx  (%d TRBs)\n",
-                (unsigned long long)evt_phys,
-                (unsigned long long)erst_phys, EVT_RING_TRBS);
+    debug_print("[xHCI] Event ring dma=0x%llx  ERST dma=0x%llx  (%d TRBs)\n",
+                (unsigned long long)evt_dma,
+                (unsigned long long)erst_dma, EVT_RING_TRBS);
     return 0;
 }
 
@@ -611,6 +674,34 @@ static int run_controller(void) {
     /* Note: CRCR reads back as 0 on VL805 (write-only register) — do not check */
 
     /*
+     * CPU readback of DMA buffer contents.
+     * Proves whether CPU writes actually reached DRAM before we set RS=1.
+     * If any value here is wrong, the issue is MMU/memory, not PCIe DMA.
+     * If all correct, data is in DRAM and the inbound PCIe path is suspect.
+     */
+    volatile uint64_t *dcbaa_v    = (volatile uint64_t *)(xhci_dma_buf + DMA_DCBAA_OFF);
+    volatile uint64_t *scratch_v  = (volatile uint64_t *)(xhci_dma_buf + DMA_SCRATCH_OFF);
+    volatile uint64_t *erst_v     = (volatile uint64_t *)(xhci_dma_buf + DMA_ERST_OFF);
+    volatile uint32_t *cmd_link_v = (volatile uint32_t *)(xhci_dma_buf + DMA_CMD_RING_OFF)
+                                    + (CMD_RING_TRBS - 1) * 4;
+    asm volatile("dsb sy" ::: "memory");
+    debug_print("[xHCI] DMA buffer CPU readback (data-in-DRAM check):\n");
+    debug_print("[xHCI]   dcbaa[0]      = 0x%016llx  (expect scratchpad arr phys)\n",
+                (unsigned long long)dcbaa_v[0]);
+    debug_print("[xHCI]   dcbaa[1]      = 0x%016llx  (expect 0)\n",
+                (unsigned long long)dcbaa_v[1]);
+    debug_print("[xHCI]   scratch_arr[0]= 0x%016llx  (expect first page phys)\n",
+                (unsigned long long)scratch_v[0]);
+    debug_print("[xHCI]   scratch_arr[1]= 0x%016llx\n",
+                (unsigned long long)scratch_v[1]);
+    debug_print("[xHCI]   erst[0]       = 0x%016llx  (expect evt_ring phys)\n",
+                (unsigned long long)erst_v[0]);
+    debug_print("[xHCI]   erst[1]       = 0x%016llx  (expect 64)\n",
+                (unsigned long long)erst_v[1]);
+    debug_print("[xHCI]   cmd_link_trb  = %08x %08x %08x %08x\n",
+                cmd_link_v[0], cmd_link_v[1], cmd_link_v[2], cmd_link_v[3]);
+
+    /*
      * Re-write CRCR immediately before RS=1.
      *
      * The VL805 SPI firmware reloads after FLR and continues running in the
@@ -628,17 +719,52 @@ static int run_controller(void) {
      * with the smallest possible gap so firmware has no time to interfere.
      */
     {
-        uint64_t ring_phys = (uint64_t)virt_to_phys(
-                                 (void *)(xhci_dma_buf + DMA_CMD_RING_OFF));
-        uint64_t crcr = (ring_phys & ~0x3FULL) | (uint64_t)cmd_cycle;
+        uint64_t ring_dma = phys_to_dma((uint64_t)virt_to_phys(
+                                (void *)(xhci_dma_buf + DMA_CMD_RING_OFF)));
+        uint64_t crcr = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
         reg_write64(op, OP_CRCR_LO, crcr);
         asm volatile("dsb sy" ::: "memory");
-        debug_print("[xHCI] CRCR re-written immediately before RS=1: "
-                    "ring=0x%llx RCS=%u\n",
-                    (unsigned long long)ring_phys, cmd_cycle);
+        debug_print("[xHCI] CRCR re-written before RS=1: dma=0x%llx RCS=%u\n",
+                    (unsigned long long)ring_dma, cmd_cycle);
     }
 
     uint32_t cmd = readl(op + OP_USBCMD);
+    /* Read USBSTS immediately before RS=1 — if HSE is already set,
+     * the problem is in register setup, not controller startup */
+    uint32_t sts_before = readl(op + OP_USBSTS);
+    debug_print("[xHCI] USBSTS before RS=1: 0x%08x\n", sts_before);
+    if (sts_before & STS_HSE)
+        debug_print("[xHCI] WARNING: HSE already set BEFORE RS=1!\n");
+
+    /*
+     * Clear all RW1C USBSTS bits before RS=1.
+     *
+     * Even after the EINT-settle wait in do_reset(), a race between our
+     * setup sequence and firmware background activity may leave these set:
+     *   HSE  (bit 2): a pre-existing error from firmware init
+     *   EINT (bit 3): a last-minute event posted between HCRST and here
+     *   PCD  (bit 4): port change with a USB device attached
+     *
+     * Write the mask of whichever bits are currently set to clear them all.
+     * Then re-confirm ERDP points at the start of our fresh empty ring.
+     */
+    {
+        uint32_t clr = sts_before & (STS_HSE | STS_EINT | STS_PCD);
+        if (clr) {
+            writel(clr, op + OP_USBSTS);
+            asm volatile("dsb sy" ::: "memory");
+            debug_print("[xHCI] Cleared USBSTS bits 0x%02x before RS=1"
+                        " (USBSTS now: 0x%08x)\n",
+                        clr, readl(op + OP_USBSTS));
+        }
+        /* Re-confirm ERDP at start of our ring, EHB=0 */
+        void *ir0_pre = ir_base(0);
+        uint64_t evt_phys_pre = (uint64_t)virt_to_phys(
+                                    (void *)(xhci_dma_buf + DMA_EVT_RING_OFF));
+        reg_write64(ir0_pre, IR_ERDP_LO, phys_to_dma(evt_phys_pre));
+        asm volatile("dsb sy" ::: "memory");
+    }
+
     cmd |= CMD_RS;    /* Run/Stop = 1      */
     cmd |= CMD_INTE;  /* Interrupter enable */
     /* NOTE: HSEE deliberately omitted — enabling it causes the controller to
@@ -646,6 +772,34 @@ static int run_controller(void) {
      * once the controller runs cleanly. */
     writel(cmd, op + OP_USBCMD);
     asm volatile("dsb sy; isb" ::: "memory");
+
+    /* Read USBSTS and USBCMD immediately after RS=1 (no delay) */
+    uint32_t sts_imm = readl(op + OP_USBSTS);
+    uint32_t cmd_imm = readl(op + OP_USBCMD);
+    debug_print("[xHCI] USBSTS immediately after RS=1: 0x%08x  USBCMD=0x%08x\n",
+                sts_imm, cmd_imm);
+    if (!(cmd_imm & CMD_RS)) {
+        if (sts_imm & STS_HSE)
+            debug_print("[xHCI] RS=0: controller started then self-halted on HSE\n");
+        else
+            debug_print("[xHCI] WARNING: RS bit did not take effect in USBCMD!\n");
+    }
+
+    /* Tight poll for first 2ms (10us intervals) to catch exact HSE timing */
+    for (int t = 200; t > 0; t--) {
+        delay_us(10);
+        uint32_t sts = readl(op + OP_USBSTS);
+        if (sts & STS_HSE) {
+            debug_print("[xHCI] HSE within first 2ms (at %d0us): USBSTS=0x%08x\n",
+                        200-t+1, sts);
+            break;
+        }
+        if (!(sts & STS_HCH)) {
+            debug_print("[xHCI] Controller RUNNING at %d0us  USBSTS=0x%08x\n",
+                        200-t+1, sts);
+            goto running;
+        }
+    }
 
     /* Poll until HCH clears (controller left halted state) */
     for (int t = 200; t > 0; t--) {
@@ -695,6 +849,10 @@ static int run_controller(void) {
     debug_print("[xHCI] ERROR: HCH still set after RS=1 (USBSTS=0x%08x)\n",
                 readl(op + OP_USBSTS));
     return -1;
+running:
+    debug_print("[xHCI] Controller RUNNING (fast)  USBSTS=0x%08x\n",
+                readl(op + OP_USBSTS));
+    return 0;
 }
 
 /* ── 2.9 Port power-on ───────────────────────────────────────────────────── */
@@ -785,7 +943,8 @@ static int evt_ring_poll(uint32_t *out, int timeout_ms)
             }
 
             /* Advance ERDP to current dequeue pointer, clear EHB */
-            uint64_t new_erdp = virt_to_phys((void *)&evt_ring[evt_dequeue * 4]);
+            uint64_t new_erdp = phys_to_dma(
+                virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
             reg_write64(ir0, IR_ERDP_LO, new_erdp | 0x8ULL);
 
             return 0;
@@ -892,7 +1051,7 @@ static int cmd_address_device(uint8_t slot_id, int port, uint32_t speed)
 
     /* Install output context pointer in DCBAA at slot_id */
     uint64_t out_phys = virt_to_phys((void *)out_ctx);
-    dcbaa[slot_id] = out_phys;
+    dcbaa[slot_id] = phys_to_dma(out_phys);
     asm volatile("dsb sy" ::: "memory");
 
     /* Setup EP0 transfer ring */
@@ -901,9 +1060,10 @@ static int cmd_address_device(uint8_t slot_id, int port, uint32_t speed)
     memset((void *)ep0_ring, 0, 1024);
     /* Link TRB at end */
     uint64_t ep0_ring_phys = virt_to_phys((void *)ep0_ring);
+    uint64_t ep0_ring_dma  = phys_to_dma(ep0_ring_phys);
     uint32_t li = (EVT_RING_TRBS - 1) * 4;
-    ep0_ring[li + 0] = (uint32_t)(ep0_ring_phys);
-    ep0_ring[li + 1] = (uint32_t)(ep0_ring_phys >> 32);
+    ep0_ring[li + 0] = (uint32_t)(ep0_ring_dma);
+    ep0_ring[li + 1] = (uint32_t)(ep0_ring_dma >> 32);
     ep0_ring[li + 2] = 0;
     ep0_ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | ep0_cycle;
     asm volatile("dsb sy" ::: "memory");
@@ -939,20 +1099,20 @@ static int cmd_address_device(uint8_t slot_id, int port, uint32_t speed)
             | (4U << 3)               /* EP Type = Control Bidir     */
             | (3U << 1)               /* Error Count = 3             */
             ;
-    ep0c[2] = (uint32_t)(ep0_ring_phys & ~1ULL) | 1U;  /* TR Dequeue lo | DCS */
-    ep0c[3] = (uint32_t)(ep0_ring_phys >> 32);          /* TR Dequeue hi       */
+    ep0c[2] = (uint32_t)(ep0_ring_dma & ~1ULL) | 1U;  /* TR Dequeue lo | DCS */
+    ep0c[3] = (uint32_t)(ep0_ring_dma >> 32);          /* TR Dequeue hi       */
 
     asm volatile("dsb sy" ::: "memory");
 
     /* Issue Address Device command — slot_id in dw3[31:24] */
-    uint64_t ictx_phys = virt_to_phys((void *)input_ctx);
+    uint64_t ictx_dma = phys_to_dma(virt_to_phys((void *)input_ctx));
 
     /* Manually write TRB to avoid slot_id being lost in cmd_ring_submit */
     {
         uint32_t s = cmd_enqueue;
         uint32_t b = s * 4;
-        cmd_ring[b+0] = (uint32_t)(ictx_phys & 0xFFFFFFF0U);
-        cmd_ring[b+1] = (uint32_t)(ictx_phys >> 32);
+        cmd_ring[b+0] = (uint32_t)(ictx_dma & 0xFFFFFFF0U);
+        cmd_ring[b+1] = (uint32_t)(ictx_dma >> 32);
         cmd_ring[b+2] = 0;
         cmd_ring[b+3] = ((uint32_t)slot_id << 24)
                       | (TRB_TYPE_ADDRESS_DEV << TRB_TYPE_SHIFT)
