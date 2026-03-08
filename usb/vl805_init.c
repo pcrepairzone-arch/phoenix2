@@ -1,0 +1,58 @@
+/*
+ * vl805_init.c — VL805 xHCI firmware init via VideoCore mailbox
+ *
+ * On Pi 4 boards WITHOUT a VLI SPI EEPROM (boardrev d03114, Pi 400, CM4):
+ *   The VL805 firmware lives in VideoCore SDRAM, loaded by start4.elf.
+ *   After PERST# the VL805 has no firmware until the VC reloads it in
+ *   response to mailbox tag 0x00030058 (NOTIFY_XHCI_RESET).
+ *
+ * On Pi 4 boards WITH SPI EEPROM (boardrev c03111, c03112):
+ *   The VL805 self-loads firmware from EEPROM after PERST#.
+ *   The mailbox call returns failure but USB still works — safe to ignore.
+ *
+ * This file now uses mailbox_property.c for all VC communication.
+ * The inline mailbox code has been removed — see drivers/gpu/mailbox.c
+ * for the low-level implementation.
+ */
+
+#include "kernel.h"
+#include "mailbox_property.h"
+
+extern void uart_puts(const char *s);
+extern void uart_putc(char c);
+
+static void print_hex32(uint32_t v) {
+    for (int i = 28; i >= 0; i -= 4) {
+        int n = (v >> i) & 0xF;
+        uart_putc(n < 10 ? '0' + n : 'a' + n - 10);
+    }
+}
+
+int vl805_init(void)
+{
+    uart_puts("[VL805] Requesting firmware via mailbox 0x00030058...\n");
+
+    /*
+     * Step 1: power on the USB HCD via mailbox.
+     * Required on some Pi 4 board variants before NOTIFY_XHCI_RESET.
+     * Failure is non-fatal — proceed regardless.
+     */
+    if (mbox_power_on_usb() < 0)
+        uart_puts("[VL805] USB power-on mailbox failed (non-fatal)\n");
+
+    /*
+     * Step 2: notify VC to load VL805 firmware.
+     * BDF: bus=1, dev=0, fn=0 → 0x00100000
+     */
+    if (mbox_notify_xhci_reset(0x00100000U) < 0) {
+        uart_puts("[VL805] Firmware load failed (EEPROM board or no VC response)\n");
+        return -1;
+    }
+
+    uart_puts("[VL805] Firmware loaded OK\n");
+
+    /* VL805 needs ~100ms to complete firmware init after VC notification */
+    for (volatile int i = 0; i < 1000000; i++) asm volatile("nop");
+
+    return 0;
+}

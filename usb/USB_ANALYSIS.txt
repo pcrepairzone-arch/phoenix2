@@ -1,0 +1,111 @@
+USB STACK ANALYSIS
+==================
+
+COMPONENTS PROVIDED:
+--------------------
+1. usb_host.c       - xHCI host controller driver
+2. usb_gadget.c     - DWC2 device mode (Pi as USB device)
+3. usb_mass_storage.c - BOT (Bulk-Only Transport) + UASP
+4. usb_storage.c    - Mass storage with streaming
+5. usb.h            - Core USB structures
+6. usb_gadget.h     - Gadget mode structures
+7. uasp.h           - USB Attached SCSI Protocol
+
+GOOD PARTS (reusable):
+----------------------
+✓ USB descriptor structures (device, interface, endpoint)
+✓ xHCI register definitions and initialization sequence
+✓ CBW/CSW structures for BOT protocol
+✓ UASP Information Units (command/sense/response IUs)
+✓ Class driver probe pattern
+✓ Bulk transfer abstraction
+✓ Multi-stream support for USB 3.0+
+✓ Gadget mode framework
+
+PROBLEMATIC PARTS:
+------------------
+✗ kmalloc/kfree - need Phoenix heap allocator
+✗ ioremap() - need MMIO mapping
+✗ PCI driver framework - Pi 4 uses PCIe but needs setup
+✗ IRQ registration (irq_set_handler) - need Phoenix IRQ system
+✗ Module init pattern - need kernel subsystem init
+✗ readl/writel macros - need to define
+✗ Spinlock functions - need Phoenix implementation
+
+HARDWARE SPECIFICS:
+-------------------
+
+Pi 4 USB:
+  - VL805 xHCI controller via PCIe (USB 3.0 ports)
+  - DWC2 OTG controller at 0xFE980000 (USB-C port, OTG)
+  - Both need different drivers
+
+Pi 5 USB:
+  - RP1 southbridge with integrated xHCI
+  - More powerful, native USB 3.0
+
+ADAPTATION STRATEGY:
+--------------------
+
+Phase 1: Core USB Infrastructure (NEW)
+  drivers/usb/usb_core.c      - Device enumeration, descriptors
+  drivers/usb/usb_hcd.c       - Host Controller Driver abstraction
+  drivers/usb/usb_hub.c       - Hub driver (needed for multi-port)
+
+Phase 2: xHCI Host Adapter (REWRITE)
+  drivers/usb/xhci_pci.c      - PCIe xHCI (VL805 on Pi 4)
+  drivers/usb/xhci_ring.c     - Transfer ring management
+  drivers/usb/xhci_mem.c      - Memory structures (DCBAA, etc)
+
+Phase 3: DWC2 Adapter (OPTIONAL)
+  drivers/usb/dwc2_host.c     - DWC2 host mode
+  drivers/usb/dwc2_gadget.c   - DWC2 device mode
+
+Phase 4: Class Drivers (ADAPT)
+  drivers/usb/usb_storage.c   - Mass storage (BOT + UASP)
+  drivers/usb/usb_hid.c       - Keyboard/Mouse (CRITICAL!)
+  drivers/usb/usb_hub.c       - Hub support
+
+MISSING DEPENDENCIES:
+---------------------
+1. PCIe initialization
+   - Pi 4: Broadcom PCIe controller at 0xFD500000
+   - Need to configure before xHCI accessible
+
+2. DMA memory allocation
+   - xHCI needs physically contiguous buffers
+   - Event rings, transfer rings, scratchpad buffers
+
+3. IRQ handling
+   - xHCI uses MSI/MSI-X or legacy IRQ
+   - Need to route to our IRQ system
+
+4. USB class drivers
+   - HID for keyboard/mouse (MOST CRITICAL)
+   - Storage for USB drives
+
+IMMEDIATE PRIORITIES:
+---------------------
+1. USB HID (Keyboard) - Makes system usable!
+2. USB Mass Storage - Access USB drives
+3. USB Hub - Multi-port support
+4. USB Gadget - Pi as device (lower priority)
+
+RECOMMENDATION:
+---------------
+Start with minimal USB HID keyboard driver:
+  - Simplified xHCI initialization
+  - Basic control/interrupt transfers
+  - HID report parsing for keyboard
+  - Integration with console input
+
+This makes Phoenix actually interactive!
+
+STRUCTURE:
+----------
+drivers/usb/
+  ├── usb_core.c        - Core USB functions
+  ├── xhci.c            - xHCI host controller
+  ├── usb_hid.c         - HID keyboard/mouse
+  ├── usb_storage.c     - Mass storage
+  └── usb.h             - USB definitions
