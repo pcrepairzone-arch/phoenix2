@@ -73,6 +73,7 @@ OBJS = \
     drivers/usb/usb_xhci.o \
     drivers/usb/usb_init.o \
     drivers/gpu/mailbox.o \
+    drivers/gpu/mailbox_property.o \
     drivers/gpu/mailbox_test.o \
     drivers/gpu/audio_diag.o \
     drivers/gpu/framebuffer.o \
