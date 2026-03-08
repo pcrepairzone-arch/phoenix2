@@ -69,11 +69,20 @@ static void idle_task_fn(void) {
     }
 }
 
-/* Add task to runqueue */
+/*
+ * enqueue_task — add a task to a CPU's runqueue.
+ *
+ * Protected by the per-CPU spinlock (with IRQ save/restore) to prevent
+ * corruption when multiple CPUs or interrupt handlers enqueue simultaneously.
+ * The lock uses LDAXR/STXR exclusive access — safe for AArch64 SMP.
+ */
 void enqueue_task(cpu_sched_t *sched, task_t *task) {
+    unsigned long flags;
+    spin_lock_irqsave(&sched->lock, &flags);
+
     task->next = NULL;
     task->prev = sched->runqueue_tail;
-    
+
     if (sched->runqueue_tail) {
         sched->runqueue_tail->next = task;
     } else {
@@ -81,24 +90,41 @@ void enqueue_task(cpu_sched_t *sched, task_t *task) {
     }
     sched->runqueue_tail = task;
     task->state = TASK_READY;
+
+    spin_unlock_irqrestore(&sched->lock, flags);
 }
 
-/* Remove task from runqueue */
+/*
+ * dequeue_task — remove a task from a CPU's runqueue.
+ *
+ * Protected by the per-CPU spinlock. Caller must not hold the lock already
+ * (not reentrant). If called from schedule() which holds the lock, use
+ * the internal _dequeue_task_locked() variant instead.
+ *
+ * NOTE: Currently called only from schedule() context on the same CPU.
+ * The lock is acquired here for correctness when SMP secondary CPUs
+ * start running tasks (after secondary CPU bring-up is implemented).
+ */
 static void dequeue_task(cpu_sched_t *sched, task_t *task) {
+    unsigned long flags;
+    spin_lock_irqsave(&sched->lock, &flags);
+
     if (task->prev) {
         task->prev->next = task->next;
     } else {
         sched->runqueue_head = task->next;
     }
-    
+
     if (task->next) {
         task->next->prev = task->prev;
     } else {
         sched->runqueue_tail = task->prev;
     }
-    
+
     task->next = NULL;
     task->prev = NULL;
+
+    spin_unlock_irqrestore(&sched->lock, flags);
 }
 
 /* Pick next task to run */

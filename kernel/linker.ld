@@ -3,8 +3,7 @@
  * Target: AArch64, Raspberry Pi 4/5
  * Link/run address: 0x80000  (Pi 4 firmware relocates here; Pi 5 loads directly)
  *
- * Sections are split so .text is RX-only and .data/.bss are RW,
- * eliminating the RWX LOAD segment warning.
+ * Sections split so .text is RX-only and .data/.bss are RW.
  */
 
 OUTPUT_FORMAT("elf64-littleaarch64")
@@ -16,13 +15,13 @@ SECTIONS
     /*
      * Pi 4 firmware loads kernel8.img to 0x200000 then relocates it to
      * 0x80000 before jumping in.  Pi 5 firmware loads directly to 0x80000.
-     * Either way the kernel RUNS at 0x80000, so all symbols must be linked
-     * there — otherwise static data (page tables, heap, stack) has wrong
+     * Either way the kernel RUNS at 0x80000 — all symbols must be linked
+     * here, otherwise static data (page tables, heap, stack) has wrong
      * addresses from the first instruction.
      */
     . = 0x80000;
 
-    /* ---- Read + Execute ------------------------------------------ */
+    /* ── Read + Execute ───────────────────────────────────────────── */
     .text : {
         KEEP(*(.text.boot))   /* primary_cpu_entry must be first */
         *(.text*)
@@ -33,7 +32,7 @@ SECTIONS
         *(.rodata*)
     }
 
-    /* ---- Read + Write (no execute) ------------------------------- */
+    /* ── Read + Write (no execute) ────────────────────────────────── */
     . = ALIGN(4096);
     .data : {
         *(.data*)
@@ -49,36 +48,31 @@ SECTIONS
     }
 
     /*
-     * xHCI DMA structures: DCBAA, command ring, event ring, ERST.
-     * MUST be in non-cacheable memory (Device memory in ARMv8 MMU terms).
+     * .xhci_dma (NOLOAD) — xHCI DMA ring buffers + VL805 scratchpad pages.
      *
-     * Two options:
-     *  (a) Place this at a physical address covered by a Device memory
-     *      mapping in mmu.c — simplest if you have a spare Device region.
-     *  (b) Keep it in normal RAM but flush D-cache (dc civac) after every
-     *      write to a DMA structure before the address is given to the
-     *      xHCI controller — usb_xhci.c does this via flush_dcache().
+     * NOLOAD: space is reserved in the address map but NOT present in the
+     * ELF/binary image — the section contributes zero bytes to kernel8.img.
+     * mmu.c maps [__xhci_dma_start, __xhci_dma_end) as Device nGnRnE
+     * (non-cacheable) so CPU writes are immediately visible to VL805 DMA.
      *
-     * For now the section is placed in normal BSS-adjacent RAM and relies
-     * on usb_xhci.c's flush_dcache() calls for correctness.  To make it
-     * truly non-cacheable, remap this address range as Device memory in
-     * mmu.c after __xhci_dma_start is defined.
+     * Size breakdown:
+     *   0x0000 – 0x07FF  DCBAA  (64 slots × 8 bytes)
+     *   0x0800 – 0x0BFF  cmd_ring  (64 TRBs × 16 bytes)
+     *   0x0C00 – 0x0FFF  evt_ring  (64 TRBs × 16 bytes)
+     *   0x1000 – 0x103F  ERST      (1 entry × 16 bytes)
+     *   0x1040 – 0x117F  scratchpad pointer array (31 × 8 bytes)
+     *   0x2000+          scratchpad pages (31 × 4096 bytes)
+     *
+     *   Total: 0x42000 = DCBAA + rings + ERST + arr + 64 × 4 KB pages
      */
     . = ALIGN(4096);
-    __xhci_dma_start = .;
-    .xhci_dma : {
-        /*
-         * Explicitly reserve space for the xHCI DMA buffer (5120 bytes,
-         * 64-byte aligned).  Using '. += size' here rather than a C static
-         * array means the reservation is linker-owned and immune to GCC
-         * placing zero-initialised data into .bss instead of this section.
-         * usb_xhci.c accesses this region via extern __xhci_dma_start[].
-         */
+    .xhci_dma (NOLOAD) : {
+        __xhci_dma_start = .;
         . = ALIGN(64);
-        *(.xhci_dma)          /* catch any explicit section()-attributed vars */
-        . += 0x42000;         /* DCBAA+rings+ERST+scratch_arr+ctx+ep0+scratch_pages(64×4KB) */
+        *(.xhci_dma)
+        . += 0x42000;
+        __xhci_dma_end = .;
     }
-    __xhci_dma_end = .;
     . = ALIGN(4096);
 
     /* Kernel stack: 64 KB × 4 CPUs = 256 KB */
