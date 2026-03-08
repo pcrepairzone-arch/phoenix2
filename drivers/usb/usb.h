@@ -78,7 +78,7 @@ typedef struct usb_class_driver {
     void (*disconnect)(usb_device_t *dev);
 } usb_class_driver_t;
 
-/* USB Core Functions - TO BE IMPLEMENTED */
+/* USB Core Functions */
 void usb_register_class_driver(usb_class_driver_t *driver);
 int usb_control_transfer(usb_device_t *dev, uint8_t request_type,
                          uint8_t request, uint16_t value, uint16_t index,
@@ -87,8 +87,100 @@ int usb_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout);
 int usb_interrupt_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout);
 
 /* For UASP multi-stream */
-int usb_bulk_transfer_stream(usb_endpoint_t *ep, void *data, size_t len, 
+int usb_bulk_transfer_stream(usb_endpoint_t *ep, void *data, size_t len,
                              int timeout, uint16_t stream_id);
+
+/*
+ * usb_enumerate_device — probe class drivers for a newly-addressed device.
+ *
+ * Called after the HCD has assigned a USB address and retrieved the device
+ * descriptor into @dev. Walks dev->interfaces[] against registered class
+ * drivers and calls driver->probe() on each class-code match.
+ *
+ * If no interfaces are populated (num_interfaces == 0) the function logs a
+ * diagnostic and returns 0 — the HCD must parse the Configuration Descriptor
+ * and populate dev->interfaces[] before calling this.
+ *
+ * @dev   Fully (or partially) populated USB device struct
+ * @port  Zero-based port index (for logging only)
+ * @return 0 always; partial bind failures are logged, not fatal
+ */
+int usb_enumerate_device(usb_device_t *dev, int port);
+
+/*
+ * usb_hc_ops_t — Host Controller Operations table.
+ *
+ * The USB core is host-controller-agnostic. Any HCD (Host Controller Driver)
+ * registers itself here via usb_register_hc(). The core transfer functions
+ * (usb_control_transfer etc.) call through this table.
+ *
+ * Currently only one HCD is supported (xHCI for VL805).
+ * Future: support Pi 5 RP1 xHCI as a second HCD instance.
+ */
+typedef struct usb_hc_ops {
+    /*
+     * control_transfer — perform a USB control transfer on EP0.
+     *
+     * @dev          Target USB device (address, slot, speed)
+     * @request_type bmRequestType byte (direction | type | recipient)
+     * @request      bRequest byte
+     * @value        wValue
+     * @index        wIndex (language ID for string descriptors)
+     * @data         Data buffer (IN: filled by HCD; OUT: sent to device)
+     * @length       Number of bytes to transfer
+     * @timeout      Timeout in milliseconds
+     * @return       Bytes transferred (>=0) or -1 on error
+     */
+    int (*control_transfer)(usb_device_t *dev,
+                            uint8_t request_type, uint8_t request,
+                            uint16_t value, uint16_t index,
+                            void *data, uint16_t length, int timeout);
+
+    /*
+     * bulk_transfer — perform a USB bulk transfer.
+     *
+     * @ep       Bulk endpoint (address encodes direction in bit 7)
+     * @data     Data buffer
+     * @len      Number of bytes
+     * @timeout  Timeout in milliseconds
+     * @return   Bytes transferred or -1 on error
+     */
+    int (*bulk_transfer)(usb_endpoint_t *ep, void *data, size_t len, int timeout);
+
+    /*
+     * interrupt_transfer — perform a USB interrupt transfer (polling).
+     *
+     * @ep       Interrupt endpoint
+     * @data     Data buffer (filled on IN)
+     * @len      Max bytes to transfer
+     * @timeout  Timeout in milliseconds (0 = non-blocking check)
+     * @return   Bytes received or -1 on error/timeout
+     */
+    int (*interrupt_transfer)(usb_endpoint_t *ep, void *data, size_t len, int timeout);
+
+    /*
+     * enumerate_device — assign a USB address and set up device context.
+     *
+     * Called by usb_core after port reset. The HCD assigns an address,
+     * populates dev->address, and prepares EP0 for control transfers.
+     *
+     * @dev   Partially-filled device struct (speed, port known)
+     * @port  Zero-based port index
+     * @return 0 on success, -1 on failure
+     */
+    int (*enumerate_device)(usb_device_t *dev, int port);
+} usb_hc_ops_t;
+
+/*
+ * usb_register_hc — register a host controller with the USB core.
+ *
+ * Must be called by the HCD (e.g. xhci_init()) after the hardware is
+ * ready. After registration, usb_control_transfer() etc. will route
+ * through the ops table.
+ *
+ * @ops  Pointer to a static usb_hc_ops_t populated by the HCD.
+ */
+void usb_register_hc(usb_hc_ops_t *ops);
 
 /* USB Initialization */
 int usb_init(void);

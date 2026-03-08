@@ -82,11 +82,53 @@ static inline uint32_t sdhci_read(uint32_t offset)
     return MMIO_READ(addr);
 }
 
-/* Helper: write SDHCI register */
+/* Helper: write SDHCI register (32-bit) */
 static inline void sdhci_write(uint32_t offset, uint32_t value)
 {
     uint64_t addr = mmc_host.base + offset;
     MMIO_WRITE(addr, value);
+}
+
+/*
+ * sdhci_write16 — write a 16-bit SDHCI register.
+ *
+ * Required for SDHCI registers that are defined as 16-bit wide in the spec:
+ *   SDHCI_BLOCK_COUNT   (0x06): upper half of the 32-bit BLOCK_SIZE register
+ *   SDHCI_CLOCK_CONTROL (0x2C): shares a 32-bit word with TIMEOUT (0x2E)
+ *   SDHCI_TRANSFER_MODE (0x0C): shares a 32-bit word with COMMAND (0x0E)
+ *
+ * Using a 32-bit write to these addresses stomps the adjacent 16-bit register.
+ * The BCM2711 arasan SDHCI is strict about register widths.
+ */
+static inline void sdhci_write16(uint32_t offset, uint16_t value)
+{
+    *(volatile uint16_t *)(mmc_host.base + offset) = value;
+    asm volatile("dsb sy" ::: "memory");
+}
+
+/*
+ * sdhci_write8 — write an 8-bit SDHCI register.
+ *
+ * Required for:
+ *   SDHCI_TIMEOUT_CONTROL (0x2E): shares 32-bit word with CLOCK_CONTROL (0x2C)
+ *   SDHCI_SOFTWARE_RESET  (0x2F): shares 32-bit word with TIMEOUT_CONTROL
+ *   SDHCI_POWER_CONTROL   (0x29): shares 32-bit word with HOST_CONTROL (0x28)
+ *
+ * A 32-bit write to 0x2F would also modify TIMEOUT_CONTROL at 0x2E —
+ * potentially causing the card to timeout immediately after reset.
+ */
+static inline void sdhci_write8(uint32_t offset, uint8_t value)
+{
+    *(volatile uint8_t *)(mmc_host.base + offset) = value;
+    asm volatile("dsb sy" ::: "memory");
+}
+
+/*
+ * sdhci_read16 — read a 16-bit SDHCI register.
+ */
+static inline uint16_t sdhci_read16(uint32_t offset)
+{
+    return *(volatile uint16_t *)(mmc_host.base + offset);
 }
 
 /* Helper: wait for command ready */
@@ -217,16 +259,18 @@ static int mmc_send_app_cmd(uint32_t acmd, uint32_t arg, uint32_t *response)
 /* Reset SD controller */
 static void sdhci_reset(void)
 {
-    /* Software reset for all */
-    sdhci_write(SDHCI_SOFTWARE_RESET, 0x07);
-    
-    /* Wait for reset complete */
+    /* FIX-B: SOFTWARE_RESET is 8-bit at 0x2F. Use byte access only.
+     * 0x07 = SRST_DAT | SRST_CMD | SRST_ALL */
+    sdhci_write8(SDHCI_SOFTWARE_RESET, 0x07);
+
+    /* Wait for reset complete — all three bits must clear */
     int timeout = 10000;
-    while ((sdhci_read(SDHCI_SOFTWARE_RESET) & 0x07) && timeout > 0) {
+    while ((*(volatile uint8_t *)(mmc_host.base + SDHCI_SOFTWARE_RESET) & 0x07)
+           && timeout > 0) {
         timeout--;
         for (volatile int i = 0; i < 100; i++);
     }
-    
+
     debug_print("MMC: Reset %s\n", timeout > 0 ? "OK" : "TIMEOUT");
 }
 
@@ -254,23 +298,30 @@ int mmc_init(void)
     /* Reset controller */
     sdhci_reset();
     
-    /* Power on */
-    sdhci_write(SDHCI_POWER_CONTROL, 0x0F);  /* 3.3V, power on */
+    /* FIX-B: POWER_CONTROL is 8-bit at offset 0x29.
+     * 32-bit write at 0x28 overlaps HOST_CONTROL — use byte write.
+     * 0x0F = SDVSEL(3.3V)=0xE | SD_BUS_POWER=1 */
+    sdhci_write8(SDHCI_POWER_CONTROL, 0x0F);
     
-    /* Enable internal clock */
-    sdhci_write(SDHCI_CLOCK_CONTROL, 0x01);
-    
-    /* Wait for clock stable */
+    /* FIX-B: CLOCK_CONTROL is 16-bit at 0x2C. 32-bit writes also hit
+     * TIMEOUT_CONTROL at 0x2E, potentially resetting the timeout register.
+     * Use 16-bit writes and reads for all clock control operations. */
+    sdhci_write16(SDHCI_CLOCK_CONTROL, 0x0001);  /* Internal clock enable */
+
+    /* Wait for Internal Clock Stable (bit 1) */
     int timeout = 10000;
-    while (!(sdhci_read(SDHCI_CLOCK_CONTROL) & 0x02) && timeout > 0) {
+    while (!(sdhci_read16(SDHCI_CLOCK_CONTROL) & 0x0002) && timeout > 0) {
         timeout--;
     }
+
+    /* Enable SD clock output (bit 2) */
+    sdhci_write16(SDHCI_CLOCK_CONTROL,
+                  sdhci_read16(SDHCI_CLOCK_CONTROL) | 0x0004);
     
-    /* Enable SD clock */
-    sdhci_write(SDHCI_CLOCK_CONTROL, sdhci_read(SDHCI_CLOCK_CONTROL) | 0x04);
-    
-    /* Set timeout */
-    sdhci_write(SDHCI_TIMEOUT_CONTROL, 0x0E);
+    /* FIX-B: TIMEOUT_CONTROL is 8-bit at 0x2E. A 32-bit write at 0x2C
+     * (the aligned address) would overwrite CLOCK_CONTROL.
+     * 0x0E = data timeout = TMCLK × 2^(0x0E+13) ≈ 1 second */
+    sdhci_write8(SDHCI_TIMEOUT_CONTROL, 0x0E);
     
     debug_print("MMC: Clock enabled\n");
     

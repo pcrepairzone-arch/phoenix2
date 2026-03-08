@@ -75,8 +75,10 @@
 /* USBSTS bits */
 #define STS_HCH         (1U << 0)   /* HC Halted                         */
 #define STS_HSE         (1U << 2)   /* Host System Error                 */
+#define STS_SRE         (1U << 8)   /* Save/Restore Error  (RW1C)        */
 #define STS_EINT        (1U << 3)   /* Event Interrupt                   */
 #define STS_PCD         (1U << 4)   /* Port Change Detect                */
+#define STS_SRE         (1U << 8)   /* Save/Restore Error  (RW1C)        */
 #define STS_CNR         (1U << 11)  /* Controller Not Ready              */
 
 /* ── Runtime interrupter offsets (from runtime_base + 0x20 + n*0x20) ───── */
@@ -102,8 +104,8 @@
 #define TRB_CYCLE           (1U <<  0)
 #define TRB_TC              (1U <<  1)  /* Toggle Cycle (Link TRB)       */
 #define TRB_TYPE_SHIFT      10
-#define TRB_TYPE_LINK       23
-#define TRB_TYPE_NOOP_CMD   6
+#define TRB_TYPE_LINK        6   /* xHCI spec Table 6-91: Link TRB = type 6   */
+#define TRB_TYPE_NOOP_CMD   23   /* xHCI spec Table 6-91: No-Op Command = 23  */
 
 /* Command TRB types */
 #define TRB_TYPE_ENABLE_SLOT    9
@@ -176,7 +178,7 @@
  * MMU Device-memory remapping in mmu.c.
  *
  * Instead the linker script reserves exactly DMA_BUF_SIZE bytes in .xhci_dma
- * via '. += 0x1400' and exports __xhci_dma_start/__xhci_dma_end.
+ * via '. += 0x42000' and exports __xhci_dma_start/__xhci_dma_end.
  * mmu.c reads those symbols to find and remap the pages as Device nGnRnE.
  * usb_xhci.c treats __xhci_dma_start as the base of the buffer.
  */
@@ -208,24 +210,37 @@ static xhci_controller_t xhci_ctrl;
 
 static uint8_t  cmd_cycle   = 1;   /* producer cycle bit */
 static uint32_t cmd_enqueue = 0;   /* next TRB slot index */
+static uint32_t last_cmd_slot  = 0;         /* slot of most recently submitted TRB   */
+static uint32_t last_cmd_dw[4] = {0,0,0,0}; /* copy of that TRB for poll re-write    */
+static uint64_t cmd_crcr    = 0;   /* current CRCR value — kept in sync with
+                                    * the dequeue pointer and cycle bit so
+                                    * cmd_ring_submit() can atomically re-win
+                                    * the command ring before ringing DB0.   */
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
 /*
  * phys_to_dma — convert a CPU physical address to a PCIe DMA bus address.
  *
- * On BCM2711 the PCIe inbound DMA window is at PCIe bus address 0xC0000000,
- * not 0x0.  All addresses given to the VL805 (DCBAAP, CRCR, ERSTBA, ERDP,
- * scratchpad page pointers, ERST segment base) must use the 0xC0000000 alias:
+ * RC_BAR2 base = 0x00000000 (PCIe 0x0 → CPU 0x0, 1GB inbound window).
+ * VL805 BAR0 resets to 0x00000000 after PERST#, so DMA addresses from
+ * the VL805 ARE CPU physical addresses — no offset required.
  *
- *   DMA address = CPU physical address + 0xC0000000
- *
- * This matches the Linux bcm2711.dtsi dma-ranges entry:
- *   <0x02000000 0x0 0xC0000000  0x0 0x00000000  0x0 0x40000000>
- *   (PCIe 32-bit prefetchable, PCI addr 0xC0000000 → CPU addr 0x0, 1 GB)
- *
- * RC_BAR2 in pci.c is set to 0xC000000F to match.
+ * DMA address = CPU physical address + 0x00000000 (identity mapping)
  */
+/* BCM2711 PCIe inbound window (RC_BAR2): PCIe 0xC0000000..0xFFFFFFFF → CPU 0x0.
+ * The VL805 DMA engine uses PCIe bus addresses.  When it writes to its DMA
+ * address for a CPU physical address P, it uses P + 0xC0000000.
+ * RC_BAR2_CFG_LO=0x00000012 maps PCIe 0x00000000..0x3FFFFFFF → CPU 0x00000000.
+ * The inbound translation is silicon-fixed on BCM2711: offset is always
+ * 0xC0000000 regardless of the RC_BAR2 base register value.
+ * WIN0_LO (outbound CPU→PCIe) is unrelated — that stays at 0x00000000.
+ */
+/* DMA_OFFSET: added to CPU physical address to get PCIe bus address for DMA.
+ * BCM2711 RC_BAR2 is configured as PCIe 0x00000000 → CPU 0x0 (1GB window).
+ * Our DMA buffer at CPU 0x080b5000 → PCIe 0x080b5000 (within 1GB window).
+ * The silicon alias at PCIe 0xC0000000 requires VC4 firmware — not available
+ * in bare-metal.  Use offset 0x0 and rely on RC_BAR2 window only. */
 #define DMA_OFFSET  0xC0000000ULL
 static inline uint64_t phys_to_dma(uint64_t phys) {
     return phys + DMA_OFFSET;
@@ -267,6 +282,7 @@ static void delay_ms(int ms) { delay_us(ms * 1000); }
  * kernel heap.  The xHCI DMA ring buffers in xhci_dma_buf do NOT need this
  * because mmu.c maps .xhci_dma as Device nGnRnE (non-cacheable).
  */
+static void flush_normal_page(void *start, size_t len) __attribute__((unused));
 static void flush_normal_page(void *start, size_t len) {
     uintptr_t a = (uintptr_t)start & ~63UL;
     uintptr_t e = (uintptr_t)start + len;
@@ -289,7 +305,7 @@ static int read_caps(void) {
 
     debug_print("[xHCI] CAPLENGTH=0x%02x  HCIVERSION=0x%04x\n", clen, hver);
 
-    if (clen < 0x10 || clen > 0x40) {
+    if (cap0 == 0xdeaddead || cap0 == 0xFFFFFFFF || clen < 0x10) {
         debug_print("[xHCI] ERROR: bad CAPLENGTH 0x%02x "
                     "— Memory Space not enabled or ATU/BAR mismatch\n", clen);
         return -1;
@@ -360,11 +376,46 @@ static int do_reset(void) {
         }
     }
 
+    /*
+     * xHCI spec §4.2: "Software shall not set HCRST to '1' while CNR = '1'."
+     * On boards where PCIe trains quickly (< 200ms from power-on), the VL805
+     * MCU may still be in its internal xHCI init (CNR=1) even after the SPI
+     * firmware-ready poll passes.  Wait up to 2s for CNR to clear.
+     */
+    {
+        int cnr_ready = 0;
+        uint32_t last_sts = 0xDEADBEEF;
+        for (int t = 0; t < 2000; t++) {    /* 2000 * 1ms = 2s */
+            uint32_t s = readl(op + OP_USBSTS);
+            if (s == 0xFFFFFFFF) {
+                debug_print("[xHCI] ERROR: device vanished waiting for CNR\n");
+                return -1;
+            }
+            if (!(s & STS_CNR)) {
+                debug_print("[xHCI] CNR cleared after %dms  USBSTS=0x%08x\n",
+                            t, s);
+                cnr_ready = 1;
+                break;
+            }
+            /* Log progress on first read or on status change */
+            if (t == 0 || s != last_sts) {
+                debug_print("[xHCI]   CNR poll t=%dms  USBSTS=0x%08x\n", t, s);
+                last_sts = s;
+            }
+            delay_ms(1);
+        }
+        if (!cnr_ready) {
+            debug_print("[xHCI] ERROR: CNR never cleared after 2s"
+                        " (USBSTS=0x%08x)\n", readl(op + OP_USBSTS));
+            return -1;
+        }
+    }
+
     debug_print("[xHCI] Issuing HCRST\n");
     writel(readl(op + OP_USBCMD) | CMD_HCRST, op + OP_USBCMD);
     asm volatile("dsb sy; isb" ::: "memory");
 
-    for (int t = 1000; t > 0; t--) {
+    for (int t = 5000; t > 0; t--) {   /* 5000 * 100µs = 500ms */
         delay_us(100);
         uint32_t cmd = readl(op + OP_USBCMD);
         uint32_t sts = readl(op + OP_USBSTS);
@@ -639,8 +690,9 @@ static int run_controller(void) {
     void    *ir0 = ir_base(0);
 
     /*
-     * Dump all DMA pointer registers before RS=1.
-     * If any of these are zero the controller will assert HSE immediately.
+     * ── Phase 1: Diagnostics (prints allowed) ─────────────────────────────
+     * Dump DMA register state and CPU readback.  This is purely informational
+     * and may take hundreds of µs.  Firmware is free to interfere here.
      */
     uint32_t dcbaap_lo = readl(op + OP_DCBAAP_LO);
     uint32_t dcbaap_hi = readl(op + OP_DCBAAP_HI);
@@ -662,23 +714,6 @@ static int run_controller(void) {
     debug_print("[xHCI]   ERDP    = 0x%08x_%08x\n", erdp_hi,   erdp_lo);
     debug_print("[xHCI]   IMAN    = 0x%08x\n", iman);
 
-    /* Sanity check — if DCBAAP is zero the controller WILL assert HSE */
-    if (dcbaap_lo == 0 && dcbaap_hi == 0) {
-        debug_print("[xHCI] ERROR: DCBAAP=0 — write did not stick!\n");
-        return -1;
-    }
-    if (erstba_lo == 0 && erstba_hi == 0) {
-        debug_print("[xHCI] ERROR: ERSTBA=0 — event ring write did not stick!\n");
-        return -1;
-    }
-    /* Note: CRCR reads back as 0 on VL805 (write-only register) — do not check */
-
-    /*
-     * CPU readback of DMA buffer contents.
-     * Proves whether CPU writes actually reached DRAM before we set RS=1.
-     * If any value here is wrong, the issue is MMU/memory, not PCIe DMA.
-     * If all correct, data is in DRAM and the inbound PCIe path is suspect.
-     */
     volatile uint64_t *dcbaa_v    = (volatile uint64_t *)(xhci_dma_buf + DMA_DCBAA_OFF);
     volatile uint64_t *scratch_v  = (volatile uint64_t *)(xhci_dma_buf + DMA_SCRATCH_OFF);
     volatile uint64_t *erst_v     = (volatile uint64_t *)(xhci_dma_buf + DMA_ERST_OFF);
@@ -702,76 +737,266 @@ static int run_controller(void) {
                 cmd_link_v[0], cmd_link_v[1], cmd_link_v[2], cmd_link_v[3]);
 
     /*
-     * Re-write CRCR immediately before RS=1.
-     *
-     * The VL805 SPI firmware reloads after FLR and continues running in the
-     * background.  It periodically re-initialises its own internal state,
-     * which includes overwriting CRCR with the firmware's own command ring
-     * address.  Because CRCR is write-only on the VL805 (readback always 0)
-     * this is invisible to us.
-     *
-     * When we set RS=1, the controller uses whatever CRCR holds at that
-     * moment.  If firmware overwrote it after setup_cmd_ring(), the
-     * controller starts fetching TRBs from the firmware's ring address
-     * (or from 0x0) → immediate HSE.
-     *
-     * Fix: write CRCR here, as the very last register write before RS=1,
-     * with the smallest possible gap so firmware has no time to interfere.
+     * ── Phase 2: Pre-compute all register values ───────────────────────────
+     * Derive all values we'll write in the tight launch below so Phase 3
+     * contains zero arithmetic and zero branching — just stores.
      */
-    {
-        uint64_t ring_dma = phys_to_dma((uint64_t)virt_to_phys(
-                                (void *)(xhci_dma_buf + DMA_CMD_RING_OFF)));
-        uint64_t crcr = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
-        reg_write64(op, OP_CRCR_LO, crcr);
-        asm volatile("dsb sy" ::: "memory");
-        debug_print("[xHCI] CRCR re-written before RS=1: dma=0x%llx RCS=%u\n",
-                    (unsigned long long)ring_dma, cmd_cycle);
-    }
+    uint64_t dcbaa_phys = (uint64_t)virt_to_phys((void *)dcbaa);
+    uint64_t dcbaa_dma  = phys_to_dma(dcbaa_phys);
+    uint32_t launch_dcbaa_lo = (uint32_t)(dcbaa_dma & 0xFFFFFFFF);
+    uint32_t launch_dcbaa_hi = (uint32_t)(dcbaa_dma >> 32);
 
-    uint32_t cmd = readl(op + OP_USBCMD);
-    /* Read USBSTS immediately before RS=1 — if HSE is already set,
-     * the problem is in register setup, not controller startup */
-    uint32_t sts_before = readl(op + OP_USBSTS);
-    debug_print("[xHCI] USBSTS before RS=1: 0x%08x\n", sts_before);
-    if (sts_before & STS_HSE)
-        debug_print("[xHCI] WARNING: HSE already set BEFORE RS=1!\n");
+    uint32_t launch_config   = (readl(op + OP_CONFIG) & ~0xFFU) |
+                               (xhci_ctrl.max_slots & 0xFFU);
+
+    uint64_t erst_phys   = (uint64_t)virt_to_phys((void *)(xhci_dma_buf + DMA_ERST_OFF));
+    uint64_t erstba_dma  = phys_to_dma(erst_phys);
+    uint32_t launch_erstba_lo = (uint32_t)(erstba_dma & 0xFFFFFFFF);
+    uint32_t launch_erstba_hi = (uint32_t)(erstba_dma >> 32);
+
+    uint64_t evt_phys    = (uint64_t)virt_to_phys((void *)(xhci_dma_buf + DMA_EVT_RING_OFF));
+    uint64_t erdp_dma    = phys_to_dma(evt_phys);
+    uint32_t launch_erdp_lo  = (uint32_t)(erdp_dma & 0xFFFFFFFF);
+    uint32_t launch_erdp_hi  = (uint32_t)(erdp_dma >> 32);
+
+    uint64_t ring_dma    = phys_to_dma((uint64_t)virt_to_phys(
+                               (void *)(xhci_dma_buf + DMA_CMD_RING_OFF)));
+    uint64_t crcr_val    = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
+    uint32_t launch_crcr_lo  = (uint32_t)(crcr_val & 0xFFFFFFFF);
+    uint32_t launch_crcr_hi  = (uint32_t)(crcr_val >> 32);
+    cmd_crcr = crcr_val;   /* keep global in sync for cmd_ring_submit() */
+
+    debug_print("[xHCI] Launch values precomputed:\n");
+    debug_print("[xHCI]   DCBAAP  = 0x%08x_%08x\n", launch_dcbaa_hi, launch_dcbaa_lo);
+    debug_print("[xHCI]   CRCR    = 0x%08x_%08x  RCS=%u\n",
+                launch_crcr_hi, launch_crcr_lo, cmd_cycle);
+    debug_print("[xHCI]   ERSTBA  = 0x%08x_%08x\n", launch_erstba_hi, launch_erstba_lo);
+    debug_print("[xHCI]   ERDP    = 0x%08x_%08x\n", launch_erdp_hi, launch_erdp_lo);
+    debug_print("[xHCI]   CONFIG  = 0x%08x\n", launch_config);
 
     /*
-     * Clear all RW1C USBSTS bits before RS=1.
+     * ── Phase 3: Patient launch — wait for MCU, steal controller ────────────
      *
-     * Even after the EINT-settle wait in do_reset(), a race between our
-     * setup sequence and firmware background activity may leave these set:
-     *   HSE  (bit 2): a pre-existing error from firmware init
-     *   EINT (bit 3): a last-minute event posted between HCRST and here
-     *   PCD  (bit 4): port change with a USB device attached
+     * OBSERVATION (boot log): After our first HCRST, the VL805 MCU asserts HSE
+     * and holds it for several ms while it re-initialises its own internal state.
+     * Issuing a second HCRST while the MCU is mid-init only restarts the HSE
+     * cycle — we cannot win by racing.
      *
-     * Write the mask of whichever bits are currently set to clear them all.
-     * Then re-confirm ERDP points at the start of our fresh empty ring.
+     * CORRECT APPROACH:
+     *   1. Wait up to 500ms for HSE to clear naturally (MCU finishes re-init).
+     *   2. Halt the MCU-started controller (clear RS if HCH=0).
+     *   3. Write our registers in a tight burst.
+     *   4. Clear all status bits (RW1C), then set RS=1.
      */
+    /* Steps 1 & 2: all debug_prints are DEFERRED until after RS=1.
+     * Every UART byte at 115200 baud takes ~86µs; the two prints in step 1+2
+     * cost ~8ms total — enough for the MCU to complete a full re-init after
+     * the second HCRST (step 3a) and re-assert HSE before our RS=1 lands. */
+    int      defer_hse_ok   = 0;
+    int      defer_hse_ms   = 0;
+    uint32_t defer_hse_sts  = 0;
+    int      defer_halted   = 0;   /* 1=was already halted, 0=we halted it */
+    uint32_t defer_halt_sts = 0;
+
+    /* Step 1: wait up to 500ms for HSE to clear */
     {
-        uint32_t clr = sts_before & (STS_HSE | STS_EINT | STS_PCD);
-        if (clr) {
-            writel(clr, op + OP_USBSTS);
-            asm volatile("dsb sy" ::: "memory");
-            debug_print("[xHCI] Cleared USBSTS bits 0x%02x before RS=1"
-                        " (USBSTS now: 0x%08x)\n",
-                        clr, readl(op + OP_USBSTS));
+        int hse_clear = 0;
+        for (int w = 0; w < 500; w++) {
+            delay_ms(1);
+            uint32_t s2 = readl(op + OP_USBSTS);
+            if (!(s2 & STS_HSE)) {
+                defer_hse_ok  = 1;
+                defer_hse_ms  = w + 1;
+                defer_hse_sts = s2;
+                hse_clear = 1;
+                break;
+            }
         }
-        /* Re-confirm ERDP at start of our ring, EHB=0 */
-        void *ir0_pre = ir_base(0);
-        uint64_t evt_phys_pre = (uint64_t)virt_to_phys(
-                                    (void *)(xhci_dma_buf + DMA_EVT_RING_OFF));
-        reg_write64(ir0_pre, IR_ERDP_LO, phys_to_dma(evt_phys_pre));
-        asm volatile("dsb sy" ::: "memory");
+        if (!hse_clear) {
+            defer_hse_ok  = 0;
+            defer_hse_sts = readl(op + OP_USBSTS);
+        }
     }
 
-    cmd |= CMD_RS;    /* Run/Stop = 1      */
-    cmd |= CMD_INTE;  /* Interrupter enable */
-    /* NOTE: HSEE deliberately omitted — enabling it causes the controller to
-     * assert HSE on any internal error, masking the real fault.  Re-enable
-     * once the controller runs cleanly. */
-    writel(cmd, op + OP_USBCMD);
+    /* Step 2: halt controller if MCU started it (HCH=0 means running) */
+    {
+        uint32_t s2 = readl(op + OP_USBSTS);
+        if (!(s2 & STS_HCH)) {
+            defer_halted = 0;
+            writel(readl(op + OP_USBCMD) & ~CMD_RS, op + OP_USBCMD);
+            asm volatile("dsb sy; isb" ::: "memory");
+            for (int t = 200; t > 0; t--) {
+                delay_us(100);
+                if (readl(op + OP_USBSTS) & STS_HCH) break;
+            }
+            defer_halt_sts = readl(op + OP_USBSTS);
+        } else {
+            defer_halted   = 1;
+            defer_halt_sts = s2;
+        }
+    }
+
+    /* Step 2b: clear stale WIC change bits left by start4.elf XHCI-STOP.
+     * No debug_prints here — deferred like steps 1+2 above.
+     * Just clear WIC (write-1-to-clear) change bits on every port so stale
+     * PCD/CSC events don't add noise at RS=1.  Also clear USBSTS sticky bits. */
+    {
+        int n_ports = xhci_ctrl.max_ports;
+        for (int p = 0; p < n_ports && p < 5; p++) {
+            void *preg = op + 0x400 + p * 0x10;
+            uint32_t psc = readl(preg);
+            if (psc & PORTSC_WIC)
+                writel((psc & ~PORTSC_WIC) | PORTSC_WIC, preg);
+            asm volatile("dsb sy" ::: "memory");
+        }
+        writel(STS_HSE | STS_SRE | STS_EINT | STS_PCD, op + OP_USBSTS);
+        asm volatile("dsb sy; isb" ::: "memory");
+    }
+
+    /* Step 3a: second HCRST — resets MCU internal state from a clean baseline.
+     *
+     * Even after step 1 (HSE cleared) + step 2 (controller halted), the MCU
+     * remains active and re-fires HSE within ~60µs of our RS=1 by monitoring
+     * for RS=1 and running its own init on top (observed boot 30: USBSTS=0x18
+     * at RS=1 latch, 0x1d only 60µs later).
+     *
+     * A second HCRST at this point resets ALL MCU internal state.  We
+     * busy-wait for CNR=0 with no prints or delays — every µs counts.
+     * Typical CNR clear: <500µs.  MCU re-init time: ~500µs.
+     * Our register burst (step 3b) completes in ~100µs — we win the race.
+     */
+    writel(readl(op + OP_USBCMD) | CMD_HCRST, op + OP_USBCMD);
     asm volatile("dsb sy; isb" ::: "memory");
+    for (volatile int t = 0; t < 5000; t++) {
+        uint32_t cmd = readl(op + OP_USBCMD);
+        uint32_t sts = readl(op + OP_USBSTS);
+        if (!(cmd & CMD_HCRST) && !(sts & STS_CNR))
+            break;
+    }
+    asm volatile("dsb sy; isb" ::: "memory");
+
+    /* Step 3b: write our rings in a burst — no prints or reads between writes */
+    asm volatile("dsb sy; isb" ::: "memory");
+    writel(launch_dcbaa_lo,  op  + OP_DCBAAP_LO);
+    writel(launch_dcbaa_hi,  op  + OP_DCBAAP_HI);
+    writel(launch_config,    op  + OP_CONFIG);
+    writel(1U,               ir0 + IR_ERSTSZ);
+    /* FIX-1: 64-bit atomic writes — VL805 MCU cannot steal CRCR between LO/HI.
+     * reg_write64 issues a single STR Xn instruction = one 8-byte PCIe TLP.
+     * erstba_dma, erdp_dma, crcr_val are the 64-bit vars computed above. */
+    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+    reg_write64(ir0, IR_ERDP_LO,   erdp_dma);
+    reg_write64(op,  OP_CRCR_LO,   crcr_val);
+    asm volatile("dsb sy; isb" ::: "memory");
+
+    /* Step 4: retry loop — clear HSE, wait for clean window, write RS=1.
+     *
+     * After the second HCRST, the VL805 MCU re-asserts HSE as part of its own
+     * re-init sequence.  A single RW1C+RS=1 write lands while HSE is still set,
+     * causing the controller to immediately self-halt (observed: USBSTS=0x05 at
+     * RS=1 latch).  Our rings are intact (ERDP proof), so we just need RS=1 to
+     * land in a HSE-free window.
+     *
+     * Strategy: clear HSE (RW1C), wait up to 5ms for HSE=0, write RS=1, then
+     * poll 2ms for the controller to stay running (HCH=0, HSE=0).  If HSE fires
+     * again, loop and retry.  The MCU's HSE phase is transient; after it passes
+     * our RS=1 will stick.
+     */
+    {
+        int launched = 0;
+        for (int attempt = 0; attempt < 50 && !launched; attempt++) {
+            /*
+             * Re-burst all ring registers before every attempt.
+             *
+             * The MCU overwrites CRCR, DCBAAP, ERSTBA, ERDP with its own
+             * SRAM pointers during/after each failed RS=1.  Re-writing here
+             * ensures our DMA rings are in place when RS=1 lands.
+             *
+             * We do NOT issue HCRST on retries — that resets the MCU but it
+             * immediately restarts and re-fires HSE before we can write RS=1.
+             * Instead: burst our registers, clear HSE, write RS=1, then poll
+             * only HCH (not HSE) to determine success.  The MCU fires HSE
+             * within ~60µs of RS=1 cosmetically but does NOT halt the
+             * controller (confirmed boot 34: RUNNING with HSE=1).
+             */
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(launch_dcbaa_lo,  op  + OP_DCBAAP_LO);
+            writel(launch_dcbaa_hi,  op  + OP_DCBAAP_HI);
+            writel(launch_config,    op  + OP_CONFIG);
+            writel(1U,               ir0 + IR_ERSTSZ);
+            /* FIX-1: 64-bit atomic writes on every retry attempt */
+            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+            reg_write64(ir0, IR_ERDP_LO,   erdp_dma);
+            reg_write64(op,  OP_CRCR_LO,   crcr_val);
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            /* RW1C clear stale status */
+            writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            /* Brief pause — give MCU's current HSE pulse time to fire
+             * and clear so we write RS=1 into a momentarily quiet window */
+            for (int w = 0; w < 20; w++) delay_us(100);   /* 2ms */
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            /* Write RS=1 */
+            writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            /* Check RS latched */
+            uint32_t cmd_chk = readl(op + OP_USBCMD);
+            uint32_t sts_chk = readl(op + OP_USBSTS);
+            if (cmd_chk & CMD_RS)
+                debug_print("[xHCI] RS=1 latched (attempt %d)  USBCMD=0x%08x  USBSTS=0x%08x\n",
+                            attempt + 1, cmd_chk, sts_chk);
+            else {
+                debug_print("[xHCI] RS=1 did not latch (attempt %d)  USBCMD=0x%08x  USBSTS=0x%08x\n",
+                            attempt + 1, cmd_chk, sts_chk);
+                continue;
+            }
+
+            /* Poll up to 5ms for HCH=0 (controller running).
+             *
+             * IMPORTANT: ignore HSE here.  The VL805 MCU fires HSE within
+             * ~60µs of RS=1 as a cosmetic startup signal — this does NOT
+             * halt the controller (boot 34 confirmed: RUNNING with HSE set).
+             * Only HCH=1 means the controller truly stopped.
+             * Clear HSE after we confirm running, per boot 34 pattern. */
+            int still_running = 0;
+            for (int p = 0; p < 500; p++) {
+                delay_us(10);
+                uint32_t s = readl(op + OP_USBSTS);
+                if (!(s & STS_HCH)) { still_running = 1; break; }
+                /* HCH=1 still set — could be normal startup latency or
+                 * genuine halt.  Keep polling unless clearly stuck. */
+            }
+            if (still_running) {
+                /* Controller running — clear cosmetic MCU HSE if set */
+                uint32_t s = readl(op + OP_USBSTS);
+                if (s & STS_HSE) {
+                    writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                }
+                launched = 1;
+            } else {
+                debug_print("[xHCI] Controller halted after RS=1 (HCH=1) — retrying\n");
+            }
+        }
+        if (!launched)
+            debug_print("[xHCI] ERROR: failed to start controller after 50 attempts\n");
+    }
+
+    /* Deferred diagnostics from steps 1 & 2 (suppressed until after RS=1) */
+    if (defer_hse_ok)
+        debug_print("[xHCI] [deferred] HSE cleared after %dms  USBSTS=0x%08x\n",
+                    defer_hse_ms, defer_hse_sts);
+    else
+        debug_print("[xHCI] [deferred] HSE not cleared in 500ms  USBSTS=0x%08x\n",
+                    defer_hse_sts);
+    if (defer_halted)
+        debug_print("[xHCI] [deferred] Controller was halted: USBSTS=0x%08x\n", defer_halt_sts);
+    else
+        debug_print("[xHCI] [deferred] MCU was running — halted it: USBSTS=0x%08x\n", defer_halt_sts);
 
     /* Read USBSTS and USBCMD immediately after RS=1 (no delay) */
     uint32_t sts_imm = readl(op + OP_USBSTS);
@@ -811,15 +1036,26 @@ static int run_controller(void) {
         }
         if (sts & STS_HSE) {
             debug_print("[xHCI] HSE set (USBSTS=0x%08x) — scanning event ring\n", sts);
-            /*
-             * The controller writes events at its INTERNAL enqueue pointer,
-             * which starts at evt_ring[0] but may have advanced.  Scan all
-             * 64 TRB slots looking for any non-zero entry with a valid cycle
-             * bit (cycle=1, since cmd_cycle=1 so initial PCS=1).
-             * Also dump ERDP readback to see how far the controller got.
-             */
+            /* DSB: ensure inbound PCIe posted writes have drained to DRAM */
+            asm volatile("dsb sy; isb" ::: "memory");
+
             uint32_t erdp_rb = readl(ir_base(0) + IR_ERDP_LO);
             debug_print("[xHCI]   ERDP readback = 0x%08x\n", erdp_rb);
+
+            /* Always dump first 4 TRBs unconditionally */
+            debug_print("[xHCI]   EVT ring first 4 TRBs (raw):\n");
+            for (int i = 0; i < 4; i++)
+                debug_print("[xHCI]   [%d] %08x %08x %08x %08x\n", i,
+                            evt_ring[i*4+0], evt_ring[i*4+1],
+                            evt_ring[i*4+2], evt_ring[i*4+3]);
+
+            /* Dump all ports PORTSC */
+            for (int p = 0; p < xhci_ctrl.max_ports && p < 5; p++) {
+                uint32_t psc = readl(xhci_ctrl.op_regs + 0x400 + p * 0x10);
+                debug_print("[xHCI]   PORT%d PORTSC=0x%08x  CCS=%u PP=%u speed=%u\n",
+                            p+1, psc, psc & 1, (psc >> 9) & 1, (psc >> 10) & 0xF);
+            }
+
             int found = 0;
             for (int i = 0; i < EVT_RING_TRBS; i++) {
                 uint32_t d0 = evt_ring[i*4+0];
@@ -843,6 +1079,12 @@ static int run_controller(void) {
         }
         if (!(sts & STS_HCH)) {
             debug_print("[xHCI] Controller RUNNING  USBSTS=0x%08x\n", sts);
+            if (sts & STS_HSE) {
+                writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+                asm volatile("dsb sy; isb" ::: "memory");
+                debug_print("[xHCI] Post-RS=1 MCU HSE cleared  USBSTS=0x%08x\n",
+                            readl(op + OP_USBSTS));
+            }
             return 0;
         }
     }
@@ -850,9 +1092,17 @@ static int run_controller(void) {
                 readl(op + OP_USBSTS));
     return -1;
 running:
-    debug_print("[xHCI] Controller RUNNING (fast)  USBSTS=0x%08x\n",
-                readl(op + OP_USBSTS));
-    return 0;
+    {
+        uint32_t fast_sts = readl(op + OP_USBSTS);
+        debug_print("[xHCI] Controller RUNNING (fast)  USBSTS=0x%08x\n", fast_sts);
+        if (fast_sts & STS_HSE) {
+            writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+            asm volatile("dsb sy; isb" ::: "memory");
+            debug_print("[xHCI] Post-RS=1 MCU HSE cleared  USBSTS=0x%08x\n",
+                        readl(op + OP_USBSTS));
+        }
+        return 0;
+    }
 }
 
 /* ── 2.9 Port power-on ───────────────────────────────────────────────────── */
@@ -896,6 +1146,13 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1,
     cmd_ring[base + 3] = (type << TRB_TYPE_SHIFT) | cmd_cycle;
     asm volatile("dsb sy" ::: "memory");
 
+    /* Save for retry in evt_ring_poll (MCU may overwrite CRCR/TRB) */
+    last_cmd_slot   = slot;
+    last_cmd_dw[0]  = dw0;
+    last_cmd_dw[1]  = dw1;
+    last_cmd_dw[2]  = dw2;
+    last_cmd_dw[3]  = (type << TRB_TYPE_SHIFT) | cmd_cycle;
+
     uint64_t trb_phys = virt_to_phys((void *)&cmd_ring[base]);
 
     cmd_enqueue++;
@@ -908,9 +1165,79 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1,
         cmd_enqueue = 0;
     }
 
-    /* Ring host controller doorbell 0 (command ring) */
-    writel(0, xhci_ctrl.doorbell_regs);
-    asm volatile("dsb sy" ::: "memory");
+    /* Ring host controller doorbell 0 (command ring).
+     *
+     * CRITICAL: The VL805 MCU re-halts the controller (HCH=1) within
+     * microseconds of us winning RS=1.  By the time we get here (after
+     * port scan + port reset), HCH=1 again.  A halted HC ignores doorbells
+     * entirely — confirmed boot 52: evt_ring all zeros, TRB correct.
+     *
+     * Fix: check HCH immediately before the doorbell.  If halted, do a
+     * tight re-burst + RS=1 retry loop, then ring the doorbell in the
+     * same breath as confirming HCH=0 — minimising the MCU's window.
+     */
+    {
+        void     *op2  = xhci_ctrl.op_regs;
+        void     *ir02 = ir_base(0);
+
+        if (readl(op2 + OP_USBSTS) & STS_HCH) {
+            debug_print("[xHCI] cmd_submit: HCH=1 before doorbell — re-winning RS=1\n");
+
+            uint64_t rb_dcbaa = phys_to_dma((uint64_t)virt_to_phys((void *)dcbaa));
+            uint64_t rb_erst  = phys_to_dma((uint64_t)virt_to_phys(
+                (void *)(xhci_dma_buf + DMA_ERST_OFF)));
+            uint64_t rb_erdp  = phys_to_dma(
+                virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
+            uint64_t rb_crcr  = (phys_to_dma((uint64_t)virt_to_phys(
+                (void *)(xhci_dma_buf + DMA_CMD_RING_OFF))) & ~0x3FULL)
+                | (uint64_t)cmd_cycle;
+            uint32_t rb_cfg   = (readl(op2 + OP_CONFIG) & ~0xFFU)
+                | (xhci_ctrl.max_slots & 0xFFU);
+
+            int won = 0;
+            for (int ra = 0; ra < 50 && !won; ra++) {
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel((uint32_t)(rb_dcbaa & 0xFFFFFFFF), op2  + OP_DCBAAP_LO);
+                writel((uint32_t)(rb_dcbaa >> 32),        op2  + OP_DCBAAP_HI);
+                writel(rb_cfg,                             op2  + OP_CONFIG);
+                writel(1U,                                 ir02 + IR_ERSTSZ);
+                /* FIX-1: 64-bit atomic writes for ERSTBA, ERDP, CRCR */
+                reg_write64(ir02, IR_ERSTBA_LO, rb_erst);
+                reg_write64(ir02, IR_ERDP_LO,   rb_erdp);
+                reg_write64(op2,  OP_CRCR_LO,   rb_crcr);
+                writel(0x00000002U,               ir02 + IR_IMAN);
+                writel(STS_HSE | STS_SRE | STS_EINT | STS_PCD, op2 + OP_USBSTS);
+                asm volatile("dsb sy; isb" ::: "memory");
+                /* NO delay here — any gap lets the MCU steal CRCR back */
+                writel(CMD_RS | CMD_INTE, op2 + OP_USBCMD);
+                asm volatile("dsb sy; isb" ::: "memory");
+
+                /* Poll HCH only — ring doorbell THE INSTANT we see HCH=0 */
+                for (int t = 0; t < 500; t++) {
+                    delay_us(10);
+                    if (!(readl(op2 + OP_USBSTS) & STS_HCH)) {
+                        /* HCH=0 — ring doorbell immediately, no extra delay */
+                        asm volatile("dsb sy; isb" ::: "memory");
+                        writel(0, xhci_ctrl.doorbell_regs);
+                        asm volatile("dsb sy" ::: "memory");
+                        won = 1;
+                        debug_print("[xHCI] cmd_submit: RS=1 won (attempt %d) — doorbell rung\n", ra + 1);
+                        break;
+                    }
+                }
+            }
+            if (!won) {
+                debug_print("[xHCI] cmd_submit: failed to win RS=1 for doorbell\n");
+                /* Ring anyway — best effort */
+                writel(0, xhci_ctrl.doorbell_regs);
+                asm volatile("dsb sy" ::: "memory");
+            }
+        } else {
+            /* Controller already running — ring normally */
+            writel(0, xhci_ctrl.doorbell_regs);
+            asm volatile("dsb sy" ::: "memory");
+        }
+    }
 
     return trb_phys;
 }
@@ -918,36 +1245,184 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1,
 /* ── Event ring polling ──────────────────────────────────────────────────── */
 
 /*
- * Poll event ring for next event, timeout in ms.
- * Fills out[0..3] with the four TRB dwords.
+ * Consume one entry from the event ring (internal helper).
+ * Advances evt_dequeue, toggles evt_cycle at wraparound, updates ERDP.
+ */
+static void evt_ring_consume(void *ir0, uint32_t *out)
+{
+    out[0] = evt_ring[evt_dequeue * 4 + 0];
+    out[1] = evt_ring[evt_dequeue * 4 + 1];
+    out[2] = evt_ring[evt_dequeue * 4 + 2];
+    out[3] = evt_ring[evt_dequeue * 4 + 3];
+    asm volatile("dsb sy" ::: "memory");
+
+    evt_dequeue++;
+    if (evt_dequeue >= EVT_RING_TRBS) {
+        evt_dequeue = 0;
+        evt_cycle ^= 1;
+    }
+
+    uint64_t new_erdp = phys_to_dma(
+        virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
+    reg_write64(ir0, IR_ERDP_LO, new_erdp | 0x8ULL);
+}
+
+/*
+ * Poll event ring for a Command Completion or Transfer Event, timeout in ms.
+ * Fills out[0..3] with the matching TRB dwords.
+ * Port Status Change Events are silently consumed (logged) while waiting —
+ * they arrive after port reset and must not block command completion polling.
  * Returns 0 on success, -1 on timeout.
  */
 static int evt_ring_poll(uint32_t *out, int timeout_ms)
 {
     void *ir0 = ir_base(0);
 
+    /* Before waiting, drain any stale events already in the ring and
+     * write ERDP with EHB=0.  If EHB=1 is left set the HC will not post
+     * further events (including the CCE we are waiting for).
+     * This handles the MCU startup event that arrives after our pre-scan
+     * drain but before the first doorbell ring. */
+    {
+        asm volatile("dsb sy" ::: "memory");
+        while (1) {
+            uint32_t dw3 = evt_ring[evt_dequeue * 4 + 3];
+            if ((dw3 & TRB_CYCLE) != evt_cycle) break;
+            uint32_t type = (dw3 >> TRB_TYPE_SHIFT) & 0x3F;
+            uint32_t tmp0 = evt_ring[evt_dequeue * 4 + 0];
+            debug_print("[xHCI] poll: pre-drain EVT type=%u dw0=0x%08x\n",
+                        type, tmp0);
+            evt_dequeue++;
+            if (evt_dequeue >= EVT_RING_TRBS) { evt_dequeue = 0; evt_cycle ^= 1; }
+        }
+        /* Write ERDP EHB=0 — open interrupter for incoming CCE */
+        uint64_t erdp = phys_to_dma(
+            virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
+        reg_write64(ir0, IR_ERDP_LO, erdp);   /* EHB=0 */
+        asm volatile("dsb sy; isb" ::: "memory");
+    }
+
     for (int ms = 0; ms < timeout_ms * 10; ms++) {
+        asm volatile("dsb sy" ::: "memory");
         uint32_t dw3 = evt_ring[evt_dequeue * 4 + 3];
         if ((dw3 & TRB_CYCLE) == evt_cycle) {
-            /* Event is valid — consume it */
-            out[0] = evt_ring[evt_dequeue * 4 + 0];
-            out[1] = evt_ring[evt_dequeue * 4 + 1];
-            out[2] = evt_ring[evt_dequeue * 4 + 2];
-            out[3] = dw3;
-            asm volatile("dsb sy" ::: "memory");
-
-            evt_dequeue++;
-            if (evt_dequeue >= EVT_RING_TRBS) {
-                evt_dequeue = 0;
-                evt_cycle ^= 1;
+            /* Event is valid — peek at type */
+            uint32_t type = (dw3 >> TRB_TYPE_SHIFT) & 0x3F;
+            if (type == TRB_TYPE_PORT_CHNG_EVT) {
+                /* Port Status Change Event — consume and keep waiting.
+                 * evt_ring_consume writes ERDP EHB=0 after advancing. */
+                uint32_t tmp[4];
+                evt_ring_consume(ir0, tmp);
+                uint32_t port_id = (tmp[0] >> 24) & 0xFF;
+                debug_print("[xHCI]   (drained Port Change Event port=%u)\n",
+                            port_id);
+                continue;   /* don't count this against timeout */
+            }
+            /* Command Completion or Transfer Event — consume and return */
+            evt_ring_consume(ir0, out);
+            return 0;
+        }
+        /* No valid event yet — keep EHB=0 so the HC can post the CCE.
+         * The MCU continuously fires Port Status Change events that set
+         * EHB=1 in ERDP; we must re-clear it every iteration.
+         * Also: every 50ms re-assert CRCR and re-write the TRB — the MCU
+         * may have stolen CRCR back to its own SRAM ring, which would
+         * cause the HC to ignore our doorbell entirely. */
+        {
+            uint32_t erdp_lo = readl(ir0 + IR_ERDP_LO);
+            if (erdp_lo & 0x8U) {
+                /* EHB is set — clear it so HC can post more events */
+                uint64_t erdp = phys_to_dma(
+                    virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
+                reg_write64(ir0, IR_ERDP_LO, erdp);  /* EHB=0 */
+                asm volatile("dsb sy; isb" ::: "memory");
+                if (ms < 5 || (ms % 100) == 0)
+                    debug_print("[xHCI] poll: EHB cleared at iter %d\n", ms);
             }
 
-            /* Advance ERDP to current dequeue pointer, clear EHB */
-            uint64_t new_erdp = phys_to_dma(
-                virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
-            reg_write64(ir0, IR_ERDP_LO, new_erdp | 0x8ULL);
+            /* Every 500 iterations (50ms): re-assert ALL xHCI registers and re-ring.
+             * The MCU steals CRCR, ERSTBA, ERDP, DCBAAP — any of these being
+             * wrong means either the HC ignores our TRB or posts CCE to the
+             * MCU's own event ring at 0xc80c5000 instead of ours. */
+            if (ms > 0 && (ms % 500) == 0) {
+                void *op = xhci_ctrl.op_regs;
+                uint64_t r_dcbaa = phys_to_dma((uint64_t)virt_to_phys((void *)dcbaa));
+                uint64_t r_erst  = phys_to_dma((uint64_t)virt_to_phys(
+                    (void *)(xhci_dma_buf + DMA_ERST_OFF)));
+                uint64_t r_erdp  = phys_to_dma(
+                    virt_to_phys((void *)&evt_ring[evt_dequeue * 4]));
+                uint64_t r_crcr  = (phys_to_dma((uint64_t)virt_to_phys(
+                    (void *)(xhci_dma_buf + DMA_CMD_RING_OFF))) & ~0x3FULL)
+                    | (uint64_t)cmd_cycle;
+                uint32_t r_cfg   = (readl(op + OP_CONFIG) & ~0xFFU)
+                    | (xhci_ctrl.max_slots & 0xFFU);
+                uint32_t base4   = last_cmd_slot * 4;
 
-            return 0;
+                /* Re-write the TRB (MCU may have clobbered cmd ring) */
+                cmd_ring[base4 + 0] = last_cmd_dw[0];
+                cmd_ring[base4 + 1] = last_cmd_dw[1];
+                cmd_ring[base4 + 2] = last_cmd_dw[2];
+                cmd_ring[base4 + 3] = last_cmd_dw[3];
+                asm volatile("dsb sy" ::: "memory");
+
+                /* Re-burst all stolen registers */
+                if (ms == 500) {
+                    /* First re-burst: log what MCU stole and what's in our ring */
+                    debug_print("[xHCI] poll: stolen ERSTBA=0x%08x_%08x CRCR_LO=0x%08x\n",
+                        readl(ir0 + IR_ERSTBA_HI), readl(ir0 + IR_ERSTBA_LO),
+                        readl(op + OP_CRCR_LO));
+                    debug_print("[xHCI] poll: USBSTS=0x%08x  evt_dequeue=%u  evt_cycle=%u\n",
+                        readl(op + OP_USBSTS), evt_dequeue, (uint32_t)evt_cycle);
+                    /* Dump first 4 event ring slots to see if HC posted CCE */
+                    for (int _d = 0; _d < 4; _d++) {
+                        debug_print("[xHCI] poll: evt_ring[%d] = %08x %08x %08x %08x\n",
+                            _d,
+                            evt_ring[_d*4+0], evt_ring[_d*4+1],
+                            evt_ring[_d*4+2], evt_ring[_d*4+3]);
+                    }
+                    /* Also dump first cmd ring slot to verify TRB is intact */
+                    debug_print("[xHCI] poll: cmd_ring[%u] = %08x %08x %08x %08x\n",
+                        last_cmd_slot,
+                        cmd_ring[last_cmd_slot*4+0], cmd_ring[last_cmd_slot*4+1],
+                        cmd_ring[last_cmd_slot*4+2], cmd_ring[last_cmd_slot*4+3]);
+                }
+                writel((uint32_t)(r_dcbaa & 0xFFFFFFFF), op  + OP_DCBAAP_LO);
+                writel((uint32_t)(r_dcbaa >> 32),        op  + OP_DCBAAP_HI);
+                writel(r_cfg,                             op  + OP_CONFIG);
+                writel(1U,                                ir0 + IR_ERSTSZ);
+                /* FIX-1: 64-bit atomic writes for ERSTBA, ERDP */
+                reg_write64(ir0, IR_ERSTBA_LO, r_erst);
+                reg_write64(ir0, IR_ERDP_LO,   r_erdp);
+                writel(0x00000002U,              ir0 + IR_IMAN);
+                /* FIX-2: CRCR write + FIX-3: win RS=1 before doorbell.
+                 *
+                 * The MCU continuously re-halts the controller (HCH=1).
+                 * A halted HC ignores doorbells entirely — confirmed by
+                 * boot logs showing 20000 re-bursts with empty event ring.
+                 * We must write RS=1 and wait for HCH=0, then ring the
+                 * doorbell the instant the controller is running.
+                 * No debug_print between CRCR/RS=1 and the doorbell. */
+                /* CRCR + doorbell atomically — NO delay, NO RS=1 retry.
+                 * Writing RS=1 gives the MCU a fresh opportunity to re-take
+                 * ownership.  Instead: write CRCR then ring doorbell with only
+                 * a DSB between them.  If HCH=1 we write RS=1 once, then
+                 * immediately ring the doorbell without waiting — the MCU
+                 * will see our TRB on the next fetch cycle. */
+                {
+                    int _hch = readl(op + OP_USBSTS) & STS_HCH;
+                    writel(STS_HSE | STS_SRE | STS_EINT | STS_PCD, op + OP_USBSTS);
+                    reg_write64(op, OP_CRCR_LO, r_crcr);
+                    if (_hch) {
+                        /* Re-assert RS=1 but ring doorbell immediately after */
+                        writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
+                    }
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    writel(0, xhci_ctrl.doorbell_regs);
+                    asm volatile("dsb sy" ::: "memory");
+                }
+                /* Debug print AFTER doorbell */
+                debug_print("[xHCI] poll: re-burst + doorbell (iter %d)\n", ms);
+            }
         }
         delay_us(100);
     }
@@ -960,6 +1435,20 @@ static int port_reset_and_enable(int port)
 {
     void    *reg    = xhci_ctrl.op_regs + 0x400 + port * 0x10;
     uint32_t portsc = readl(reg);
+
+    /* xHCI §4.15.2.3: if the port is already enabled (PED=1), CCS=1,
+     * PLS=U0, and SuperSpeed, it is fully active — issuing PR=1 will
+     * trigger a Warm Reset that disconnects SS devices (confirmed boot log:
+     * CCS goes 1→0 after reset on Port 2).  Skip reset entirely. */
+    uint32_t pls   = (portsc >> 5) & 0xf;
+    uint32_t speed = (portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
+    int ped        = (portsc >> 1) & 1;
+    int ccs        = portsc & 1;
+    if (ccs && ped && pls == 0 && speed >= 4) {
+        debug_print("[xHCI] Port %d already enabled (SS, U0, PED=1) — skipping reset\n",
+                    port + 1);
+        return 0;
+    }
 
     /* Clear WIC bits (write-1-to-clear), set PR */
     portsc = (portsc & ~PORTSC_WIC) | (1U << 4);   /* PR = bit 4 */
@@ -1126,6 +1615,17 @@ static int cmd_address_device(uint8_t slot_id, int port, uint32_t speed)
             cmd_cycle ^= 1;
             cmd_enqueue = 0;
         }
+        /* Re-win CRCR atomically before ringing doorbell — same race fix as
+         * cmd_ring_submit().  Address Device TRB bypasses cmd_ring_submit()
+         * to preserve slot_id in dw3[31:24], so we must do this manually. */
+        {
+            void *op = xhci_ctrl.op_regs;
+            uint64_t ring_dma = phys_to_dma(
+                virt_to_phys((void *)&cmd_ring[cmd_enqueue * 4]));
+            cmd_crcr = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
+            reg_write64(op, OP_CRCR_LO, cmd_crcr);
+            asm volatile("dsb sy" ::: "memory");
+        }
         writel(0, xhci_ctrl.doorbell_regs);
         asm volatile("dsb sy" ::: "memory");
     }
@@ -1290,6 +1790,16 @@ static void enumerate_device(int port, uint32_t speed)
     }
     delay_ms(10);   /* Spec: ≥10ms after reset before first transaction */
 
+    /* Re-read speed from PORTSC — speed=0 before reset is normal (port was
+     * in Polling state).  After reset the HC fills in the actual speed. */
+    {
+        uint32_t psc_post = readl(xhci_ctrl.op_regs + 0x400 + port * 0x10);
+        uint32_t sp = (psc_post & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
+        if (sp != 0) speed = sp;
+        debug_print("[USB] Port %d: post-reset PORTSC=0x%08x  speed=%u\n",
+                    port + 1, psc_post, speed);
+    }
+
     /* 2. Enable a device slot */
     uint8_t slot_id = 0;
     if (cmd_enable_slot(&slot_id) != 0) {
@@ -1382,7 +1892,24 @@ static void port_scan(void) {
             case 3: s = "High  480 Mbps"; break;
             case 4: s = "Super 5 Gbps";   break;
         }
+        /* Bit 30 meaning differs by port protocol:
+         *   USB3 (SS) ports:  bit 30 = WPR (Warm Port Reset in progress)
+         *   USB2 ports:       bit 30 = DR  (Device Removable) — always 1
+         * Never skip a port solely because bit 30 is set.  If WPR=1 on an
+         * SS port with CCS=1, wait up to 500ms for WPR to clear before
+         * enumerating (the MCU is performing a warm reset). */
         if (portsc & PORTSC_CCS) {
+            /* If WPR=1 (bit 30) and speed=SS, wait for reset to complete */
+            if ((portsc & (1U << 30)) && speed == 4) {
+                debug_print("[xHCI]   Port %d: WPR=1 (SS warm reset), waiting...  PORTSC=0x%08x\n",
+                            p + 1, portsc);
+                for (int w = 0; w < 50; w++) {
+                    delay_ms(10);
+                    portsc = readl(op + 0x400 + p * 0x10);
+                    if (!(portsc & (1U << 30))) break;
+                }
+                speed = (portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
+            }
             debug_print("[xHCI]   Port %d: CONNECTED  %s  PORTSC=0x%08x\n",
                         p + 1, s, portsc);
             enumerate_device(p, speed);
