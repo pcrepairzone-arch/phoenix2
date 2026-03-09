@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phoenix RISC OS — xHCI Deep Analysis &amp; Fix Plan</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2e3352;
+    --accent: #5b8dee;
+    --accent2: #7c5bf5;
+    --warn: #f0c040;
+    --danger: #e05555;
+    --success: #3db87e;
+    --text: #d4d8f0;
+    --muted: #7a80a0;
+    --code-bg: #0d1020;
+    --code-text: #a8d5b5;
+    --tag-race: #e05555;
+    --tag-fix: #3db87e;
+    --tag-stub: #f0c040;
+    --tag-arch: #5b8dee;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    padding: 32px 24px;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 1.9rem;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 6px;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.95rem;
+    margin-bottom: 36px;
+  }
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 36px 0 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h2 .num {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+  h3 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #c8d0f0;
+    margin: 20px 0 8px;
+  }
+  p { margin-bottom: 10px; }
+  ul { margin: 8px 0 12px 20px; }
+  li { margin-bottom: 5px; }
+  a { color: var(--accent); }
+
+  /* Summary box */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 14px;
+    margin: 20px 0 32px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .stat-card .label { color: var(--muted); font-size: 0.82rem; margin-bottom: 4px; }
+  .stat-card .value { font-size: 1.6rem; font-weight: 700; }
+  .stat-card.danger .value { color: var(--danger); }
+  .stat-card.warn   .value { color: var(--warn); }
+  .stat-card.ok     .value { color: var(--success); }
+  .stat-card.info   .value { color: var(--accent); }
+
+  /* Issue cards */
+  .issue {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 22px;
+    overflow: hidden;
+  }
+  .issue-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sev {
+    flex-shrink: 0;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin-top: 2px;
+  }
+  .sev.critical { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; }
+  .sev.high     { background: #451a03; color: #fb923c; border: 1px solid #7c2d12; }
+  .sev.medium   { background: #422006; color: #fbbf24; border: 1px solid #78350f; }
+  .sev.low      { background: #052e16; color: #4ade80; border: 1px solid #14532d; }
+  .sev.info     { background: #0c1a3a; color: #60a5fa; border: 1px solid #1e3a5f; }
+  .issue-title  { font-size: 1.05rem; font-weight: 700; color: #e8eaf8; }
+  .issue-file   { font-size: 0.82rem; color: var(--muted); margin-top: 2px; font-family: monospace; }
+  .issue-body   { padding: 16px 20px; }
+
+  /* Tag */
+  .tag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-right: 5px;
+    margin-bottom: 4px;
+  }
+  .tag.race  { background: #3a0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+  .tag.fix   { background: #052e16; color: #4ade80; border: 1px solid #14532d; }
+  .tag.stub  { background: #422006; color: #fbbf24; border: 1px solid #78350f; }
+  .tag.arch  { background: #0c1a3a; color: #60a5fa; border: 1px solid #1e3a5f; }
+
+  /* Code */
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 14px 16px;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.82rem;
+    color: var(--code-text);
+    overflow-x: auto;
+    margin: 10px 0 14px;
+    line-height: 1.6;
+    white-space: pre;
+  }
+  pre .bad  { color: #f87171; }
+  pre .good { color: #4ade80; }
+  pre .note { color: #fbbf24; }
+  pre .head { color: #60a5fa; font-weight: bold; }
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-family: monospace;
+    font-size: 0.85em;
+    color: var(--code-text);
+  }
+
+  /* Divider */
+  hr { border: none; border-top: 1px solid var(--border); margin: 30px 0; }
+
+  /* Fix box */
+  .fix-box {
+    background: #071f13;
+    border: 1px solid #14532d;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 12px 0;
+  }
+  .fix-box h4 { color: #4ade80; font-size: 0.9rem; margin-bottom: 8px; }
+
+  /* Approach box */
+  .approach {
+    background: var(--surface2);
+    border-left: 4px solid var(--accent2);
+    border-radius: 0 8px 8px 0;
+    padding: 14px 18px;
+    margin: 12px 0;
+  }
+  .approach h4 { color: var(--accent); font-size: 0.9rem; margin-bottom: 6px; }
+
+  /* Warning callout */
+  .callout {
+    background: #2a1a04;
+    border: 1px solid #78350f;
+    border-left: 4px solid var(--warn);
+    border-radius: 0 8px 8px 0;
+    padding: 12px 16px;
+    margin: 12px 0;
+    font-size: 0.9rem;
+  }
+  .callout.danger {
+    background: #1f0606;
+    border-color: #7f1d1d;
+    border-left-color: var(--danger);
+  }
+  .callout.success {
+    background: #051a0d;
+    border-color: #14532d;
+    border-left-color: var(--success);
+  }
+
+  /* Boot log excerpt */
+  .logbox {
+    background: #07090f;
+    border: 1px solid #1e2540;
+    border-radius: 7px;
+    padding: 12px 16px;
+    font-family: monospace;
+    font-size: 0.8rem;
+    line-height: 1.7;
+    margin: 10px 0 14px;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .logbox .ok   { color: #4ade80; }
+  .logbox .warn { color: #fbbf24; }
+  .logbox .err  { color: #f87171; }
+  .logbox .dim  { color: #505878; }
+  .logbox .hl   { color: #60a5fa; }
+
+  /* Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 16px;
+    font-size: 0.88rem;
+  }
+  th {
+    background: var(--surface2);
+    color: var(--accent);
+    text-align: left;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    font-weight: 600;
+  }
+  td {
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tr:nth-child(even) td { background: #13161f; }
+  td.green { color: var(--success); font-weight: 600; }
+  td.red   { color: var(--danger); font-weight: 600; }
+  td.amber { color: var(--warn); font-weight: 600; }
+  td.blue  { color: var(--accent); font-weight: 600; }
+
+  .toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin-bottom: 36px;
+  }
+  .toc h3 { color: var(--accent); margin-bottom: 10px; font-size: 0.95rem; }
+  .toc ol { margin-left: 20px; }
+  .toc li { margin-bottom: 4px; font-size: 0.9rem; }
+  .toc a  { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>🔬 Phoenix RISC OS — xHCI Deep Analysis &amp; Fix Plan</h1>
+<p class="subtitle">Raspberry Pi 4 / VL805 xHCI · Boot log analysis · Codebase audit · Race condition fixes &amp; driver integration review</p>
+
+<!-- ── SUMMARY STATS ── -->
+<div class="summary-grid">
+  <div class="stat-card danger">
+    <div class="label">Critical Issues</div>
+    <div class="value">3</div>
+  </div>
+  <div class="stat-card warn">
+    <div class="label">High Issues</div>
+    <div class="value">4</div>
+  </div>
+  <div class="stat-card warn">
+    <div class="label">Medium / Stub Issues</div>
+    <div class="value">6</div>
+  </div>
+  <div class="stat-card ok">
+    <div class="label">PCIe / ATU / L1ss</div>
+    <div class="value">Fixed ✓</div>
+  </div>
+  <div class="stat-card ok">
+    <div class="label">HCRST / DMA Layout</div>
+    <div class="value">Correct ✓</div>
+  </div>
+  <div class="stat-card info">
+    <div class="label">Files Analysed</div>
+    <div class="value">18+</div>
+  </div>
+</div>
+
+<!-- ── TOC ── -->
+<div class="toc">
+  <h3>📋 Contents</h3>
+  <ol>
+    <li><a href="#s1">What the Boot Log is Actually Showing</a></li>
+    <li><a href="#s2">Issue 1 — CRCR Split-Write Race (Critical)</a></li>
+    <li><a href="#s3">Issue 2 — Doorbell Timing Gap (Critical)</a></li>
+    <li><a href="#s4">Issue 3 — MCU Re-halts After Enable Slot (Critical)</a></li>
+    <li><a href="#s5">Issue 4 — IRQ / GIC Never Wired (High)</a></li>
+    <li><a href="#s6">Issue 5 — USB Core Fully Stubbed Out (High)</a></li>
+    <li><a href="#s7">Issue 6 — Pre-Scan Drain ERDP Not Updated (High)</a></li>
+    <li><a href="#s8">Issue 7 — MMC Driver SDHCI Register Width (High)</a></li>
+    <li><a href="#s9">Issue 8 — DMA Buffer Size vs Linker Section (Medium)</a></li>
+    <li><a href="#s10">Issue 9 — SMP: CPUs 1-3 Running but Unguarded (Medium)</a></li>
+    <li><a href="#s11">Issue 10 — enqueue_task Not Spinlock-Protected (Medium)</a></li>
+    <li><a href="#s12">Other Driver Status Table</a></li>
+    <li><a href="#s13">Alternative Approaches</a></li>
+    <li><a href="#s14">Recommended Fix Order</a></li>
+  </ol>
+</div>
+
+<!-- ──────────────────────────────────────────────
+     SECTION 1: WHAT THE BOOT LOG SHOWS
+     ────────────────────────────────────────────── -->
+<h2 id="s1"><span class="num">1</span> What the Boot Log is Actually Showing</h2>
+
+<p>The boot reaches USB init successfully — PCIe link comes up, VL805 ID reads correctly, HCRST completes, all DMA ring addresses are set up properly. The failure happens during the <strong>Enable Slot command</strong> after port reset. Here is the key sequence from the log:</p>
+
+<div class="logbox"><span class="ok">[xHCI] Controller RUNNING at 10us  USBSTS=0x00000000</span>
+<span class="ok">[xHCI] Controller RUNNING (fast)  USBSTS=0x00000005</span>
+<span class="warn">[xHCI] Post-RS=1 MCU HSE cleared  USBSTS=0x00000001</span>
+<span class="dim">...</span>
+<span class="warn">[xHCI] Pre-scan  USBSTS=0x0000001d  ERDP_LO=0xc80b5c08  IMAN=0x00000003</span>
+<span class="err">[xHCI] WARNING: halted before port scan — recovery</span>
+<span class="ok">[xHCI] Recovery done  USBSTS=0x00000005</span>
+<span class="ok">[xHCI]   Port 2: CONNECTED  Super 5 Gbps  PORTSC=0x00281203</span>
+<span class="ok">[xHCI] Port 2 reset complete  PORTSC=0x000202f1</span>
+<span class="dim">... (20,000 EHB poll iterations over ~2 seconds) ...</span>
+<span class="warn">[xHCI] poll: stolen ERSTBA=0x00000000_c80b6000  CRCR_LO=0x00000000</span>  <span class="note">← CRCR wiped!</span>
+<span class="warn">[xHCI] poll: USBSTS=0x00000005  evt_dequeue=0  evt_cycle=1</span>
+<span class="err">[xHCI] poll: evt_ring[0..3] = all zeros</span>  <span class="note">← controller never processed TRB</span>
+<span class="err">[xHCI] Enable Slot: event timeout</span>
+<span class="err">[USB] Port 2: Enable Slot failed</span></pre></div>
+
+<p>The line <code>CRCR_LO=0x00000000</code> at the first re-burst dump is the smoking gun. The VL805 MCU has overwritten the Command Ring Control Register to zero. Our Enable Slot TRB is sitting correctly in memory (<code>cmd_ring[0] = ... 00002401</code> — type 9 = Enable Slot, cycle=1), but the controller has no idea where to find it because CRCR was cleared.</p>
+
+<div class="callout danger">
+  <strong>Root cause in one sentence:</strong> The VL805 has an internal MCU that runs its own xHCI init firmware. Every time we write RS=1, the MCU interprets it as a trigger to re-run its own initialization, overwriting CRCR (and potentially DCBAAP/ERSTBA/ERDP) with pointers to its own SRAM-based rings. Our Enable Slot TRB is invisible to the controller because CRCR has been redirected to SRAM.
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 1: CRCR SPLIT WRITES
+     ────────────────────────────────────────────── -->
+<h2 id="s2"><span class="num">2</span> Issue 1 — CRCR Split-Write Race Condition</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev critical">Critical</span>
+    <div>
+      <div class="issue-title">CRCR, ERSTBA, and ERDP written as two separate 32-bit stores in all re-burst loops</div>
+      <div class="issue-file">drivers/usb/usb_xhci.c — run_controller() step 3b (lines ~880–891), retry loop (lines ~924–935), evt_ring_poll re-burst (~1403–1414), cmd_ring_submit recovery (~1205–1215)</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The file's own comment on <code>reg_write64()</code> correctly explains the problem:</p>
+    <blockquote style="border-left:3px solid var(--accent2);padding-left:12px;color:var(--muted);font-style:italic;margin:10px 0;">
+      "This matters critically for CRCR: the VL805 latches the command ring pointer only when it sees the full 64-bit value in one transaction. Two sequential 32-bit writes cause the VL805 to silently discard CRCR_LO, leaving CRCR=0."
+    </blockquote>
+    <p>Yet every single re-burst loop — including the critical one in step 3b and the retry loop — uses two separate <code>writel()</code> calls. The <strong>MCU window to steal CRCR</strong> is exactly the gap between writing CRCR_LO and CRCR_HI. On a PCIe bus this gap can be 50–200 ns — plenty of time for the MCU to read the half-valid register and cache it internally as zero.</p>
+
+    <pre><span class="bad">/* CURRENT — BAD: split writes, MCU steals the gap */</span>
+writel(launch_crcr_lo,  op + OP_CRCR_LO);   <span class="bad">// ← MCU can fire here</span>
+writel(launch_crcr_hi,  op + OP_CRCR_HI);   <span class="bad">// ← too late, MCU already read LO</span>
+
+<span class="bad">/* SAME PROBLEM in every re-burst in evt_ring_poll, cmd_ring_submit */</span>
+writel((uint32_t)(r_crcr &amp; 0xFFFFFFFF), op + OP_CRCR_LO);
+writel((uint32_t)(r_crcr &gt;&gt; 32),        op + OP_CRCR_HI);</pre>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Use reg_write64 for CRCR, ERSTBA, and ERDP in every burst</h4>
+      <p>The <code>reg_write64()</code> function already exists and does the right thing — a single 64-bit STR instruction. Replace every pair of CRCR writel calls with it:</p>
+      <pre><span class="good">/* FIXED: single 64-bit write — VL805 latches the full pointer atomically */</span>
+reg_write64(op,  OP_CRCR_LO,    crcr_val);   <span class="good">// one 8-byte PCIe write</span>
+reg_write64(ir0, IR_ERSTBA_LO,  erstba_dma); <span class="good">// ditto for ERSTBA</span>
+reg_write64(ir0, IR_ERDP_LO,    erdp_dma);   <span class="good">// ditto for ERDP</span></pre>
+      <p>This needs to be applied in <strong>all four locations</strong>: setup_cmd_ring(), run_controller() step 3b, the retry loop inside run_controller(), evt_ring_poll(), and cmd_ring_submit() recovery.</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 2: DOORBELL TIMING GAP
+     ────────────────────────────────────────────── -->
+<h2 id="s3"><span class="num">3</span> Issue 2 — Doorbell Timing Gap After CRCR Write</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev critical">Critical</span>
+    <div>
+      <div class="issue-title">Doorbell is rung too late — MCU overwrites CRCR in the gap between the write and the ring</div>
+      <div class="issue-file">drivers/usb/usb_xhci.c — cmd_ring_submit() (lines ~1246–1253), evt_ring_poll re-burst (~1416–1419)</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>Even after fixing the split-write issue, there is a second race window: between writing CRCR and ringing doorbell 0, the MCU has ~100–500 µs to steal CRCR back. In <code>evt_ring_poll()</code>, the re-burst writes CRCR and then calls <code>debug_print()</code> before ringing the doorbell. Each UART byte at 115200 baud takes ~86 µs. A single <code>debug_print</code> call with a format string can take 2–8 ms — completely ruining the timing.</p>
+
+    <pre><span class="bad">/* CURRENT — evt_ring_poll re-burst */</span>
+writel(...crcr_lo..., op + OP_CRCR_LO);
+writel(...crcr_hi..., op + OP_CRCR_HI);
+writel(0x00000002U,   ir0 + IR_IMAN);
+asm volatile("dsb sy; isb" ::: "memory");
+<span class="bad">debug_print("...re-burst all regs...");  // ← costs 1-8ms, MCU steals CRCR here</span>
+writel(0, xhci_ctrl.doorbell_regs);      // ← doorbell lands AFTER MCU overwrote CRCR</pre>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Ring the doorbell in the same barrier burst as CRCR write</h4>
+      <pre><span class="good">/* FIXED: doorbell immediately after CRCR, no prints in between */</span>
+reg_write64(op, OP_CRCR_LO, crcr_val);
+writel(0, xhci_ctrl.doorbell_regs);          <span class="good">// ring NOW, before MCU can react</span>
+asm volatile("dsb sy" ::: "memory");
+<span class="good">/* Print AFTER doorbell — diagnostic info is still useful */</span>
+debug_print("[xHCI] re-burst + doorbell (iter %d)\n", ms);</pre>
+    </div>
+    <p>The same principle applies everywhere a doorbell is rung after a register burst. The CRCR write and doorbell ring should be separated by nothing but a DSB, not a UART print or a delay loop.</p>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 3: MCU RE-HALTS
+     ────────────────────────────────────────────── -->
+<h2 id="s4"><span class="num">4</span> Issue 3 — MCU Ownership Battle: The Deeper Architectural Problem</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev critical">Critical</span>
+    <div>
+      <div class="issue-title">The VL805 MCU continues re-initialising after RS=1 and after Enable Slot command submission</div>
+      <div class="issue-file">drivers/usb/usb_xhci.c — run_controller(), port_scan(), evt_ring_poll(); kernel/pci.c — overall firmware approach</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The VL805 has an embedded Cortex-M class MCU running SPI-loaded firmware. This firmware:</p>
+    <ul>
+      <li>Watches for RS=1 and immediately runs its own xHCI startup sequence</li>
+      <li>Sets HSE ~60 µs after RS=1 as a "I am starting" signal</li>
+      <li>Overwrites CRCR, DCBAAP, ERSTBA, ERDP with pointers to its own SRAM rings at address ~<code>0xc80c5000</code></li>
+      <li>Re-halts the controller (HCH=1) within 10–60 µs if it decides its own init is in progress</li>
+    </ul>
+
+    <p>The boot log shows the pre-scan halted state USBSTS=<code>0x0000001d</code> = HCH + HSE + EINT + PCD. The MCU halted the controller again between the time run_controller() returned and the time port_scan() checked. This is confirmed by:</p>
+
+    <div class="logbox"><span class="warn">Pre-scan  USBSTS=0x0000001d  ERDP_LO=0xc80b5c08  IMAN=0x00000003</span>
+<span class="note">  USBSTS bits: bit0=HCH(halted) bit2=HSE bit3=EINT bit4=PCD — all four set</span></div>
+
+    <p>The current <code>run_controller()</code> approach is essentially correct — it detects this and has a recovery path — but the Enable Slot timeout is happening because the MCU steals CRCR during the 10ms delay between port reset and Enable Slot submission (<code>delay_ms(10)</code> in <code>enumerate_device()</code>).</p>
+
+    <div class="approach">
+      <h4>🔧 Fix A — Tighten the Enable Slot sequence (recommended short-term)</h4>
+      <p>The combination of fixes from Issues 1 and 2 should be sufficient IF also applied to the immediate pre-Enable-Slot window. Specifically: immediately before calling <code>cmd_enable_slot()</code>, perform a full re-burst using <code>reg_write64</code> for CRCR, then ring the doorbell atomically:</p>
+      <pre><span class="good">/* In enumerate_device(), before cmd_enable_slot() */</span>
+<span class="good">/* 1. Re-win the controller one more time */</span>
+<span class="good">/* 2. Write Enable Slot TRB to cmd_ring[cmd_enqueue] */</span>
+<span class="good">/* 3. DSB to flush TRB to Device memory */</span>
+<span class="good">/* 4. reg_write64(op, OP_CRCR_LO, crcr_val) — 64-bit atomic */</span>
+<span class="good">/* 5. writel(0, doorbell_regs) — ring NOW in same burst */</span>
+<span class="good">/* 6. asm volatile("dsb sy" ::: "memory") */</span>
+<span class="good">/* 7. Poll evt_ring for CCE — MCU may fire HSE but won't halt us */</span></pre>
+    </div>
+
+    <div class="approach">
+      <h4>🔧 Fix B — Pre-stage TRB before HCRST, burst within CNR=0 window</h4>
+      <p>A more robust approach: write the Enable Slot TRB into the command ring <em>before</em> issuing a targeted HCRST. Immediately after CNR=0 clears (no delay, tight spin), write CRCR as a 64-bit write and ring doorbell 0 in one back-to-back pair. The MCU typically takes ~500 µs to restart after HCRST; our burst completes in &lt;5 µs.</p>
+      <pre><span class="good">/* Step 1: Write Enable Slot TRB to memory (MCU doesn't know about it yet) */</span>
+cmd_ring[0]  = 0;
+cmd_ring[1]  = 0;
+cmd_ring[2]  = 0;
+cmd_ring[3]  = (TRB_TYPE_ENABLE_SLOT &lt;&lt; 10) | cmd_cycle;
+asm volatile("dsb sy" ::: "memory");
+
+<span class="good">/* Step 2: HCRST — this resets MCU internal state */</span>
+writel(CMD_HCRST, op + OP_USBCMD);
+asm volatile("dsb sy; isb" ::: "memory");
+
+<span class="good">/* Step 3: Busy-wait CNR=0, NO delays, NO prints */</span>
+while (readl(op + OP_USBSTS) &amp; STS_CNR) {}
+
+<span class="good">/* Step 4: Blast DCBAAP, CONFIG, ERST, ERDP — then CRCR+DB atomically */</span>
+writel(dcbaa_lo, op + OP_DCBAAP_LO);
+writel(dcbaa_hi, op + OP_DCBAAP_HI);
+<span class="note">/* ... other regs ... */</span>
+reg_write64(op,  OP_CRCR_LO,  crcr_val);   <span class="good">// 64-bit write</span>
+writel(CMD_RS | CMD_INTE, op + OP_USBCMD); <span class="good">// RS=1</span>
+writel(0, doorbell_regs);                   <span class="good">// DB0 — immediately</span>
+asm volatile("dsb sy" ::: "memory");</pre>
+    </div>
+
+    <div class="approach">
+      <h4>🔧 Fix C — Firmware mailbox approach (alternative, longer-term)</h4>
+      <p>The VL805 firmware loaded from SPI has a mailbox interface (the PERST# + firmware load sequence already uses tag <code>0x00030058</code>). If Broadcom/VIA documentation for the firmware's USB Host API is available, it may be possible to submit enumeration commands directly to the MCU rather than fighting it. This avoids the ownership battle entirely. However, this interface is not publicly documented and would require reverse engineering or binary analysis of the VL805 SPI firmware image.</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 4: GIC NOT WIRED
+     ────────────────────────────────────────────── -->
+<h2 id="s5"><span class="num">5</span> Issue 4 — IRQ System: GIC Not Configured</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev high">High</span>
+    <div>
+      <div class="issue-title">irq.c has a stub GIC — no vectors routed, no USB interrupt ever delivered</div>
+      <div class="issue-file">kernel/irq.c — irq_init(), irq_unmask(), irq_eoi(); kernel/exceptions.S</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The entire IRQ system is effectively a no-op. <code>irq_init()</code> clears a software table but never touches the BCM2711's GIC-400 controller hardware. The TODO comments are clear:</p>
+    <pre><span class="bad">/* TODO: Set up GIC (Generic Interrupt Controller) */</span>
+<span class="bad">/* TODO: Unmask in GIC */</span>
+<span class="bad">/* TODO: Mask in GIC */</span>
+<span class="bad">/* TODO: Send End-of-Interrupt to GIC */</span></pre>
+
+    <p>Consequences for the current xHCI work:</p>
+    <ul>
+      <li>The <code>CMD_INTE</code> flag written to USBCMD has no effect — even if the VL805 asserts the interrupt line, the CPU never receives it.</li>
+      <li>The code already polls the event ring directly, so the USB <em>currently works in polling mode</em> — no GIC dependency for the current boot sequence.</li>
+      <li>Once the Enable Slot fix works and the kernel tries to use USB for I/O (keyboard, mass storage), interrupt-driven transfers will silently fail. All I/O would need to remain in a polling loop.</li>
+    </ul>
+
+    <div class="fix-box">
+      <h4>✅ Fix — BCM2711 GIC-400 initialisation (minimum viable)</h4>
+      <p>BCM2711 GIC-400 base: <code>0xFF840000</code>. Distributor offset: <code>0x1000</code>. CPU Interface: <code>0x2000</code>.</p>
+      <pre><span class="good">#define GIC_DIST_BASE  0xFF841000ULL</span>
+<span class="good">#define GIC_CPU_BASE   0xFF842000ULL</span>
+
+<span class="good">/* In irq_init(): */</span>
+<span class="good">// 1. GICD_CTLR = 1  (enable distributor)</span>
+<span class="good">// 2. GICC_PMR  = 0xFF  (all interrupt priorities unmasked)</span>
+<span class="good">// 3. GICC_CTLR = 1  (enable CPU interface)</span>
+<span class="good">// 4. For each SPI: GICD_ISENABLERn bit = 1  (enable specific IRQ)</span>
+<span class="good">// 5. Set exception vectors (EL1 IRQ vector → irq_dispatch)</span>
+
+<span class="good">/* BCM2711 USB IRQ: VL805 xHCI → GIC SPI 75 (check DTS) */</span></pre>
+      <p>Note: the <code>exceptions.S</code> vector table must be verified to route the EL1 IRQ to the <code>irq_dispatch()</code> C handler. If the vector table currently has a stub or infinite loop for IRQ entries, no interrupts will work regardless of GIC state.</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 5: USB CORE STUBS
+     ────────────────────────────────────────────── -->
+<h2 id="s6"><span class="num">6</span> Issue 5 — USB Core Completely Stubbed Out</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev high">High</span>
+    <div>
+      <div class="issue-title">usb_core.c transfers all return -1; usb_core.c and usb_xhci.c are not connected</div>
+      <div class="issue-file">drivers/usb/usb_core.c, drivers/usb/usb_hid.c, drivers/usb/usb_mass_storage.c</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The three main USB transfer functions in <code>usb_core.c</code> are hard-coded stubs that return -1:</p>
+    <pre><span class="bad">int usb_control_transfer(...) { return -1; }   // TODO</span>
+<span class="bad">int usb_bulk_transfer(...)    { return -1; }   // TODO</span>
+<span class="bad">int usb_interrupt_transfer(...){ return -1; }  // TODO</span></pre>
+
+    <p>Furthermore, <code>usb_enumerate_device()</code> accesses <code>dev->num_interfaces</code> and <code>dev->interfaces[]</code> without these ever being populated — the descriptor parsing that populates these fields is also a TODO comment.</p>
+
+    <p>The <code>xhci_init()</code> function in usb_xhci.c does perform its own inline enumeration (Get Device Descriptor, string descriptors) but the results are never stored in a <code>usb_device_t</code> struct, so class drivers (HID, mass storage) can never bind to them. There is also a disconnect: <code>kernel/usb_storage.c</code> exists but uses none of the functions in <code>drivers/usb/usb_core.c</code>.</p>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Wire usb_core.c to xhci via a callback/ops table</h4>
+      <p>Define a <code>usb_hc_ops_t</code> struct (host controller operations) in <code>usb.h</code> and have <code>xhci_init()</code> register it. Then <code>usb_control_transfer()</code> calls through the ops table:</p>
+      <pre><span class="good">typedef struct {</span>
+<span class="good">    int (*control)(usb_device_t*, uint8_t rt, uint8_t req,</span>
+<span class="good">                   uint16_t val, uint16_t idx, void*, uint16_t, int);</span>
+<span class="good">    int (*bulk)   (usb_endpoint_t*, void*, size_t, int);</span>
+<span class="good">    int (*intr)   (usb_endpoint_t*, void*, size_t, int);</span>
+<span class="good">} usb_hc_ops_t;</span>
+
+<span class="good">static usb_hc_ops_t *g_hc_ops = NULL;</span>
+
+<span class="good">/* xhci registers itself: */</span>
+<span class="good">void xhci_register_hc_ops(usb_hc_ops_t *ops) { g_hc_ops = ops; }</span></pre>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 6: PRE-SCAN DRAIN ERDP
+     ────────────────────────────────────────────── -->
+<h2 id="s7"><span class="num">7</span> Issue 6 — Pre-Scan Drain Loop Does Not Update ERDP Per Event</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev high">High</span>
+    <div>
+      <div class="issue-title">The post-run drain loop increments evt_dequeue but only writes ERDP once at the end</div>
+      <div class="issue-file">drivers/usb/usb_xhci.c — xhci_init() post-run drain block (lines ~1958–1978)</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The pre-scan event drain loop (which runs after <code>run_controller()</code> returns) does:</p>
+    <pre>while (event_valid) {
+    evt_dequeue++;   <span class="bad">// increments the pointer</span>
+    ...
+}
+<span class="note">/* write ERDP only once at the end */</span>
+reg_write64(ir0, IR_ERDP_LO, clean_erdp);</pre>
+    <p>If the VL805 MCU is simultaneously writing events to the ring, the controller checks ERDP after each event write. If ERDP points to a slot already consumed (but ERDP not yet advanced), the controller may think the ring is full and stop posting events. The correct approach is to call <code>evt_ring_consume()</code> (which advances ERDP individually) or write ERDP after each consumed TRB during draining.</p>
+    <p>Additionally, this drain loop has no cycle-bit check wraparound — if more than 64 events are posted during firmware startup, <code>evt_dequeue</code> will go out-of-bounds into <code>evt_cycle</code> territory.</p>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Use evt_ring_consume() for each event in all drain loops</h4>
+      <pre><span class="good">/* Replace the open-coded drain loop with: */</span>
+int drained = 0;
+uint32_t tmp[4];
+while (1) {
+    uint32_t dw3 = evt_ring[evt_dequeue * 4 + 3];
+    if ((dw3 &amp; TRB_CYCLE) != evt_cycle) break;
+    evt_ring_consume(ir0, tmp);   <span class="good">// advances dequeue AND writes ERDP</span>
+    drained++;
+    if (drained &gt; EVT_RING_TRBS) break;  <span class="good">// safety: avoid infinite loop</span>
+}</pre>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 7: MMC DRIVER
+     ────────────────────────────────────────────── -->
+<h2 id="s8"><span class="num">8</span> Issue 7 — MMC Driver: Byte-Wide Register Access on 16/8-bit Offsets</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev high">High</span>
+    <div>
+      <div class="issue-title">SDHCI_BLOCK_COUNT, CLOCK_CONTROL, TIMEOUT_CONTROL, SOFTWARE_RESET are 16/8-bit registers accessed via 32-bit read-modify-write</div>
+      <div class="issue-file">drivers/mmc/mmc.c — SDHCI register map definitions and access helpers</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The SDHCI spec defines several sub-word registers:</p>
+    <table>
+      <tr><th>Register</th><th>Offset</th><th>SDHCI Width</th><th>Current Access</th></tr>
+      <tr><td>SDHCI_BLOCK_COUNT</td><td>0x06</td><td class="amber">16-bit</td><td class="red">32-bit read at 0x04</td></tr>
+      <tr><td>SDHCI_CLOCK_CONTROL</td><td>0x2C</td><td class="amber">16-bit</td><td class="red">32-bit, overlaps TIMEOUT(0x2E)</td></tr>
+      <tr><td>SDHCI_TIMEOUT_CONTROL</td><td>0x2E</td><td class="amber">8-bit</td><td class="red">32-bit, stomps SOFTWARE_RESET</td></tr>
+      <tr><td>SDHCI_SOFTWARE_RESET</td><td>0x2F</td><td class="amber">8-bit</td><td class="red">32-bit, covers TIMEOUT</td></tr>
+    </table>
+    <p>Using 32-bit writes to 0x2C will modify TIMEOUT and RESET at the same time. On BCM2711 the arasan SDHCI is strict about register widths. The boot log showed the arasan correctly negotiating 50 MHz and reaching FAT-formatted boot partition — so the SD card is reading correctly — but incorrect TIMEOUT/RESET writes could cause spurious timeouts or silent resets during block I/O.</p>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Add byte and half-word accessors</h4>
+      <pre><span class="good">static inline void sdhci_write16(uint32_t off, uint16_t v) {</span>
+<span class="good">    *(volatile uint16_t *)(SDHCI_BASE + off) = v;</span>
+<span class="good">}</span>
+<span class="good">static inline void sdhci_write8(uint32_t off, uint8_t v) {</span>
+<span class="good">    *(volatile uint8_t *)(SDHCI_BASE + off) = v;</span>
+<span class="good">}</span>
+<span class="good">/* Use sdhci_write16 for CLOCK_CONTROL (0x2C) */</span>
+<span class="good">/* Use sdhci_write8  for TIMEOUT_CONTROL (0x2E) and SOFTWARE_RESET (0x2F) */</span></pre>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 8: DMA BUFFER SIZE
+     ────────────────────────────────────────────── -->
+<h2 id="s9"><span class="num">9</span> Issue 8 — DMA Buffer Size vs Linker Section Reserved Size Mismatch</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev medium">Medium</span>
+    <div>
+      <div class="issue-title">xhci_dma_buf requires 270,336 bytes but linker comment references 0x1400 (5120 bytes)</div>
+      <div class="issue-file">drivers/usb/usb_xhci.c — DMA_BUF_SIZE calculation; kernel/linker.ld</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The code comment in usb_xhci.c states the buffer needs:</p>
+    <pre>DMA_BUF_SIZE = DMA_SCRATCH_PAGES_OFF + MAX_SCRATCH_PAGES * 4096
+             = 0x2000 + 64 * 4096
+             = 0x2000 + 0x40000
+             = 0x42000 = 270,336 bytes</pre>
+    <p>The comment also says the linker script reserves it with <code>'. += 0x1400'</code>. If the linker section is only 0x1400 = 5,120 bytes, the scratchpad pages (VL805 needs 31 × 4096 = 126,976 bytes) overflow into arbitrary kernel memory. This would cause the VL805 to DMA into kernel code/data — likely causing the halted/HSE states.</p>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Verify and correct linker.ld .xhci_dma section</h4>
+      <pre><span class="good">/* In linker.ld, the .xhci_dma section should be: */</span>
+<span class="good">.xhci_dma (NOLOAD) : ALIGN(4096) {</span>
+<span class="good">    __xhci_dma_start = .;</span>
+<span class="good">    . += 0x42000;    /* 270,336 bytes — matches DMA_BUF_SIZE */</span>
+<span class="good">    __xhci_dma_end = .;</span>
+<span class="good">} &gt;ram</span></pre>
+      <p>Also verify mmu.c maps <em>all</em> pages from <code>__xhci_dma_start</code> to <code>__xhci_dma_end</code> as Device nGnRnE. If only 0x1400 bytes are being remapped, scratchpad pages at the end of the buffer are marked Normal WB (cacheable), causing DMA coherency failures.</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 9: SMP
+     ────────────────────────────────────────────── -->
+<h2 id="s10"><span class="num">10</span> Issue 9 — SMP: CPUs 1–3 Running WFE Without Proper Initialisation</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev medium">Medium</span>
+    <div>
+      <div class="issue-title">Scheduler shows 4 CPUs but only CPU 0 is fully initialised; CPUs 1–3 in undefined state</div>
+      <div class="issue-file">kernel/sched.c — sched_init_cpu(); kernel/boot.S</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>The boot log shows <code>"CPUs detected: 4"</code> and <code>"Scheduler initialized for 4 CPUs"</code>. However, <code>sched_init_cpu()</code> is only called for CPU 0 in the boot sequence. CPUs 1–3 are presumably spinning on a WFE loop from boot.S but are not held in a safe power-down or parked state with a defined exception vector. The <code>idle_task_fn</code> uses <code>WFE</code> which will wake on any event (including spurious), and without proper MPIDR-based spin tables, the secondary CPUs may jump to undefined addresses.</p>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Use ARMv8 spin table or PSCI for secondary CPUs</h4>
+      <p>Either: (a) in boot.S, park CPUs 1–3 in a WFI/SEV spin table waiting on a mailbox address, then bring them up sequentially once per-CPU stacks and MMU state are ready; or (b) use the Pi 4's PSCI mailbox at <code>0xd8</code> (spin table entry point) which the bootloader configures. The secondary CPU MMU/stack state must be initialised before <code>sched_init_cpu(n)</code> is called for n &gt; 0.</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     ISSUE 10: SPINLOCK IN SCHED
+     ────────────────────────────────────────────── -->
+<h2 id="s11"><span class="num">11</span> Issue 10 — enqueue_task() Not Protected by Per-CPU Spinlock</h2>
+<div class="issue">
+  <div class="issue-header">
+    <span class="sev medium">Medium</span>
+    <div>
+      <div class="issue-title">enqueue_task() modifies the linked list without holding cpu_sched[n].lock</div>
+      <div class="issue-file">kernel/sched.c — enqueue_task(), dequeue_task()</div>
+    </div>
+  </div>
+  <div class="issue-body">
+    <p>Each <code>cpu_sched_t</code> has a <code>spinlock_t lock</code>, but <code>enqueue_task()</code> modifies <code>runqueue_head</code>, <code>runqueue_tail</code>, and the prev/next pointers without taking the lock. If two cores call <code>enqueue_task()</code> on the same CPU's runqueue simultaneously, the linked list can become corrupt.</p>
+
+    <div class="fix-box">
+      <h4>✅ Fix — Wrap list mutations with spinlock</h4>
+      <pre><span class="good">void enqueue_task(cpu_sched_t *sched, task_t *task) {</span>
+<span class="good">    unsigned long flags;</span>
+<span class="good">    spin_lock_irqsave(&amp;sched-&gt;lock, &amp;flags);</span>
+<span class="good">    /* ... list manipulation ... */</span>
+<span class="good">    spin_unlock_irqrestore(&amp;sched-&gt;lock, flags);</span>
+<span class="good">}</span></pre>
+      <p>Same applies to <code>dequeue_task()</code> and <code>schedule()</code> when it accesses <code>runqueue_head</code>.</p>
+    </div>
+  </div>
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     DRIVER STATUS TABLE
+     ────────────────────────────────────────────── -->
+<h2 id="s12"><span class="num">12</span> All Driver Status Overview</h2>
+
+<table>
+  <tr>
+    <th>Driver / File</th>
+    <th>Status</th>
+    <th>Works With Codebase?</th>
+    <th>Key Issue / Note</th>
+  </tr>
+  <tr>
+    <td>kernel/pci.c — BCM2711 PCIe</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>L1ss fix, ATU, HARD_DEBUG all correct. Link comes up reliably.</td>
+  </tr>
+  <tr>
+    <td>drivers/usb/usb_xhci.c — xHCI init</td>
+    <td class="amber">Partial ⚠</td>
+    <td class="amber">Almost</td>
+    <td>HCRST, DMA setup, ring init all correct. Fails at Enable Slot due to CRCR split-write + doorbell timing race (Issues 1–3).</td>
+  </tr>
+  <tr>
+    <td>drivers/usb/usb_core.c</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>All transfer functions return -1. Not connected to xHCI. Class driver probe loop is correct but unreachable.</td>
+  </tr>
+  <tr>
+    <td>drivers/usb/usb_hid.c</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>Depends on usb_control_transfer / usb_interrupt_transfer which are stubs.</td>
+  </tr>
+  <tr>
+    <td>drivers/usb/usb_mass_storage.c</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>Same — depends on usb_bulk_transfer stub. VFS is also a stub so no path from block device to filesystem.</td>
+  </tr>
+  <tr>
+    <td>drivers/usb/vl805_init.c</td>
+    <td class="green">Done ✓</td>
+    <td class="green">Yes</td>
+    <td>VL805 firmware load via mailbox tag 0x00030058. Works as fallback when vl805.bin absent (non-fatal).</td>
+  </tr>
+  <tr>
+    <td>drivers/mmc/mmc.c — SDHCI/SD</td>
+    <td class="amber">Partial ⚠</td>
+    <td class="amber">Reads OK</td>
+    <td>SD init sequence looks correct. Sub-word register width issue on CLOCK_CONTROL / TIMEOUT / RESET (Issue 7). Boot works because arasan initialised by firmware; kernel re-init may fail.</td>
+  </tr>
+  <tr>
+    <td>drivers/gpu/framebuffer.c</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>Mailbox framebuffer at 1920×1080. Boot log confirms base=0x3e3cf000. Correctly connected to kernel.</td>
+  </tr>
+  <tr>
+    <td>drivers/gpu/mailbox.c</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>Used by GPU, VL805 firmware load, and framebuffer. Correct phys→GPU address translation via +0x40000000.</td>
+  </tr>
+  <tr>
+    <td>drivers/uart/uart.c</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>PL011 at 103448 baud (slightly off from 115200 but readable). debug_print() functional.</td>
+  </tr>
+  <tr>
+    <td>drivers/nvme/nvme.c</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>NVMe not applicable to Pi 4. May be intended for Pi 5 / PCIe NVMe hat. No PCIe init for it.</td>
+  </tr>
+  <tr>
+    <td>drivers/bluetooth/bluetooth.c</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>BCM43455 Bluetooth on UART2 — not initialised. Would need firmware upload + HCI UART driver.</td>
+  </tr>
+  <tr>
+    <td>drivers/input/input_stub.c</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>Returns no events. Depends on USB HID which is also a stub. No keyboard/mouse input possible.</td>
+  </tr>
+  <tr>
+    <td>kernel/irq.c — GIC</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>Software table only. GIC-400 never programmed. All interrupts silently lost. (Issue 4)</td>
+  </tr>
+  <tr>
+    <td>kernel/sched.c — Scheduler</td>
+    <td class="amber">Partial ⚠</td>
+    <td class="amber">CPU0 only</td>
+    <td>Round-robin works on CPU 0. CPUs 1–3 uninitialised. enqueue_task spinlock missing (Issue 10).</td>
+  </tr>
+  <tr>
+    <td>kernel/mmu.c</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>Identity map with Device pages for .xhci_dma. Correct L3 split within first 2MB. Verify section size (Issue 8).</td>
+  </tr>
+  <tr>
+    <td>kernel/malloc.c</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>Simple first-fit heap. Boot log shows 134 MB free. Safe for single-CPU use.</td>
+  </tr>
+  <tr>
+    <td>kernel/spinlock.c</td>
+    <td class="green">Working ✓</td>
+    <td class="green">Yes</td>
+    <td>LDAXR/STXR exclusive access. Correct DAIF save/restore. Proper AArch64 SMP-safe implementation.</td>
+  </tr>
+  <tr>
+    <td>net/ (tcp, udp, ipv4, arp etc.)</td>
+    <td class="red">Stub ✗</td>
+    <td class="red">No</td>
+    <td>Network stack stubs. No ethernet driver connected. Pi 4 has USB-connected gigabit (LAN7515) which would need USB mass-storage/CDC path first.</td>
+  </tr>
+  <tr>
+    <td>wimp/ (window manager)</td>
+    <td class="amber">Partial ⚠</td>
+    <td class="amber">GPU only</td>
+    <td>Framebuffer rendering works. No input events reach WIMP (keyboard/mouse stubs). Desktop launches but is non-interactive.</td>
+  </tr>
+</table>
+
+
+<!-- ──────────────────────────────────────────────
+     ALTERNATIVE APPROACHES
+     ────────────────────────────────────────────── -->
+<h2 id="s13"><span class="num">13</span> Alternative Approaches to the MCU Race</h2>
+
+<p>If the targeted register fixes (Issues 1–3) don't fully resolve the Enable Slot timeout, here are three distinct architectural approaches in order of complexity:</p>
+
+<div class="approach">
+  <h4>Approach A — Bare-metal HCRST "steal" with pre-staged TRB (Recommended next step)</h4>
+  <p>Issue a dedicated HCRST before each command submission. Write the command TRB to memory <em>before</em> the HCRST so it survives the reset. After CNR=0, write all registers (using reg_write64 for CRCR), set RS=1, and ring the doorbell in a back-to-back burst with zero gaps. The MCU's re-init window is ~500 µs; our burst is ~5 µs. Win ratio is ~100:1. This is the approach the existing code is attempting but is failing due to Issues 1 and 2.</p>
+</div>
+
+<div class="approach">
+  <h4>Approach B — Polled mode with HCRST between every command</h4>
+  <p>Accept that the MCU will re-own the controller between commands. For each command: do a mini HCRST cycle, blast registers, submit one TRB, poll for CCE, then halt and wait. This is slower (adds ~2ms per command) but deterministic. Works well for boot-time enumeration where throughput doesn't matter. Not suitable for runtime I/O.</p>
+</div>
+
+<div class="approach">
+  <h4>Approach C — Interrupt-based handoff using VL805 mailbox</h4>
+  <p>The VL805 firmware communicates status via a specific MMIO register (the "firmware ready" Command bit 20 polled in pci.c). Some VL805 firmware versions expose a minimal command interface via these mailbox registers. If the firmware can be convinced to enter "pass-through" mode (letting the host take direct xHCI ownership), the MCU race disappears entirely. This requires firmware binary analysis and is a medium-term research item, not a quick fix.</p>
+</div>
+
+<div class="callout success">
+  <strong>What Is Working Well:</strong> The PCIe bring-up, L1ss disable, ATU window, HARD_DEBUG fix, PERST# logic, HCRST sequence, DMA buffer layout, reg_write64 concept, scratchpad allocation, and the overall xHCI spec §4.2 sequence are all correctly implemented. The boot log shows CAPLENGTH, HCIVERSION, MaxSlots, MaxPorts all reading correctly — the controller is live and responding. The VL805 firmware is running. Port 2 detects a SuperSpeed device and port reset completes. The problem is only in the final ~5 µs window between CRCR write and doorbell ring.
+</div>
+
+
+<!-- ──────────────────────────────────────────────
+     FIX ORDER
+     ────────────────────────────────────────────── -->
+<h2 id="s14"><span class="num">14</span> Recommended Fix Order</h2>
+
+<table>
+  <tr>
+    <th>#</th>
+    <th>Fix</th>
+    <th>File</th>
+    <th>Effort</th>
+    <th>Impact</th>
+  </tr>
+  <tr>
+    <td><strong>1</strong></td>
+    <td>Replace all CRCR/ERSTBA/ERDP split writes with reg_write64</td>
+    <td>usb_xhci.c (4 locations)</td>
+    <td class="green">30 min</td>
+    <td class="red">Critical — fixes Enable Slot race</td>
+  </tr>
+  <tr>
+    <td><strong>2</strong></td>
+    <td>Ring doorbell immediately after CRCR write (remove prints in between)</td>
+    <td>usb_xhci.c — evt_ring_poll, cmd_ring_submit</td>
+    <td class="green">15 min</td>
+    <td class="red">Critical — closes timing gap</td>
+  </tr>
+  <tr>
+    <td><strong>3</strong></td>
+    <td>Verify linker.ld .xhci_dma section size = 0x42000, verify mmu.c maps full range</td>
+    <td>linker.ld, mmu.c</td>
+    <td class="green">15 min</td>
+    <td class="amber">Critical if wrong — DMA into kernel memory</td>
+  </tr>
+  <tr>
+    <td><strong>4</strong></td>
+    <td>Replace pre-scan drain loop with evt_ring_consume() calls</td>
+    <td>usb_xhci.c — xhci_init() post-run block</td>
+    <td class="green">20 min</td>
+    <td class="amber">High — prevents lost CCE events</td>
+  </tr>
+  <tr>
+    <td><strong>5</strong></td>
+    <td>Implement GIC-400 init in irq.c (GICD_CTLR, GICC_PMR, GICC_CTLR)</td>
+    <td>kernel/irq.c</td>
+    <td class="amber">2–4 hrs</td>
+    <td class="amber">High — enables interrupt-driven I/O</td>
+  </tr>
+  <tr>
+    <td><strong>6</strong></td>
+    <td>Wire usb_core.c control/bulk/intr to xhci via ops table</td>
+    <td>usb_core.c, usb_xhci.c, usb.h</td>
+    <td class="amber">3–5 hrs</td>
+    <td class="amber">High — enables keyboard/mouse/storage</td>
+  </tr>
+  <tr>
+    <td><strong>7</strong></td>
+    <td>Fix SDHCI sub-word register accesses in mmc.c</td>
+    <td>drivers/mmc/mmc.c</td>
+    <td class="green">30 min</td>
+    <td class="amber">High — prevents spurious SD timeouts</td>
+  </tr>
+  <tr>
+    <td><strong>8</strong></td>
+    <td>Add spinlock around enqueue_task / dequeue_task</td>
+    <td>kernel/sched.c</td>
+    <td class="green">20 min</td>
+    <td class="amber">Medium — SMP safety</td>
+  </tr>
+  <tr>
+    <td><strong>9</strong></td>
+    <td>Secondary CPU bring-up (ARMv8 spin table or PSCI)</td>
+    <td>kernel/boot.S, sched.c</td>
+    <td class="red">1–2 days</td>
+    <td class="blue">Medium — SMP, not needed for single-CPU USB</td>
+  </tr>
+  <tr>
+    <td><strong>10</strong></td>
+    <td>USB HID / mass storage driver implementation</td>
+    <td>usb_hid.c, usb_mass_storage.c, usb_core.c</td>
+    <td class="red">1–2 weeks</td>
+    <td class="blue">Long-term — input &amp; storage</td>
+  </tr>
+</table>
+
+<hr>
+
+<p style="color:var(--muted);font-size:0.85rem;margin-top:24px;">
+  Analysis based on: bootlogpi4.txt, drivers/usb/usb_xhci.c (~2072 lines), kernel/pci.c (~860 lines), drivers/usb/usb_core.c, kernel/irq.c, kernel/sched.c, kernel/spinlock.c, drivers/mmc/mmc.c, and supporting headers. Generated March 2026.
+</p>
+
+</body>
+</html>
