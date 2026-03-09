@@ -12,6 +12,8 @@
 #define USB_XHCI_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include "usb.h"   /* usb_device_t, usb_endpoint_t, usb_hc_ops_t */
 
 /* xHCI Capability Registers (offset from base) */
 #define XHCI_CAP_CAPLENGTH      0x00  /* Capability Register Length */
@@ -126,13 +128,85 @@ xhci_controller_t *xhci_get_controller(void);
 
 /**
  * @brief Scan USB ports for connected devices
- * 
+ *
  * Checks all ports and enumerates newly connected devices.
  * Should be called after initialization and on port change interrupts.
- * 
+ *
  * @return Number of devices found, or negative on error
  * @since v56
  */
 int xhci_scan_ports(void);
+
+/* ── USB Core HCD ops callbacks ─────────────────────────────────────────────
+ * Registered automatically by xhci_init() via usb_register_hc().
+ * External code should use usb_control_transfer() etc. in usb_core.c rather
+ * than calling these directly.
+ */
+
+/**
+ * @brief Perform a USB control transfer on EP0.
+ *
+ * Generic implementation of usb_hc_ops_t::control_transfer.
+ * Supports IN and OUT transfers; data length must be ≤ 512 bytes.
+ *
+ * @param dev          USB device (dev->hcd_private = slot_id)
+ * @param request_type bmRequestType byte
+ * @param request      bRequest byte
+ * @param value        wValue
+ * @param index        wIndex
+ * @param data         Caller data buffer (filled on IN, consumed on OUT)
+ * @param length       Bytes in data phase (0 = no data stage)
+ * @param timeout      Poll timeout in milliseconds
+ * @return Bytes transferred, or -1 on error/timeout
+ * @since v57
+ */
+int xhci_control_transfer(usb_device_t *dev,
+                           uint8_t request_type, uint8_t request,
+                           uint16_t value, uint16_t index,
+                           void *data, uint16_t length, int timeout);
+
+/**
+ * @brief USB bulk transfer stub.
+ *
+ * Returns -1 until per-endpoint ring management is implemented.
+ * See usb_xhci.c for the TODO implementation notes.
+ *
+ * @param ep       Bulk endpoint
+ * @param data     Transfer buffer
+ * @param len      Number of bytes
+ * @param timeout  Milliseconds
+ * @return -1 (not yet implemented)
+ * @since v57
+ */
+int xhci_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout);
+
+/**
+ * @brief USB interrupt transfer stub.
+ *
+ * Returns -1 until interrupt endpoint ring management is implemented.
+ * HID drivers should fall back to GET_REPORT via control transfer.
+ *
+ * @param ep       Interrupt endpoint
+ * @param data     Buffer to fill on IN
+ * @param len      Max bytes
+ * @param timeout  Milliseconds (0 = non-blocking)
+ * @return -1 (not yet implemented)
+ * @since v57
+ */
+int xhci_interrupt_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout);
+
+/**
+ * @brief Enumerate a USB device on a given port.
+ *
+ * HCD bridge for usb_hc_ops_t::enumerate_device.  @dev->speed must be set
+ * to the USB_SPEED_* value before calling.  Internally runs the full xHCI
+ * port-reset → Enable Slot → Address Device → GET_DESCRIPTOR sequence.
+ *
+ * @param dev   Device struct with speed populated
+ * @param port  Zero-based port index
+ * @return 0 on success, -1 if controller not ready or speed unknown
+ * @since v57
+ */
+int xhci_enumerate_device(usb_device_t *dev, int port);
 
 #endif /* USB_XHCI_H */

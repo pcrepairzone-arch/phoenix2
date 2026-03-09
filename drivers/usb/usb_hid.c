@@ -85,8 +85,9 @@ static void hid_process_keyboard(hid_device_t *hid, const uint8_t *data)
                 /* TODO: Send to console input buffer */
                 debug_print("Key: '%c' (0x%02x)\n", ch, ch);
                 
-                /* For now, just echo to console */
-                con_putchar(ch);
+                /* For now, just echo to console — con_putc() is in drivers/gpu/framebuffer.c */
+                extern void con_putc(char c);
+                con_putc(ch);
             }
         }
     }
