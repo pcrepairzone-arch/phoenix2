@@ -37,7 +37,7 @@ extern void sched_init_cpu(int cpu);    /* kernel/sched.c           */
 extern void irq_init(void);             /* kernel/irq.c             */
 extern void timer_init(void);           /* kernel/timer.c           */
 extern void timer_init_cpu(void);       /* kernel/timer.c           */
-extern void pci_scan_bus(void);         /* kernel/pci.c (stub)      */
+extern void pci_init(void);             /* kernel/pci.c             */
 
 extern int usb_init(void);
 extern void vfs_init(void);             /* kernel/vfs.c (stub)      */
@@ -118,6 +118,25 @@ void kernel_main(uint64_t dtb_ptr)
     irq_init();
     timer_init();
     timer_init_cpu();
+
+    /*
+     * Unmask IRQs at the CPU level (clear DAIF.I bit).
+     *
+     * The GIC-400 distributor and CPU interface are now configured by
+     * irq_init() and the exception vectors are set (VBAR_EL1 = exception_vectors
+     * in boot.S).  Clearing the I-bit allows the CPU to take IRQ exceptions.
+     *
+     * NOTE: The xHCI driver operates in polling mode (evt_ring_poll), so no
+     * USB interrupts are expected yet.  This unmask is required for the
+     * ARM Generic Timer (PPI 30) which timer_init() will configure, and
+     * prepares the system for future interrupt-driven USB (PCIe MSI SPI 48).
+     *
+     * msr daifclr, #2  clears the I (IRQ) bit only; F (FIQ) and A (SError)
+     * remain masked until explicitly needed.
+     */
+    asm volatile("msr daifclr, #2" ::: "memory");
+    debug_print("[IRQ] CPU IRQs unmasked (DAIF.I cleared)\n");
+
     debug_print("IRQ/Timer ready\n");
 
     /* Now safe to create the idle task (IRQs are masked/managed) */

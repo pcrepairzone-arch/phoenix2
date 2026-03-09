@@ -655,8 +655,11 @@ static void pci_init_pi4(void) {
     pcie_setup_outbound_window();
 
     /* RC_BAR2: inbound DMA window.
-     * With BAR=0x00000000, VL805 DMA addresses = CPU physical addresses directly.
-     * RC_BAR2 base=0x00000000, size=1GB, encode_ibar_size(1GB)=ilog2(2^30)-12=18=0x12 */
+     * BCM2711 inbound DMA is silicon-fixed: PCIe 0xC0000000..0xFFFFFFFF → CPU 0x0.
+     * RC_BAR2_CFG_LO encodes cpu_base (bits[31:5]) | size_enc (bits[4:0]).
+     * cpu_base = 0x00000000, size_enc = ilog2(1GB)-12 = 18 = 0x12.
+     * NOTE: phys_to_dma() in usb_xhci.c must add 0xC0000000 to all DMA addresses.
+     *       WIN0_LO (outbound) is unrelated to this inbound DMA offset. */
     uart_puts("[PCI] RC_BAR2 setup (inbound DMA: PCIe 0x00000000 -> CPU 0x0, 1GB)...\n");
     writel(0x00000012U, pcie_base + MISC_RC_BAR2_CFG_LO);
     writel(0x00000000U, pcie_base + MISC_RC_BAR2_CFG_HI);

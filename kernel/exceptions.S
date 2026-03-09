@@ -116,23 +116,83 @@ exc_handler:
     /* Blink LED and halt */
     b    exc_halt_blink
 
-/* IRQ handler: for now just print and halt (GIC not set up yet) */
+/*
+ * exc_irq_handler — EL1 IRQ exception entry point.
+ *
+ * Called by the exception vector table for all IRQ entries
+ * (SP0/SPx current EL, lower EL AArch64).
+ *
+ * Saves the complete AArch64 caller-saved context (x0–x17, x29, x30,
+ * ELR_EL1, SPSR_EL1), calls irq_dispatch(0) in C, restores context,
+ * and ERET back to the interrupted code.
+ *
+ * Register save layout (grows downward from SP):
+ *   [sp+  0] x0   [sp+  8] x1
+ *   [sp+ 16] x2   [sp+ 24] x3
+ *   [sp+ 32] x4   [sp+ 40] x5
+ *   [sp+ 48] x6   [sp+ 56] x7
+ *   [sp+ 64] x8   [sp+ 72] x9
+ *   [sp+ 80] x10  [sp+ 88] x11
+ *   [sp+ 96] x12  [sp+104] x13
+ *   [sp+112] x14  [sp+120] x15
+ *   [sp+128] x16  [sp+136] x17
+ *   [sp+144] x29  [sp+152] x30  (FP + LR)
+ *   [sp+160] ELR_EL1
+ *   [sp+168] SPSR_EL1
+ *   Total: 176 bytes (11 × 16-byte pairs), 16-byte aligned.
+ *
+ * AArch64 ABI: x0–x17, x29, x30 are caller-saved; x18–x28 are
+ * callee-saved and preserved by the C irq_dispatch() function itself.
+ * We therefore only save x0–x17, x29 (FP), x30 (LR) plus the
+ * exception-return registers ELR_EL1 and SPSR_EL1.
+ */
 exc_irq_handler:
-    stp  x0, x1, [sp, #-16]!
-    mrs  x0, esr_el1
-    mrs  x1, elr_el1
-    ldr  x10, =exc_msg_irq
-    bl   exc_uart_str
-    ldr  x10, =exc_msg_elr
-    bl   exc_uart_str
-    mov  x0, x1
-    bl   exc_uart_hex64
-    mov  x0, #'\n'
-    bl   exc_uart_putc
-    mov  x0, #'\r'
-    bl   exc_uart_putc
-    ldp  x0, x1, [sp], #16
-    b    exc_halt_blink
+    /* Allocate 176 bytes on the stack */
+    sub  sp, sp, #176
+
+    /* Save integer registers x0–x17 */
+    stp  x0,  x1,  [sp,   #0]
+    stp  x2,  x3,  [sp,  #16]
+    stp  x4,  x5,  [sp,  #32]
+    stp  x6,  x7,  [sp,  #48]
+    stp  x8,  x9,  [sp,  #64]
+    stp  x10, x11, [sp,  #80]
+    stp  x12, x13, [sp,  #96]
+    stp  x14, x15, [sp, #112]
+    stp  x16, x17, [sp, #128]
+
+    /* Save frame pointer (x29) and link register (x30) */
+    stp  x29, x30, [sp, #144]
+
+    /* Save ELR_EL1 (return address) and SPSR_EL1 (saved processor state) */
+    mrs  x0, elr_el1
+    mrs  x1, spsr_el1
+    stp  x0, x1, [sp, #160]
+
+    /* Call irq_dispatch(0): the C function reads GICC_IAR itself */
+    mov  x0, #0
+    bl   irq_dispatch
+
+    /* Restore ELR_EL1 and SPSR_EL1 */
+    ldp  x0, x1, [sp, #160]
+    msr  elr_el1,  x0
+    msr  spsr_el1, x1
+
+    /* Restore integer registers */
+    ldp  x29, x30, [sp, #144]
+    ldp  x16, x17, [sp, #128]
+    ldp  x14, x15, [sp, #112]
+    ldp  x12, x13, [sp,  #96]
+    ldp  x10, x11, [sp,  #80]
+    ldp  x8,  x9,  [sp,  #64]
+    ldp  x6,  x7,  [sp,  #48]
+    ldp  x4,  x5,  [sp,  #32]
+    ldp  x2,  x3,  [sp,  #16]
+    ldp  x0,  x1,  [sp,   #0]
+
+    /* Deallocate stack frame and return from exception */
+    add  sp, sp, #176
+    eret
 
 /* ── UART helpers ────────────────────────────────────── */
 
