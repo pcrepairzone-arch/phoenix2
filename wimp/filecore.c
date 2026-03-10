@@ -3,7 +3,7 @@
  * Implements RISC OS FileCore (ADFS-style) on block devices
  * Supports directories, file types (&FFF, &AFF, etc.), loading/executing by type
  * Integrates with VFS for modern apps and blockdev for storage (NVMe, USB, etc.)
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"
