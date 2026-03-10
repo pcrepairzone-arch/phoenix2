@@ -1,0 +1,81 @@
+Building for Raspberry Pi 4 (cortex-a72)
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -x assembler-with-cpp -c kernel/boot.S -o kernel/boot.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -x assembler-with-cpp -c kernel/exceptions.S -o kernel/exceptions.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/kernel.c -o kernel/kernel.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/malloc.c -o kernel/malloc.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/errno.c -o kernel/errno.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/sched.c -o kernel/sched.o
+kernel/sched.c:108:13: warning: ‘dequeue_task’ defined but not used [-Wunused-function]
+  108 | static void dequeue_task(cpu_sched_t *sched, task_t *task) {
+      |             ^~~~~~~~~~~~
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/task.c -o kernel/task.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/signal.c -o kernel/signal.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/mmu.c -o kernel/mmu.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/pipe.c -o kernel/pipe.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/select.c -o kernel/select.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/irq.c -o kernel/irq.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/timer.c -o kernel/timer.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/pci.c -o kernel/pci.o
+kernel/pci.c:577:12: warning: ‘xhci_start_controller’ defined but not used [-Wunused-function]
+  577 | static int xhci_start_controller(void) {
+      |            ^~~~~~~~~~~~~~~~~~~~~
+kernel/pci.c:551:12: warning: ‘xhci_reset_controller’ defined but not used [-Wunused-function]
+  551 | static int xhci_reset_controller(void) {
+      |            ^~~~~~~~~~~~~~~~~~~~~
+kernel/pci.c:378:13: warning: ‘vl805_flr’ defined but not used [-Wunused-function]
+  378 | static void vl805_flr(pci_dev_t *dev) {
+      |             ^~~~~~~~~
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/vfs.c -o kernel/vfs.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/filecore.c -o kernel/filecore.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/dl.c -o kernel/dl.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/blockdriver.c -o kernel/blockdriver.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/spinlock.c -o kernel/spinlock.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/lib.c -o kernel/lib.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/devicetree.c -o kernel/devicetree.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/led_diag.c -o kernel/led_diag.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/periph_base.c -o kernel/periph_base.o
+kernel/periph_base.c:21:17: warning: ‘fdt_read32’ defined but not used [-Wunused-function]
+   21 | static uint32_t fdt_read32(const uint8_t *p) {
+      |                 ^~~~~~~~~~
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c kernel/mmio.c -o kernel/mmio.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c drivers/uart/uart.c -o drivers/uart/uart.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c drivers/gpu/gpu.c -o drivers/gpu/gpu.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c drivers/nvme/nvme.c -o drivers/nvme/nvme.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c drivers/usb/vl805_init.c -o drivers/usb/vl805_init.o
+drivers/usb/vl805_init.c:24:13: warning: ‘print_hex32’ defined but not used [-Wunused-function]
+   24 | static void print_hex32(uint32_t v) {
+      |             ^~~~~~~~~~~
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c drivers/usb/usb_storage.c -o drivers/usb/usb_storage.o
+aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4 -c drivers/usb/usb_xhci.c -o drivers/usb/usb_xhci.o
+drivers/usb/usb_xhci.c: In function ‘cmd_ring_submit’:
+drivers/usb/usb_xhci.c:354:9: error: implicit declaration of function ‘evt_ring_consume’ [-Wimplicit-function-declaration]
+  354 |         evt_ring_consume(ir0, tmp);
+      |         ^~~~~~~~~~~~~~~~
+drivers/usb/usb_xhci.c: In function ‘cmd_enable_slot’:
+drivers/usb/usb_xhci.c:387:9: error: implicit declaration of function ‘evt_ring_poll’ [-Wimplicit-function-declaration]
+  387 |     if (evt_ring_poll(ev, 5000) != 0) {
+      |         ^~~~~~~~~~~~~
+drivers/usb/usb_xhci.c: At top level:
+drivers/usb/usb_xhci.c:404:12: error: static declaration of ‘evt_ring_poll’ follows non-static declaration
+  404 | static int evt_ring_poll(uint32_t *out, int timeout_ms) {
+      |            ^~~~~~~~~~~~~
+drivers/usb/usb_xhci.c:387:9: note: previous implicit declaration of ‘evt_ring_poll’ with type ‘int()’
+  387 |     if (evt_ring_poll(ev, 5000) != 0) {
+      |         ^~~~~~~~~~~~~
+drivers/usb/usb_xhci.c:434:13: warning: conflicting types for ‘evt_ring_consume’; have ‘void(void *, uint32_t *)’ {aka ‘void(void *, unsigned int *)’}
+  434 | static void evt_ring_consume(void *ir0, uint32_t *out) {
+      |             ^~~~~~~~~~~~~~~~
+drivers/usb/usb_xhci.c:434:13: error: static declaration of ‘evt_ring_consume’ follows non-static declaration
+drivers/usb/usb_xhci.c:354:9: note: previous implicit declaration of ‘evt_ring_consume’ with type ‘void(void *, uint32_t *)’ {aka ‘void(void *, unsigned int *)’}
+  354 |         evt_ring_consume(ir0, tmp);
+      |         ^~~~~~~~~~~~~~~~
+drivers/usb/usb_xhci.c:434:13: warning: ‘evt_ring_consume’ defined but not used [-Wunused-function]
+  434 | static void evt_ring_consume(void *ir0, uint32_t *out) {
+      |             ^~~~~~~~~~~~~~~~
+drivers/usb/usb_xhci.c:404:12: warning: ‘evt_ring_poll’ defined but not used [-Wunused-function]
+  404 | static int evt_ring_poll(uint32_t *out, int timeout_ms) {
+      |            ^~~~~~~~~~~~~
+drivers/usb/usb_xhci.c:383:12: warning: ‘cmd_enable_slot’ defined but not used [-Wunused-function]
+  383 | static int cmd_enable_slot(uint8_t *slot_id_out) {
+      |            ^~~~~~~~~~~~~~~
+make: *** [Makefile:114: drivers/usb/usb_xhci.o] Error 1
