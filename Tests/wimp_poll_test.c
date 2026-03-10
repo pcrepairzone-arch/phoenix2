@@ -2,7 +2,7 @@
  * wimp_poll_test.c – Wimp_Poll Re-entry Test for RISC OS Phoenix
  * Verifies that Wimp_Poll is never re-entered while an application is processing an event
  * Critical compatibility test for the cooperative multitasking model
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews – 06 Feb 2026
  */
 
 #include "kernel.h"

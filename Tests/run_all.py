@@ -2,7 +2,7 @@
 """
 run_all.py – Automated Compatibility Test Suite Runner for RISC OS Phoenix
 Tests Wimp cooperative behavior, memory protection, multi-tasking, and more.
-Author: R Andrews Grok 4 – 06 Feb 2026
+Author: R Andrews  – 06 Feb 2026
 """
 
 import subprocess

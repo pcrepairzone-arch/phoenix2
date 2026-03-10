@@ -1,7 +1,7 @@
 /*
  * memory_fault_test.c – Memory Protection Test for RISC OS Phoenix
  * Verifies that bad memory access is caught and contained (SIGSEGV)
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"

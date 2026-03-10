@@ -1,7 +1,7 @@
 /*
  * 100_task_stress.c – 100 Task Stress Test for RISC OS Phoenix
  * Creates 100 cooperative tasks and verifies system stability
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"

@@ -1,7 +1,7 @@
 /*
  * shared_global_test.c – Shared Global Data Test for RISC OS Phoenix
  * Verifies that shared module data is properly serialized under preemptive scheduling
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"

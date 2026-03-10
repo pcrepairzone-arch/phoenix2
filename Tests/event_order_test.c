@@ -2,7 +2,7 @@
  * event_order_test.c – Event Ordering Test for RISC OS Phoenix
  * Verifies that events are delivered in strict FIFO order
  * Critical for Wimp compatibility
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"
