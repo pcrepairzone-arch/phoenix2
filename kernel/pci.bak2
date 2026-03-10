@@ -655,28 +655,13 @@ static void pci_init_pi4(void) {
     pcie_setup_outbound_window();
 
     /* RC_BAR2: inbound DMA window.
-     * The VL805 DMAs to PCIe addresses computed by phys_to_dma() in usb_xhci.c,
-     * which adds DMA_OFFSET=0xC0000000 to every physical address.
-     * So the VL805 targets PCIe 0xC0000000+phys, and RC_BAR2 must accept
-     * DMA reads from that PCIe range and map them to CPU 0x00000000+phys.
-     *
-     * RC_BAR2_CONFIG_LO encoding (BCM2711 TRM):
-     *   bits[4:0]  = size: ilog2(window_bytes) - 12
-     *                For 1 GB: ilog2(0x40000000) - 12 = 30 - 12 = 18 = 0x12
-     *   bits[31:5] = PCIe base address >> 5
-     *                For PCIe base 0xC0000000: 0xC0000000 >> 5 = 0x06000000
-     *   Combined:   (0x06000000 << 5) | 0x12 = 0xC0000012
-     *
-     * This maps PCIe 0xC0000000..0xFFFFFFFF → CPU 0x00000000..0x3FFFFFFF.
-     * DMA_OFFSET=0xC0000000 in usb_xhci.c then correctly translates:
-     *   phys 0x080b5000 → DMA addr 0xC80b5000 → lands at CPU 0x080b5000 ✓
-     *
-     * NOTE: The previous value 0x00000012 set PCIe base=0, covering
-     * PCIe 0x00000000–0x3FFFFFFF.  The VL805 DMAs to 0xC80b5000 which
-     * is OUTSIDE that window — all DMA silently drops → empty event ring
-     * → timeout on every command. */
-    uart_puts("[PCI] RC_BAR2 setup (1GB DMA: PCIe 0xC0000000 -> CPU 0x0)...\n");
-    writel(0xC0000012U, pcie_base + MISC_RC_BAR2_CFG_LO);
+     * BCM2711 inbound DMA is silicon-fixed: PCIe 0xC0000000..0xFFFFFFFF → CPU 0x0.
+     * RC_BAR2_CFG_LO encodes cpu_base (bits[31:5]) | size_enc (bits[4:0]).
+     * cpu_base = 0x00000000, size_enc = ilog2(1GB)-12 = 18 = 0x12.
+     * NOTE: phys_to_dma() in usb_xhci.c must add 0xC0000000 to all DMA addresses.
+     *       WIN0_LO (outbound) is unrelated to this inbound DMA offset. */
+    uart_puts("[PCI] RC_BAR2 setup (inbound DMA: PCIe 0x00000000 -> CPU 0x0, 1GB)...\n");
+    writel(0x00000012U, pcie_base + MISC_RC_BAR2_CFG_LO);
     writel(0x00000000U, pcie_base + MISC_RC_BAR2_CFG_HI);
     asm volatile("dsb sy; isb" ::: "memory");
     uart_puts("[PCI] RC_BAR2 LO="); print_hex32(readl(pcie_base + MISC_RC_BAR2_CFG_LO));

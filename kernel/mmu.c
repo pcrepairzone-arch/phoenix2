@@ -63,11 +63,20 @@
 #define PTE_UXN         (1ULL << 54)
 
 /* MAIR indices */
-#define MAIR_NORMAL  0   /* Normal WB cacheable */
-#define MAIR_DEVICE  1   /* Device nGnRnE       */
+#define MAIR_NORMAL  0   /* Normal WB cacheable            */
+#define MAIR_DEVICE  1   /* Device nGnRnE (MMIO registers) */
+#define MAIR_NC      2   /* Normal Non-Cacheable (DMA buf) */
 
+/*
+ * MAIR_NC = 0x44: outer Non-Cacheable (0100), inner Non-Cacheable (0100).
+ * Use this for DMA ring buffers — not Device (0x00) which is for MMIO.
+ * Normal-NC allows unaligned access and memset; Device does not.
+ * Stores to Normal-NC are guaranteed visible to PCIe DMA without
+ * explicit cache maintenance, while avoiding Device ordering restrictions.
+ */
 #define MAIR_VALUE   ((0xFFULL << (MAIR_NORMAL * 8)) | \
-                      (0x00ULL << (MAIR_DEVICE * 8)))
+                      (0x00ULL << (MAIR_DEVICE * 8)) | \
+                      (0x44ULL << (MAIR_NC     * 8)))
 
 /* TCR_EL1 */
 #define TCR_T0SZ    (25ULL << 0)    /* 39-bit VA, walk starts at L1 */
@@ -167,9 +176,13 @@ void mmu_init(void)
     /* 4 KB L3 page descriptor (Normal WB) */
 #define L3_NORMAL(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
                          PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NORMAL))
-    /* 4 KB L3 page descriptor (Device nGnRnE) */
+    /* 4 KB L3 page descriptor (Device nGnRnE) — MMIO only, not for DMA */
 #define L3_DEVICE(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
                          PTE_SH_OUTER | PTE_AP_RW | PTE_ATTRINDX(MAIR_DEVICE) | \
+                         PTE_PXN | PTE_UXN)
+    /* 4 KB L3 page descriptor (Normal Non-Cacheable) — DMA ring buffers */
+#define L3_NC(pa)      ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
+                         PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NC) | \
                          PTE_PXN | PTE_UXN)
     /* L1/L2 table (pointer-to-next-level) descriptor */
 #define TABLE_DESC(pa) ((pa) | PTE_VALID | PTE_TABLE)
@@ -203,7 +216,7 @@ void mmu_init(void)
         for (;;) {}
     }
 
-    debug_print("[MMU] .xhci_dma: 0x%llx – 0x%llx  (L2[%llu], Device pages)\n",
+    debug_print("[MMU] .xhci_dma: 0x%llx – 0x%llx  (L2[%llu], Normal-NC pages)\n",
                 (unsigned long long)dma_start,
                 (unsigned long long)dma_end,
                 (unsigned long long)dma_l2_idx);
@@ -221,9 +234,9 @@ void mmu_init(void)
     for (int i = 0; i < 512; i++) {
         uint64_t pa = l2_block_base + ((uint64_t)i << 12);
         if ((uint64_t)i >= dma_l3_first && (uint64_t)i < dma_l3_last)
-            l3_dma_2mb[i] = L3_DEVICE(pa);   /* DMA pages — non-cacheable */
+            l3_dma_2mb[i] = L3_NC(pa);     /* DMA pages — Normal Non-Cacheable */
         else
-            l3_dma_2mb[i] = L3_NORMAL(pa);   /* Everything else — Normal WB */
+            l3_dma_2mb[i] = L3_NORMAL(pa); /* Everything else — Normal WB */
     }
     debug_print("[MMU] L3 DMA pages: entries %llu–%llu marked Device\n",
                 (unsigned long long)dma_l3_first,
@@ -284,6 +297,7 @@ void mmu_init(void)
 #undef L2_DEVICE
 #undef L3_NORMAL
 #undef L3_DEVICE
+#undef L3_NC
 #undef TABLE_DESC
 
     debug_print("[MMU] Tables ready, enabling MMU + caches...\n");
