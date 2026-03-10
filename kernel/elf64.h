@@ -1,7 +1,7 @@
 /*
  * elf64.h – ELF64 Headers for RISC OS Phoenix
  * Defines structures for execve (Ehdr, Phdr, Shdr, Dyn, Rel, Sym)
- * Author:R Andrews Grok 4 – 10 Dec 2025
+ * Author:R Andrews  – 10 Dec 2025
  */
 
 #ifndef ELF64_H

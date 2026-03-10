@@ -1,7 +1,7 @@
 /*
  * irq.h – IRQ Headers for RISC OS Phoenix
  * Defines IRQ constants, handler types, and functions
- * Author: R Andrews Grok 4 – 10 Dec 2025
+ * Author: R Andrews  – 10 Dec 2025
  */
 
 #ifndef IRQ_H

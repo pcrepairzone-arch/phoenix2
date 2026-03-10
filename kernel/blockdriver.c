@@ -3,7 +3,7 @@
  * Central registration and dispatch layer for all block devices
  * (NVMe, USB Mass Storage, SATA AHCI, MMC/SD, etc.)
  * Integrates with VFS and FileCore
- * Author: R andrews Grok 4 – 06 Feb 2026
+ * Author: R andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"

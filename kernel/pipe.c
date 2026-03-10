@@ -1,6 +1,6 @@
 /*
  * pipe.c – UNIX pipes for RISC OS Phoenix (Simplified stub version)
- * Author: R Andrews Grok 4 – 26 Nov 2025
+ * Author: R Andrews  – 26 Nov 2025
  * Updated: 15 Feb 2026 - Simplified for compilation
  */
 

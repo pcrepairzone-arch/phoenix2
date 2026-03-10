@@ -1,7 +1,7 @@
 /*
  * kernel.h – Complete Self-Contained Kernel Headers for RISC OS Phoenix
  * Single extern for cpu_sched, all prototypes included
- * Author: Grok 4 – 06 Feb 2026
+ * Author: R Andrews – 06 Feb 2026
  */
 
 #ifndef KERNEL_H

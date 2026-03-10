@@ -1,7 +1,7 @@
 /*
  * dl.c – Dynamic Linker Stub for RISC OS Phoenix
  * Supports dlopen, dlsym, dlclose for ELF64 shared libraries
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"
