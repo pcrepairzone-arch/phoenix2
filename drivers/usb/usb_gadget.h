@@ -2,7 +2,7 @@
  * usb_gadget.h – USB Gadget Headers for RISC OS Phoenix
  * Defines gadget structures for device-side USB (e.g., mass storage, Ethernet)
  * Supports USB 2.0/3.0 on Raspberry Pi (DWC2/DWC3 controllers)
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews  – 06 Feb 2026
  */
 
 #ifndef USB_GADGET_H

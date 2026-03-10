@@ -2,7 +2,7 @@
  * usb_gadget.c – USB Gadget Driver for RISC OS Phoenix
  * Device-side USB (e.g., Pi as mass storage or RNDIS Ethernet)
  * Uses DWC2 controller on Pi (configurable for host/device)
- * Author:R Andrews Grok 4 – 06 Feb 2026
+ * Author:R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"
