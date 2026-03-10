@@ -1,0 +1,83 @@
+═══════════════════════════════════════════════════════════════
+RISC OS PHOENIX KERNEL — xHCI DRIVER DEVELOPMENT JOURNAL
+═══════════════════════════════════════════════════════════════
+
+SESSION: 2026-03-10  xHCI HSE root cause found + controller running
+═══════════════════════════════════════════════════════════════
+
+BREAKTHROUGH: Controller running as of v17.
+
+ROOT CAUSE OF HSE (all previous versions):
+After HCRST, the VL805 MCU re-runs its firmware init and posts events
+to its own internal ring, setting USBSTS.EINT. If RS=1 is written while
+EINT=1, the MCU delivers that pending event using its stale internal ring
+pointer (not our ERSTBA) → DMA to unmapped address → HSE in <1ms.
+Fix: poll until EINT+HSE both clear after HCRST, then tight register
+burst + RS=1 immediately. One millisecond wait was all it took.
+
+SECONDARY BUGS FIXED THIS SESSION:
+- v13: PAGESIZE register now read and validated (0x00000001 = 4KB OK)
+- v14: ERST address corruption fixed — s_erst computed from
+       xhci_dma_buf+DMA_ERST_OFF without (uint64_t) cast gave high
+       word 0x00000010. Fix: use erst pointer with explicit cast.
+- v15: HCRST reinstated (incorrectly skipped in v12)
+- v16: Port change bits cleared after HCRST. PORTSC dump added.
+       Revealed ports 0,1,2 have connected devices.
+- v17: THE FIX — EINT poll after HCRST + tight register burst
+       + retry loop on HCH only (CMD_HSEE=0, cosmetic HSE ignored)
+
+v17 BOOT LOG CONFIRMS:
+  [xHCI] MCU settled after 1ms  USBSTS=0x00000001
+  [xHCI] attempt 1: USBCMD=0x00000004 USBSTS=0x00000005 RUNNING
+  [xHCI] Controller running. USBSTS=0x00000001
+
+HARDWARE (DeskPi Pro case, Pi 4 boardrev c03112):
+  USB3 stick confirmed on Port 3 (Super 5Gbps, PED=1, U0)
+  Show target: USB keyboard + mouse (HID boot protocol)
+  M.2 500GB SSD via DeskPi breakout board
+  Full-size HDMI + front USB via DeskPi
+
+DMA BUFFER LAYOUT (our driver):
+  0x0000  DCBAA        2KB
+  0x0800  cmd_ring     1KB  (64 TRBs)
+  0x0C00  evt_ring     1KB  (64 TRBs)
+  0x1000  erst         64B
+  0x1040  scratch_arr  31×8B
+  0x2000  scratch_pgs  31×4KB = 0x1F000
+  Total:  0x21000 — fits in 0x42000 buffer
+  MMU:    0x080b2000–0x080f4000, Normal-NC
+
+  Friend's driver adds (needed for enumeration):
+  0x1240  input_ctx    1088B
+  0x16C0  out_ctx      1024B
+  0x1AC0  ep0_ring     1024B  (64 TRBs)
+  0x1EC0  ep0_data     512B
+
+KEY CONSTANTS:
+  DMA_OFFSET   = 0xC0000000ULL
+  RC_BAR2_LO   = 0xC0000012   (PCIe 0xC0000000–0xFFFFFFFF → CPU 0x0)
+  xHCI base    = 0x0000000600000000
+  CAPLENGTH    = 0x20, HCIVERSION = 0x0100
+  MaxSlots=32, MaxPorts=5, Scratchpads=31
+  PAGESIZE reg = 0x00000001 (4KB)
+
+NEXT STEPS FOR SHOW:
+  1. Graft enumeration stack onto v17
+     (port_scan, port_reset, Enable Slot, Address Device,
+      GET_DESCRIPTOR, string descriptors, VID/PID)
+  2. HID boot protocol — no descriptor parse needed:
+     SET_PROTOCOL(0), poll GET_REPORT every 10ms
+     8-byte boot report: [modifier, 0, key0..key5]
+  3. Decode keycodes → ASCII → framebuffer text output
+  4. Mouse: same approach, 3-4 byte boot report
+
+UPLOAD PRIORITY (do one at a time):
+  usb.c / usb.h — USB core, usb_enumerate_device()
+  usb_hid.c     — HID class driver (if exists)
+  kernel.h      — type definitions, virt_to_phys etc
+  framebuffer text layer — for on-screen key echo
+
+OUTPUT FILES:
+  usb_xhci.c  — v17, controller running, no enumeration yet
+  journal.txt — this file
+═══════════════════════════════════════════════════════════════
