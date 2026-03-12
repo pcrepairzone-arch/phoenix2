@@ -73,17 +73,17 @@ static int class_driver_count = 0;
  */
 void usb_register_hc(usb_hc_ops_t *ops) {
     if (!ops) {
-        debug_print("[USB] usb_register_hc: NULL ops — ignored\n");
+        uart_puts("[USB] usb_register_hc: NULL ops — ignored\n");
         return;
     }
     g_hc_ops = ops;
-    debug_print("[USB] Host controller registered\n");
+    uart_puts("[USB] Host controller registered\n");
     if (!ops->control_transfer)
-        debug_print("[USB]   WARNING: control_transfer not implemented\n");
+        uart_puts("[USB]   WARNING: control_transfer not implemented\n");
     if (!ops->bulk_transfer)
-        debug_print("[USB]   WARNING: bulk_transfer not implemented\n");
+        uart_puts("[USB]   WARNING: bulk_transfer not implemented\n");
     if (!ops->interrupt_transfer)
-        debug_print("[USB]   WARNING: interrupt_transfer not implemented\n");
+        uart_puts("[USB]   WARNING: interrupt_transfer not implemented\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -279,11 +279,37 @@ int usb_enumerate_device(usb_device_t *dev, int port) {
  *
  * @return 0 always (failures are logged but non-fatal at subsystem level)
  */
+/*
+ * usb_init — initialise the USB subsystem.
+ *
+ * Called from kernel_main() after pci_init() has set up the VL805.
+ * Registers all class drivers BEFORE port_scan runs so that
+ * usb_enumerate_device() finds them when the first device connects.
+ *
+ * Sequence:
+ *   1. Register class drivers (HID, mass storage)
+ *   2. pci_init() calls xhci_init() which calls usb_register_hc()
+ *   3. xhci_init() runs port_scan() → enumerate_port() → usb_enumerate_device()
+ *   4. usb_enumerate_device() probes class drivers registered here
+ *
+ * @return 0 always (failures are logged but non-fatal at subsystem level)
+ */
 int usb_init(void) {
-    debug_print("[USB] Initialising USB subsystem\n");
-    debug_print("[USB]   g_hc_ops = %s\n",
-                g_hc_ops ? "registered" : "NULL (HCD not yet initialised)");
-    debug_print("[USB]   Class drivers registered: %d\n", class_driver_count);
-    debug_print("[USB] USB subsystem ready\n");
+    uart_puts("[USB] Initialising USB subsystem\n");
+
+    /* Register class drivers — must happen before port_scan */
+    extern int hid_init(void);
+    extern int usb_mass_storage_init(void);
+
+    hid_init();
+    usb_mass_storage_init();
+
+    uart_puts("[USB]   g_hc_ops = ");
+    uart_puts(g_hc_ops ? "registered" : "NULL (HCD not yet initialised)");
+    uart_puts("\n[USB]   Class drivers registered: ");
+    /* print count as single digit — enough for our purposes */
+    char dbuf[4]; dbuf[0] = '0' + (char)class_driver_count; dbuf[1] = '\n'; dbuf[2] = 0;
+    uart_puts(dbuf);
+    uart_puts("[USB] USB subsystem ready\n");
     return 0;
 }

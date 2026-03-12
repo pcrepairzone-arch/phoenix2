@@ -6,6 +6,7 @@
 
 #include "kernel.h"
 #include "usb.h"
+#include <string.h>
 
 /* HID Report Descriptor item types */
 #define HID_ITEM_MAIN_INPUT        0x80
@@ -35,6 +36,11 @@ typedef struct {
     uint8_t         protocol;     /* Keyboard=1, Mouse=2 */
     uint8_t         last_report[8];
 } hid_device_t;
+
+/* Registered HID devices (up to 4: typically keyboard + mouse + 2 spare) */
+#define HID_MAX_DEVICES 4
+static hid_device_t *hid_devices[HID_MAX_DEVICES];
+static int           hid_device_count = 0;
 
 /* Scancode to ASCII table (US layout) */
 static const char scancode_to_ascii[] = {
@@ -110,13 +116,31 @@ static void hid_process_mouse(hid_device_t *hid, const uint8_t *data)
     }
 }
 
-/* USB HID interrupt handler (polled mode for now) */
+/* USB HID interrupt handler (polled mode) */
 void hid_poll(hid_device_t *hid)
 {
     uint8_t report[8];
-    
-    /* Read report from interrupt endpoint */
-    int len = usb_interrupt_transfer(hid->int_in, report, 8, 10);
+    int len;
+
+    if (hid->int_in) {
+        /*
+         * Try interrupt endpoint transfer first.
+         * xhci_interrupt_transfer() implements this as GET_REPORT over EP0
+         * (boot protocol fallback), which works for any HID boot-protocol
+         * device without needing a separate interrupt endpoint ring.
+         */
+        len = usb_interrupt_transfer(hid->int_in, report, 8, 10);
+    } else {
+        /*
+         * No interrupt endpoint — use GET_REPORT directly.
+         * bmRequestType=0xA1 (IN, Class, Interface), bRequest=0x01 (GET_REPORT)
+         * wValue=0x0100 (Input report, ID 0), wIndex=interface number.
+         */
+        len = usb_control_transfer(hid->dev,
+                                   0xA1, 0x01, 0x0100,
+                                   hid->intf->bInterfaceNumber,
+                                   report, 8, 100);
+    }
     
     if (len > 0) {
         if (hid->protocol == USB_PROTOCOL_KEYBOARD) {
@@ -140,9 +164,12 @@ static int hid_probe(usb_device_t *dev, usb_interface_t *intf)
     }
     
     /* Allocate HID device */
-    /* hid_device_t *hid = kmalloc(sizeof(hid_device_t)); */
-    hid_device_t *hid = NULL;  /* TODO: Use heap */
-    if (!hid) return -1;
+    hid_device_t *hid = kmalloc(sizeof(hid_device_t));
+    if (!hid) {
+        debug_print("HID: kmalloc failed\n");
+        return -1;
+    }
+    memset(hid, 0, sizeof(hid_device_t));
     
     hid->dev = dev;
     hid->intf = intf;
@@ -170,7 +197,11 @@ static int hid_probe(usb_device_t *dev, usb_interface_t *intf)
                         NULL, 0, 1000);
     
     dev->class_private = hid;
-    
+
+    /* Register in device table for poll loop */
+    if (hid_device_count < HID_MAX_DEVICES)
+        hid_devices[hid_device_count++] = hid;
+
     if (hid->protocol == USB_PROTOCOL_KEYBOARD) {
         debug_print("HID: USB Keyboard detected!\n");
     } else if (hid->protocol == USB_PROTOCOL_MOUSE) {
@@ -194,4 +225,19 @@ int hid_init(void)
     debug_print("HID: Initializing USB HID driver\n");
     usb_register_class_driver(&hid_driver);
     return 0;
+}
+
+/*
+ * hid_poll_all() — call from main kernel loop to service all HID devices.
+ * Each call polls every registered keyboard/mouse for a new report.
+ * Returns total number of events processed across all devices.
+ */
+int hid_poll_all(void)
+{
+    int total = 0;
+    for (int i = 0; i < hid_device_count; i++) {
+        if (hid_devices[i])
+            hid_poll(hid_devices[i]);
+    }
+    return total;
 }

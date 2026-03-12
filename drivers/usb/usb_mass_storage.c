@@ -2,7 +2,7 @@
  * usb_mass_storage.c – Full 64-bit USB Mass Storage Driver for RISC OS Phoenix
  * Supports USB 3.2 Gen 2x2 (20 Gbps) + UASP
  * Integrates with BlockDevice → FileCore
- * Author: R Andrews Grok 4 – 4 Feb 2026
+ * Author: R Andrews – 4 Feb 2026
  */
 
 #include "kernel.h"
@@ -123,13 +123,13 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
 
     drive->dev = dev;
     drive->intf = intf;
-    drive->intf_num = intf->desc.bInterfaceNumber;
+    drive->intf_num = intf->bInterfaceNumber;
 
     /* Find bulk endpoints */
     for (int i = 0; i < intf->endpoint_count; i++) {
         usb_endpoint_t *ep = &intf->endpoints[i];
-        if ((ep->desc.bmAttributes & 0x03) == 0x02) {  // Bulk
-            if (ep->desc.bEndpointAddress & 0x80)
+        if ((ep->bmAttributes & 0x03) == 0x02) {  // Bulk
+            if (ep->bEndpointAddress & 0x80)
                 drive->bulk_in = ep;
             else
                 drive->bulk_out = ep;
@@ -142,7 +142,7 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
     }
 
     /* Detect UASP vs BOT */
-    if (intf->desc.bInterfaceProtocol == USB_PROTOCOL_UASP) {
+    if (intf->bInterfaceProtocol == USB_PROTOCOL_UASP) {
         drive->uasp = 1;
         debug_print("USBStorage: UASP device detected\n");
         // TODO: Implement full UASP multi-queue
@@ -154,4 +154,27 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
     usb_bot_rw(drive, 0, 0, 1, data, 0);  // Dummy to clear stall
     usb_bot_rw(drive, 0, 0, 1, data, 0);
 
-    uint32_t lba = (data[0] << 24) | (data[1] << 16) | (data[2]
+    uint32_t lba = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+    drive->capacity[0] = (uint64_t)lba + 1;
+
+    if (usb_drive_count < 16)
+        usb_drives[usb_drive_count++] = drive;
+
+    dev->class_private = drive;
+
+    uart_puts("[MSC] USB mass storage device probed OK\n");
+    return 0;
+}
+
+static usb_class_driver_t msc_driver = {
+    .name       = "USB-MSC",
+    .class_code = USB_CLASS_MSC,
+    .probe      = usb_storage_probe,
+    .disconnect = NULL,
+};
+
+int usb_mass_storage_init(void) {
+    uart_puts("[MSC] Registering USB mass storage class driver\n");
+    usb_register_class_driver(&msc_driver);
+    return 0;
+}
