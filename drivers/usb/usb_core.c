@@ -52,6 +52,8 @@
 #include "kernel.h"
 #include "usb.h"
 
+extern void uart_puts(const char *s);
+
 /* ── Global state ───────────────────────────────────────────────────────── */
 
 /* Registered host controller operations (set by usb_register_hc()) */
@@ -297,12 +299,21 @@ int usb_enumerate_device(usb_device_t *dev, int port) {
 int usb_init(void) {
     uart_puts("[USB] Initialising USB subsystem\n");
 
-    /* Register class drivers — must happen before port_scan */
-    extern int hid_init(void);
-    extern int usb_mass_storage_init(void);
+    /* Register class drivers — must happen before port_scan.
+     * Both functions are declared as weak references so the build
+     * succeeds whether or not their object files are linked in.
+     * Add drivers/usb/usb_mass_storage.o and drivers/usb/usb_hid.o
+     * to the Makefile to activate them. */
+    extern int hid_init(void)            __attribute__((weak));
+    extern int usb_mass_storage_init(void) __attribute__((weak));
 
-    hid_init();
-    usb_mass_storage_init();
+    if (hid_init)              hid_init();
+    if (usb_mass_storage_init) usb_mass_storage_init();
+
+    /* Now trigger the deferred port scan — class drivers are registered
+     * so usb_enumerate_device() will find and probe them correctly. */
+    extern int xhci_scan_ports(void) __attribute__((weak));
+    if (xhci_scan_ports) xhci_scan_ports();
 
     uart_puts("[USB]   g_hc_ops = ");
     uart_puts(g_hc_ops ? "registered" : "NULL (HCD not yet initialised)");

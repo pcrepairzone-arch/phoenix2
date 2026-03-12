@@ -8,6 +8,37 @@
 #include "usb.h"
 #include <string.h>
 
+/* ── UART / print helpers ───────────────────────────────────────────────── */
+/* uart_puts is defined in drivers/uart/uart.c                               */
+extern void uart_puts(const char *s);
+
+static void print_hex32(uint32_t v) {
+    static const char hex[] = "0123456789abcdef";
+    char buf[11];
+    buf[0]  = '0'; buf[1] = 'x';
+    buf[2]  = hex[(v >> 28) & 0xF]; buf[3]  = hex[(v >> 24) & 0xF];
+    buf[4]  = hex[(v >> 20) & 0xF]; buf[5]  = hex[(v >> 16) & 0xF];
+    buf[6]  = hex[(v >> 12) & 0xF]; buf[7]  = hex[(v >>  8) & 0xF];
+    buf[8]  = hex[(v >>  4) & 0xF]; buf[9]  = hex[(v >>  0) & 0xF];
+    buf[10] = '\0';
+    uart_puts(buf);
+}
+
+static void print_hex64(uint64_t v) {
+    print_hex32((uint32_t)(v >> 32));
+    /* skip the leading 0x on the low half for readability */
+    static const char hex[] = "0123456789abcdef";
+    char buf[9];
+    uint32_t lo = (uint32_t)v;
+    buf[0] = hex[(lo >> 28) & 0xF]; buf[1] = hex[(lo >> 24) & 0xF];
+    buf[2] = hex[(lo >> 20) & 0xF]; buf[3] = hex[(lo >> 16) & 0xF];
+    buf[4] = hex[(lo >> 12) & 0xF]; buf[5] = hex[(lo >>  8) & 0xF];
+    buf[6] = hex[(lo >>  4) & 0xF]; buf[7] = hex[(lo >>  0) & 0xF];
+    buf[8] = '\0';
+    uart_puts(buf);
+}
+/* ── end helpers ────────────────────────────────────────────────────────── */
+
 extern void *pcie_base;
 extern pci_dev_t vl805_dev;
 
@@ -246,7 +277,7 @@ static int setup_cmd_ring(void) {
 
     asm volatile("dsb sy" ::: "memory");
 
-    uint64_t crcr = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle | (1ULL << 1);
+    uint64_t crcr = (ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
     reg_write64(xhci_ctrl.op_regs, OP_CRCR_LO, crcr);
 
     return 0;
@@ -293,7 +324,7 @@ static int run_controller(void) {
     uint64_t dcbaa_dma  = phys_to_dma((uint64_t)virt_to_phys((void *)dcbaa));
     uint64_t erstba_dma = erst_dma_addr;
     uint64_t evt_dma    = evt_ring_dma;
-    uint64_t crcr_val   = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle | (1ULL << 1);
+    uint64_t crcr_val   = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
     uint32_t cfg_val    = (readl(op + OP_CONFIG) & ~0xFFU) | (xhci_ctrl.max_slots & 0xFFU);
 
     /* MCU stabilization + launch (full from your original) */
@@ -342,7 +373,7 @@ static usb_hc_ops_t g_xhci_hc_ops;
 
 /* ── xhci_init ───────────────────────────────────────────────────────────── */
 int xhci_init(uint64_t base_addr) {
-    debug_print("[xHCI] driver v37 init base=0x%llx\n", base_addr);
+    debug_print("[xHCI] driver v41 init base=0x%llx\n", base_addr);
     xhci_ctrl.cap_regs = (void *)base_addr;
     if (read_caps() != 0) return -1;
     if (do_reset() != 0) return -1;
@@ -353,7 +384,10 @@ int xhci_init(uint64_t base_addr) {
 
     if (run_controller() != 0) return -1;
 
-    port_scan();
+    /* Register HC ops BEFORE port scan so xhci_control_transfer is
+     * available during enumeration. port_scan itself is deferred —
+     * it is called by xhci_scan_ports() which usb_init() calls AFTER
+     * registering class drivers, so usb_enumerate_device() finds them. */
     usb_register_hc(&g_xhci_hc_ops);
     xhci_ctrl.initialized = 1;
     return 0;
@@ -461,7 +495,7 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32
      * ring setup and the doorbell. Writing it here with only a dsb
      * between it and db[0] closes that gap. */
     void *op = xhci_ctrl.op_regs;
-    uint64_t crcr = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle | (1ULL << 1);
+    uint64_t crcr = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
     reg_write64(op, OP_CRCR_LO, crcr);
     asm volatile("dsb sy; isb" ::: "memory");
 
@@ -542,34 +576,78 @@ static void enumerate_port(int port) {
     void *op = xhci_ctrl.op_regs;
     uint32_t portsc = readl(op + 0x400 + port * 0x10);
 
-    if (portsc & (1U << 30)) return; /* companion port */
+    /* Print every port so we can see its PORTSC in the log */
+    uart_puts("[xHCI] Port "); print_hex32(port + 1);
+
     if (!(portsc & PORTSC_CCS)) {
-        uart_puts("[xHCI] Port "); print_hex32(port + 1);
         uart_puts(": not connected (PORTSC="); print_hex32(portsc);
         uart_puts(")\n");
         return;
     }
 
     uint32_t speed = (portsc >> 10) & 0xF;
+    uint32_t pls   = (portsc >> 5) & 0xF;
+    uint32_t prc   = (portsc >> 21) & 1;
     uart_puts("[xHCI] Port "); print_hex32(port + 1);
     uart_puts(": CONNECTED speed="); print_hex32(speed);
+    uart_puts(" PLS="); print_hex32(pls);
+    uart_puts(" PRC="); print_hex32(prc);
     uart_puts(" PORTSC="); print_hex32(portsc); uart_puts("\n");
 
-    /* Port reset — skip for SS already in U0 (PED=1) */
-    if (!(speed == 4 && (portsc & PORTSC_PED))) {
-        uint32_t reset_bit = (speed == 4) ? (1U << 31) : (1U << 4);
-        writel((portsc & ~PORTSC_WIC) | reset_bit, op + 0x400 + port * 0x10);
-        for (int t = 0; t < 200; t++) {
+    /*
+     * PORT RESET DECISION
+     *
+     * PRC=1 (bit21) means a port reset ALREADY COMPLETED — the VL805 MCU
+     * resets ports during cold-boot firmware init.  If we issue a second
+     * port reset the device drops off (CCS→0, PP→0, PLS→Disabled).
+     * This was the v40 regression: PORTSC=0x40200ee1 had PRC=1, we reset
+     * anyway, and got PORTSC=0x40000080 (device gone).
+     *
+     * Rule:
+     *   PRC=1  → already reset, just clear PRC W1C and proceed
+     *   PED=1  → port enabled and in U0, skip reset
+     *   otherwise → issue PR (bit4), wait for PED=1
+     *
+     * Always use PR (bit4), never WPR (bit31) for initial enumeration.
+     * WPR is only for SS link recovery when PED was 1 then dropped.
+     */
+    if (prc) {
+        /* MCU already completed a reset — clear PRC W1C and continue */
+        uart_puts("[xHCI] PRC already set — skipping reset, clearing PRC\n");
+        writel((portsc & ~PORTSC_WIC) | (1U << 21), op + 0x400 + port * 0x10);
+        delay_ms(5);
+    } else if (!(portsc & PORTSC_PED)) {
+        /* Port not yet enabled — issue PR (bit4) */
+        uart_puts("[xHCI] Issuing port reset (PR)...\n");
+        writel((portsc & ~PORTSC_WIC) | (1U << 4), op + 0x400 + port * 0x10);
+        uint32_t ps = portsc;
+        for (int t = 0; t < 500; t++) {
             delay_ms(1);
-            uint32_t ps = readl(op + 0x400 + port * 0x10);
-            if (!(ps & reset_bit)) break;
+            ps = readl(op + 0x400 + port * 0x10);
+            if (!(ps & (1U << 4)) && (ps & PORTSC_PED)) break;
         }
+        /* Clear change bits W1C */
+        uint32_t ps2 = readl(op + 0x400 + port * 0x10);
+        writel((ps2 & ~PORTSC_WIC) | PORTSC_WIC, op + 0x400 + port * 0x10);
+        delay_ms(5);
         uart_puts("[xHCI] Port reset done. PORTSC=");
         print_hex32(readl(op + 0x400 + port * 0x10)); uart_puts("\n");
+    } else {
+        uart_puts("[xHCI] Port already enabled (PED=1), skipping reset\n");
+    }
+
+    /* Verify device still connected after reset decision */
+    uint32_t ps_check = readl(op + 0x400 + port * 0x10);
+    uart_puts("[xHCI] Post-reset PORTSC="); print_hex32(ps_check); uart_puts("\n");
+    if (!(ps_check & PORTSC_CCS)) {
+        uart_puts("[xHCI] Device lost after reset — aborting\n");
+        return;
     }
 
     /* ── Step 1: Enable Slot ─────────────────────────────────────────── */
+    uart_puts("[xHCI] Submitting Enable Slot...\n");
     cmd_ring_submit(0, 0, 0, TRB_TYPE_ENABLE_SLOT);
+    uart_puts("[xHCI] Waiting for Enable Slot event...\n");
     uint32_t ev[4];
     if (xhci_wait_event(ev, 5000) != 0) {
         uart_puts("[xHCI] Enable Slot TIMEOUT\n");
@@ -718,7 +796,16 @@ static void port_scan(void) {
 
 /* HCD callbacks */
 int xhci_is_ready(void) { return xhci_ctrl.initialized; }
-int xhci_scan_ports(void) { return 0; }
+
+/*
+ * xhci_scan_ports — deferred port scan, called from usb_init() AFTER
+ * class drivers are registered so usb_enumerate_device() finds them.
+ */
+int xhci_scan_ports(void) {
+    if (!xhci_ctrl.initialized) return 0;
+    port_scan();
+    return 0;
+}
 
 int xhci_enumerate_device(usb_device_t *dev, int port) {
     /* Address Device already done inline in enumerate_port().
@@ -838,8 +925,85 @@ static usb_hc_ops_t g_xhci_hc_ops = {
     .enumerate_device   = xhci_enumerate_device,
 };
 
-/* ── Event ring + IRQ + MSI (final) ─────────────────────────────────────── */
+/* ── Event ring + IRQ + MSI ──────────────────────────────────────────────── */
+
+/*
+ * evt_ring_poll — read one event directly from the event ring.
+ *
+ * This is the AUTHORITATIVE event consumer.  It is called by both
+ * xhci_wait_event (polling path) and xhci_irq_handler (MSI path).
+ *
+ * Returns 1 if an event was consumed into ev[], 0 if ring is empty.
+ *
+ * The cycle bit protocol:
+ *   The controller writes TRBs into the ring and toggles the cycle
+ *   bit on each full pass.  We track evt_cycle which starts at 1.
+ *   A TRB belongs to us iff (dword3 & 1) == evt_cycle.
+ */
+static int evt_ring_poll(uint32_t ev[4]) {
+    uint32_t *slot = (uint32_t *)(evt_ring + evt_dequeue * 4);
+
+    /* Memory barrier — ensure we see the controller's write */
+    asm volatile("dsb sy; isb" ::: "memory");
+
+    uint8_t slot_cycle = slot[3] & 1;
+    if (slot_cycle != evt_cycle) {
+        /* Uncomment for deep debug — very noisy:
+         * uart_puts("[xHCI] poll: empty deq="); print_hex32(evt_dequeue);
+         * uart_puts(" slot3="); print_hex32(slot[3]);
+         * uart_puts(" want_cycle="); print_hex32(evt_cycle); uart_puts("\n");
+         */
+        return 0;
+    }
+
+    uart_puts("[xHCI] evt_ring_poll: GOT EVENT deq="); print_hex32(evt_dequeue);
+    uart_puts(" ["); print_hex32(slot[0]); uart_puts(",");
+    print_hex32(slot[1]); uart_puts(",");
+    print_hex32(slot[2]); uart_puts(",");
+    print_hex32(slot[3]); uart_puts("]\n");
+
+    ev[0] = slot[0];
+    ev[1] = slot[1];
+    ev[2] = slot[2];
+    ev[3] = slot[3];
+
+    evt_dequeue++;
+    if (evt_dequeue >= EVT_RING_TRBS) {
+        evt_dequeue = 0;
+        evt_cycle ^= 1;
+    }
+
+    /* Advance ERDP so the controller knows we consumed this slot */
+    void *ir0 = ir_base(0);
+    uint64_t new_erdp = evt_ring_dma + (uint64_t)evt_dequeue * 16;
+    /* Set EHB (Event Handler Busy clear) bit 3 in ERDP lo */
+    reg_write64(ir0, IR_ERDP_LO, new_erdp | (1ULL << 3));
+    /* Clear IMAN IP (Interrupt Pending) W1C */
+    writel(readl(ir0 + IR_IMAN) | 1U, ir0 + IR_IMAN);
+
+    return 1;
+}
+
+/*
+ * xhci_wait_event — wait for a command/transfer completion event.
+ *
+ * Polls the event ring directly — does NOT require MSI to fire.
+ * MSI/IRQ path via xhci_irq_handler is an optimisation only.
+ *
+ * This fixes Enable Slot TIMEOUT: the first command after RS=1
+ * raised a completion event on the ring, but MSI delivery timing
+ * was unreliable so pending_event_ready was never set.
+ */
 static int xhci_wait_event(uint32_t ev[4], int timeout_ms) {
+    /* Fast path: IRQ handler already consumed and staged the event */
+    if (pending_event_ready) {
+        ev[0] = pending_event[0]; ev[1] = pending_event[1];
+        ev[2] = pending_event[2]; ev[3] = pending_event[3];
+        pending_event_ready = 0;
+        return 0;
+    }
+
+    /* Polling path: read event ring directly every 1ms */
     for (int t = 0; t < timeout_ms; t++) {
         if (pending_event_ready) {
             ev[0] = pending_event[0]; ev[1] = pending_event[1];
@@ -847,6 +1011,8 @@ static int xhci_wait_event(uint32_t ev[4], int timeout_ms) {
             pending_event_ready = 0;
             return 0;
         }
+        if (evt_ring_poll(ev))
+            return 0;
         delay_ms(1);
     }
     return -1;
@@ -854,29 +1020,15 @@ static int xhci_wait_event(uint32_t ev[4], int timeout_ms) {
 
 void xhci_irq_handler(int vector, void *data) {
     (void)vector; (void)data;
-    void *ir0 = ir_base(0);
-    uint32_t iman = readl(ir0 + IR_IMAN);
-    if (iman & 1) {
-        uint32_t *ev_ptr = (uint32_t *)(evt_ring + evt_dequeue * 4);
-
-        /* Check cycle bit — if it doesn't match evt_cycle the slot is
-         * empty or stale (controller hasn't written this entry yet). */
-        if ((ev_ptr[3] & 1) != evt_cycle)
-            return;
-
-        pending_event[0] = ev_ptr[0];
-        pending_event[1] = ev_ptr[1];
-        pending_event[2] = ev_ptr[2];
-        pending_event[3] = ev_ptr[3];
-
-        evt_dequeue++;
-        if (evt_dequeue >= EVT_RING_TRBS) {
-            evt_dequeue = 0;
-            evt_cycle ^= 1;   /* toggle cycle when we wrap */
-        }
-
-        reg_write64(ir0, IR_ERDP_LO, evt_ring_dma + evt_dequeue * 16);
-        writel(1U, ir0 + IR_IMAN);
+    /* MSI fired — consume event and stage it for xhci_wait_event fast path.
+     * If xhci_wait_event already consumed it via polling, the slot's cycle
+     * bit will not match and evt_ring_poll returns 0 — no double-consume. */
+    uint32_t ev[4];
+    if (evt_ring_poll(ev)) {
+        pending_event[0] = ev[0];
+        pending_event[1] = ev[1];
+        pending_event[2] = ev[2];
+        pending_event[3] = ev[3];
         pending_event_ready = 1;
     }
 }
