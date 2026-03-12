@@ -283,3 +283,63 @@ TRANSCRIPT CATALOG
   Covers: CNR/HCRST investigation v32-v35, enumeration code
   review, all pci.c and usb_xhci.c fixes, first successful boot.
 ═══════════════════════════════════════════════════════════════
+
+
+SESSION 3 MILESTONE: 2026-03-12  v38-v39  First device detected
+═══════════════════════════════════════════════════════════════
+
+MILESTONE — After 130+ debugging sessions, a USB device was
+detected on Port 1 for the first time.
+
+  [xHCI] Port 0x00000001: CONNECTED speed=0x3 PORTSC=0x40200ee1
+  [xHCI] Port reset done. PORTSC=0x40200e03
+
+Port 1 PORTSC=0x40200ee1 decoded:
+  CCS=1  (device connected)
+  PED=0  (not yet enabled — reset needed)
+  Speed=3  (SS 5Gbps — DeskPi hub/SSD)
+  DR=1 (bit 30 set — this is why port 1 was SKIPPED in v37)
+
+WHY BIT 30 WAS SET:
+  Our companion port guard (if portsc & (1U<<30)) return) was
+  intended to skip EHCI/OHCI companion ports. On VL805 bit 30
+  is set on the SS port (likely DR = Device Removable flag).
+  It is NOT a companion port indicator. Removed in v38.
+
+ENABLE SLOT TIMEOUT (v38):
+  Port reset completed (PRC cleared, PORTSC=0x40200e03).
+  Enable Slot TRB submitted. xhci_wait_event timed out after 5s.
+  The completion event WAS on the event ring but xhci_wait_event
+  only checked pending_event_ready (set by MSI handler).
+  MSI delivery timing on the first command after RS=1 was
+  unreliable — the IRQ fired but our handler may have missed
+  or the event arrived before the handler was fully live.
+
+v39 FIX — Direct event ring polling:
+  xhci_wait_event now polls the event ring directly (evt_ring_poll)
+  every 1ms in addition to checking pending_event_ready.
+  MSI/IRQ path is now an optimisation — no longer required for
+  correctness. evt_ring_poll checks the cycle bit, consumes the
+  slot, advances ERDP, and clears IMAN.IP.
+
+  Also fixed: PRC (Port Reset Change, bit 21) W1C clear after
+  port reset completes, plus 20ms settle before Enable Slot.
+
+EXPECTED v39 BOOT OUTPUT:
+  [xHCI] Port 1: CONNECTED speed=3 SS PORTSC=0x40200ee1
+  [xHCI] Port reset done. PORTSC=0x40200e03
+  [xHCI] Enable Slot: cc=0x1 slot=0x1
+  [xHCI] Address Device OK slot=0x1
+  [xHCI] Device: VID=... PID=... class=0x8
+  [xHCI] Interface 0 class=0x8 sub=0x6 proto=0x50
+  [MSC] USB mass storage device probed OK
+
+KEY RULES ADDED:
+  9. Bit 30 of PORTSC is NOT a companion port flag on VL805.
+     Do not skip ports based on bit 30. CCS=0 is sufficient.
+  10. xhci_wait_event must poll the event ring directly.
+      Never rely solely on MSI delivery for command completions.
+      The first Enable Slot after RS=1 fires before MSI is stable.
+  11. Clear PRC (bit 21) W1C after port reset completes.
+      Leave it set and the MCU may treat the next command as stale.
+═══════════════════════════════════════════════════════════════
