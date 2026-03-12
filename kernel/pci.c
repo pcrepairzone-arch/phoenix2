@@ -72,6 +72,15 @@
 #include "kernel.h"
 #include "pci.h"
 
+/* Forward declarations for mailbox power state check.
+ * Defined in drivers/gpu/mailbox_property.c — same TU that drives
+ * fb_init() and all other VC property-channel calls. */
+extern int mbox_get_power_state(uint32_t device_id);
+#define MBOX_PWR_USB_HCD  3   /* matches MBOX_PWR_USB_HCD in drivers/gpu/mailbox_property.h */
+
+/* kernel.h includes irq.h which defines PCIE_MSI_IRQ_VECTOR (180) and
+ * PCIE_INTX_IRQ_VECTOR (175) — used by xhci_setup_msi() below. */
+
 extern void uart_puts(const char *s);
 extern void uart_putc(char c);
 extern void *ioremap(uint64_t phys_addr, size_t size);
@@ -79,8 +88,8 @@ extern int   get_pi_model(void);
 
 /* ── Globals ────────────────────────────────────────────────────── */
 
-static void    *pcie_base = NULL;
-static pci_dev_t vl805_dev;
+ void    *pcie_base = NULL;
+ pci_dev_t vl805_dev;
 static void    *xhci_base = NULL;
 static void    *xhci_op   = NULL;
 
@@ -166,6 +175,23 @@ static void delay_ms(int ms) {
  */
 #define RC_CFG_PRIV1_ID_VAL3_OFF    0x043C
 #define RC_CORRECT_CLASS            0x060400U
+
+/* BCM2711 PCIe RC — MSI inbound address registers.
+ * The RC has a fixed MSI target window: any PCIe write to the address
+ * programmed in MSI_BAR triggers GIC SPI 148 (INTID 180).
+ * We point it at a scratch word in our DMA buffer — the value written
+ * doesn't matter, the RC intercepts the TLP and raises the interrupt. */
+#define MISC_MSI_BAR_CONFIG_LO      0x4044
+#define MISC_MSI_BAR_CONFIG_HI      0x4048
+#define MISC_MSI_DATA_CONFIG        0x404C
+#define MISC_INTR2_CPU_BASE         0x4300   /* L2 interrupt controller */
+#define MISC_INTR2_CPU_STATUS       (MISC_INTR2_CPU_BASE + 0x00)
+#define MISC_INTR2_CPU_CLEAR        (MISC_INTR2_CPU_BASE + 0x08)
+#define MISC_INTR2_CPU_MASK_SET     (MISC_INTR2_CPU_BASE + 0x10)
+#define MISC_INTR2_CPU_MASK_CLR     (MISC_INTR2_CPU_BASE + 0x14)
+
+/* PCIe standard MSI capability ID */
+#define PCI_CAP_ID_MSI              0x05
 
 #define PI4_PCIE_RC_BASE     0xFD500000ULL
 #define PI5_PCIE_RC_BASE     0x1F00000000ULL
@@ -256,11 +282,29 @@ static int pcie_bring_up_link(void) {
      * clears it to 0 before handoff regardless of board or firmware state.
      */
     /*
-     * CRITICAL: MISC_CTRL is zeroed by start4.elf's "PCI0 reset", which clears
-     * SCB_ACCESS_EN (bit 12).  With the SCB gate closed, PCIE_STATUS reads back
-     * 0x00000000 regardless of actual link state — causing us to always take the
-     * PERST# path even when the VL805 is still alive.
-     * Restore SCB_ACCESS_EN + SCB0_SIZE NOW, before reading PCIE_STATUS.
+     * CRITICAL ORDERING — BCM2711 RC registers are write-protected while
+     * RGR1_SW_INIT_1 has its reset bits set.  start4.elf leaves RGR1=0x3
+     * (both bit1=bridge-reset and bit0=PERST# asserted).  Any write to
+     * MISC_CTRL while RGR1!=0 is silently dropped — readback returns 0.
+     * This caused MISC_CTRL restored=0x00000000 on every boot, leaving
+     * SCB_ACCESS_EN=0, so PCIE_STATUS always read 0x00000000, so we always
+     * took the PERST# path even when the VL805 was alive.
+     *
+     * Linux pcie-brcmstb.c and U-Boot pcie_brcmstb.c both confirm:
+     * deassert bridge reset (bit1) FIRST, wait, then configure MISC_CTRL,
+     * then check PCIE_STATUS to decide whether full PERST# is needed.
+     *
+     * Step A: deassert bridge soft reset (bit1 only — keep PERST# bit0 as-is).
+     * This brings the RC register file out of reset so writes take effect.
+     */
+    rgr1 &= ~(1U << 1);
+    writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
+    asm volatile("dsb sy; isb" ::: "memory");
+    delay_ms(1);   /* RC needs ~1ms to come out of bridge reset */
+
+    /*
+     * Step B: open the SCB gate so PCIE_STATUS is readable.
+     * Now that RGR1 bit1=0 the RC register file accepts writes.
      */
     uint32_t ctrl = readl(pcie_base + MISC_MISC_CTRL_OFF);
     ctrl |= (1U << 12);                  /* SCB_ACCESS_EN — open the gate */
@@ -270,6 +314,12 @@ static int pcie_bring_up_link(void) {
     asm volatile("dsb sy; isb" ::: "memory");
     uart_puts("[PCI] MISC_CTRL restored="); print_hex32(readl(pcie_base + MISC_MISC_CTRL_OFF)); uart_puts("\n");
 
+    /*
+     * Step C: read PCIE_STATUS with the gate open.
+     * Bits 4+5 (pcie_link_up + pcie_dl_up) survive start4.elf's PCI0 reset.
+     * If both set: VL805 is alive, BAR assigned — skip PERST# entirely.
+     * If either clear: cold boot or CM4 rpiboot — need full PERST# + link train.
+     */
     uint32_t entry_status = readl(pcie_base + MISC_PCIE_STATUS_OFF);
     int link_up_at_entry  = (entry_status & (1U << 4)) && (entry_status & (1U << 5));
     uint32_t fw_rc_win    = readl(pcie_base + 0x20);  /* logging only */
@@ -284,22 +334,18 @@ static int pcie_bring_up_link(void) {
          * BCM2711 RGR1_SW_INIT_1 — empirically confirmed register behaviour:
          *
          *   RGR1 = 0x00000000  →  LINK UP  (RC active, PERST# deasserted)
-         *   RGR1 = 0x00000001  →  LINK FAILED (boots 16-17)
+         *   RGR1 = 0x00000001  →  LINK FAILED
          *
-         * Firmware leaves RGR1 = 0x00000003 (both bits set).
-         * Clearing BOTH bits (→ 0x00000000) produces a working link.
-         * Clearing only bit 1 (→ 0x00000001) fails.
-         *
-         * Sequence:
-         *   Step 1 — Clear bit 1 (RC soft reset): RC comes out of reset.
-         *   Step 2 — Clear bit 0 (PERST#): VL805 is released / link trains.
+         * Bit 1 (bridge soft reset) was already cleared in Step A above.
+         * Only bit 0 (PERST#) remains to be cleared to release the VL805.
+         * The bit1 write below is a no-op (already 0) but left for clarity.
          */
-        rgr1 &= ~(1U << 1);
+        rgr1 &= ~(1U << 1);   /* already done in Step A — no-op */
         writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
         asm volatile("dsb sy; isb" ::: "memory");
         delay_ms(1);
 
-        rgr1 &= ~(1U << 0);
+        rgr1 &= ~(1U << 0);   /* clear PERST# — VL805 released, link trains */
         writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
         asm volatile("dsb sy; isb" ::: "memory");
     }
@@ -393,6 +439,148 @@ static void vl805_flr(pci_dev_t *dev) {
         cap_ptr = (cap >> 8) & 0xFC;
     }
     uart_puts("[PCI] No FLR support — skipping\n");
+}
+
+/* ── MSI setup ───────────────────────────────────────────────────── */
+
+/*
+ * xhci_setup_msi — wire VL805 MSI to GIC SPI 148 (INTID 180).
+ *
+ * Three steps:
+ *   1. Program the BCM2711 RC MSI inbound address window.
+ *      The RC intercepts any PCIe memory write to this address and
+ *      asserts GIC SPI 148 internally — no external wiring needed.
+ *      We use a word in our DMA scratch area as the target physical
+ *      address; the written value is irrelevant.
+ *
+ *   2. Walk the VL805 PCIe capability list to find the MSI capability
+ *      (cap ID 0x05) and enable it.  The VL805 will then issue a
+ *      memory-write TLP to the MSI BAR address on every xHCI interrupt.
+ *
+ *   3. Register our handler with the GIC and unmask INTID 180.
+ *
+ * Must be called after pci_init_pi4() has fully set up the RC and
+ * VL805 config space is accessible via EXT_CFG.
+ *
+ * The handler (xhci_irq_handler) is defined in usb_xhci.c and declared
+ * here via extern.
+ */
+void xhci_setup_msi(void) {
+    uart_puts("[MSI] Setting up VL805 MSI -> GIC INTID 180...\n");
+
+    /*
+     * Step 1: Program RC MSI BAR.
+     *
+     * Physical address for MSI target: use the first word of the ERST
+     * scratch area (DMA buffer + 0x1000).  This is ordinary cached RAM;
+     * the RC only needs a valid PCIe-reachable address.  The RC converts
+     * the PCIe write TLP into a GIC interrupt — it never actually lands
+     * in RAM as far as the VL805 is concerned.
+     *
+     * MSI_BAR must be programmed in PCIe address space.  Our RC_BAR2
+     * maps PCIe 0xC0000000 → CPU 0x00000000.  So:
+     *   CPU phys 0x080b6000 → PCIe 0xC80b6000
+     * We store the PCIe address in MSI_BAR_LO (32-bit, fits in low 4GB).
+     */
+    extern uint64_t xhci_dma_phys(void);   /* returns DMA buf physical base */
+    uint32_t msi_target_pcie = (uint32_t)(xhci_dma_phys() + 0x1000 + 0xC0000000U);
+    writel(msi_target_pcie,  pcie_base + MISC_MSI_BAR_CONFIG_LO);
+    writel(0x00000000U,      pcie_base + MISC_MSI_BAR_CONFIG_HI);
+    writel(0x0000FFE0U,      pcie_base + MISC_MSI_DATA_CONFIG);
+    asm volatile("dsb sy; isb" ::: "memory");
+
+    uart_puts("[MSI] RC MSI BAR -> PCIe 0x");
+    print_hex32(msi_target_pcie);
+    uart_puts("\n");
+
+    /* Unmask the RC L2 MSI interrupt towards the GIC */
+    writel(0xFFFFFFFFU, pcie_base + MISC_INTR2_CPU_CLEAR);
+    writel(0x00000000U, pcie_base + MISC_INTR2_CPU_MASK_SET);  /* unmask all */
+    asm volatile("dsb sy; isb" ::: "memory");
+
+    /*
+     * Step 2: Enable MSI in VL805 PCIe config space.
+     *
+     * Walk the capability list from cap pointer at config offset 0x34.
+     * MSI capability (ID=0x05) layout (PCIe spec 6.8.1):
+     *   +0  [7:0]  Cap ID (0x05)
+     *   +0  [15:8] Next pointer
+     *   +2  [15:0] Message Control
+     *              bit 0 = MSI Enable
+     *              bits[3:1] = Multiple Message Enable (000=1 vector)
+     *   +4  [31:0] Message Address Lo
+     *   +8  [31:0] Message Address Hi (if 64-bit capable, bit 7 of ctrl)
+     *   +12 [15:0] Message Data
+     */
+    uint32_t cap_ptr = pci_read_config(&vl805_dev, 0x34) & 0xFC;
+    int msi_found = 0;
+    while (cap_ptr && cap_ptr < 0x100) {
+        uint32_t cap = pci_read_config(&vl805_dev, cap_ptr);
+        if ((cap & 0xFF) == PCI_CAP_ID_MSI) {
+            uart_puts("[MSI] Found MSI cap at offset 0x");
+            print_hex8((uint8_t)cap_ptr);
+            uart_puts("\n");
+
+            /* Write MSI Address (PCIe target address the VL805 will write to) */
+            pci_write_config(&vl805_dev, cap_ptr + 4, msi_target_pcie);
+
+            /* Check 64-bit capability (bit 7 of Message Control word) */
+            uint32_t ctrl_word = pci_read_config(&vl805_dev, cap_ptr + 0);
+            int is64 = (ctrl_word >> 23) & 1;  /* bit 23 of dword = bit 7 of ctrl */
+            if (is64) {
+                pci_write_config(&vl805_dev, cap_ptr + 8,  0x00000000U); /* AddrHi=0 */
+                pci_write_config(&vl805_dev, cap_ptr + 12, 0x00000000U); /* Data=0   */
+            } else {
+                pci_write_config(&vl805_dev, cap_ptr + 8,  0x00000000U); /* Data=0   */
+            }
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            /* Enable MSI: set bit 0 of Message Control.
+             * Message Control is at byte offset +2 within the capability,
+             * which is bits[31:16] of the dword at cap_ptr+0 on a
+             * little-endian read — but pci_read_config reads full dwords.
+             * Re-read, set bit 16 (= MSI Enable in the dword), write back. */
+            ctrl_word |= (1U << 16);   /* bit 16 of dword = bit 0 of ctrl halfword */
+            pci_write_config(&vl805_dev, cap_ptr + 0, ctrl_word);
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            uint32_t verify = pci_read_config(&vl805_dev, cap_ptr + 0);
+            uart_puts("[MSI] MSI ctrl after enable: "); print_hex32(verify);
+            uart_puts(verify & (1U << 16) ? "  MSI ENABLED\n" : "  WARNING: enable bit not set\n");
+            msi_found = 1;
+            break;
+        }
+        cap_ptr = (cap >> 8) & 0xFC;
+    }
+
+    if (!msi_found) {
+        uart_puts("[MSI] WARNING: MSI cap not found — falling back to INTx\n");
+        /* Fall back: unmask INTx (PCIE_INTX_IRQ_VECTOR = 175) */
+        extern void irq_set_handler(int, void(*)(int, void*), void*);
+        extern void irq_unmask(int);
+        extern void xhci_irq_handler(int vector, void *data);
+        irq_set_handler(PCIE_INTX_IRQ_VECTOR, xhci_irq_handler, NULL);
+        irq_unmask(PCIE_INTX_IRQ_VECTOR);
+        uart_puts("[MSI] INTx fallback registered on INTID 175\n");
+        return;
+    }
+
+    /*
+     * Step 3: Register handler and unmask at GIC.
+     *
+     * irq_set_handler registers the C function in the GIC dispatch table.
+     * irq_unmask writes GICD_ISENABLER for INTID 180 (SPI 148).
+     * irq_dispatch (called from exceptions.S) will call xhci_irq_handler
+     * on every MSI from the VL805.
+     */
+    extern void irq_set_handler(int, void(*)(int, void*), void*);
+    extern void irq_unmask(int);
+    extern void xhci_irq_handler(int vector, void *data);
+
+    irq_set_handler(PCIE_MSI_IRQ_VECTOR, xhci_irq_handler, NULL);
+    irq_unmask(PCIE_MSI_IRQ_VECTOR);
+
+    uart_puts("[MSI] GIC INTID 180 unmasked — VL805 MSI armed\n");
 }
 
 /* ── BCM2711 outbound ATU setup ─────────────────────────────────── */
@@ -711,11 +899,49 @@ static void pci_init_pi4(void) {
 
     vl805_dev.bus = 1; vl805_dev.dev = 0; vl805_dev.func = 0;
 
+    /*
+     * Mailbox cross-check: ask VideoCore for the USB HCD power state.
+     *
+     * GET_POWER_STATE (tag 0x00020001) for device 3 (MBOX_PWR_USB_HCD):
+     *   returns bit0 = on/off, bit1 = device_exists
+     *
+     * Why this matters:
+     *   start4.elf leaves USB power ON (state=1) after it finishes init.
+     *   If we call mbox_power_on_usb() (SET_POWER_STATE on->on) when USB
+     *   is already powered, the VideoCore treats it as a USB subsystem reset
+     *   request — it issues an internal PERST# equivalent, kicking the VL805
+     *   MCU mid-init.  This was the original "skipping reset sets it to 1
+     *   which stops proceeding" bug.
+     *
+     * Rule:
+     *   usb_pwr == 1 (already on)  AND  link_up  ->  skip ALL mailbox calls
+     *   usb_pwr == 0 (off)         OR  !link_up  ->  do full mbox power-on path
+     */
+    int usb_pwr = mbox_get_power_state(MBOX_PWR_USB_HCD);
+    uart_puts("[PCI] USB HCD power state (mailbox): ");
+    uart_putc('0' + (usb_pwr < 0 ? 9 : usb_pwr));  /* '9' = call failed */
+    uart_puts(usb_pwr == 1 ? " (ON — VL805 alive, skip mailbox)\n"
+            : usb_pwr == 0 ? " (OFF — need mailbox power-on)\n"
+                           : " (mailbox error — assuming OFF)\n");
+
+    /*
+     * Override fw_already_inited: if power is OFF we must do the full
+     * mailbox path regardless of what PCIE_STATUS said.
+     * (Defensive: link bits can survive a power glitch on some revisions.)
+     */
+    if (usb_pwr != 1)
+        fw_already_inited = 0;
+
     if (fw_already_inited) {
         /*
-         * Skip-PERST# path: VL805 firmware already loaded by start4.elf.
-         * Read BAR0 directly from VL805 config space — this is the actual
-         * address the firmware assigned, which may differ from our default.
+         * Skip-PERST# path: VL805 firmware already loaded by start4.elf,
+         * USB power confirmed ON by mailbox.  Do NOT call any SET_POWER_STATE
+         * or NOTIFY_XHCI_RESET — either would trigger a VC-side USB reset.
+         *
+         * Read BAR0 for logging only (EXT_CFG on BCM2711 only forwards
+         * offsets 0x00 and 0x04 — BAR0 at 0x10 returns RC's own register,
+         * so this will read 0x00000000; that is fine, WIN0_LO already
+         * has 0x00000000 from pcie_setup_outbound_window()).
          */
         uart_puts("[VL805] Firmware already loaded by start4.elf — skipping mailbox\n");
         uint32_t bar0 = pci_read_config(&vl805_dev, 0x10) & 0xFFFFFFF0U;
@@ -727,12 +953,14 @@ static void pci_init_pi4(void) {
             asm volatile("dsb sy; isb" ::: "memory");
             uart_puts("[PCI] WIN0_LO updated to match firmware BAR\n");
         } else {
-            uart_puts("[VL805] BAR0 unreadable — keeping default 0xC0000000\n");
+            uart_puts("[VL805] BAR0 unreadable via EXT_CFG (expected on BCM2711) — WIN0_LO stays 0x00000000\n");
         }
     } else {
         /*
-         * PERST# path: mailbox call to reload VL805 firmware (needed on
-         * d03114 boards which have no SPI EEPROM).
+         * PERST# path: USB power was off or mailbox check failed.
+         * Call mbox_power_on_usb() FIRST (safe: power was off),
+         * then mbox_notify_xhci_reset() to reload VL805 firmware
+         * (needed on d03114 boards; silently ignored on c03112 EEPROM boards).
          */
         extern int vl805_init(void);
         vl805_init();
@@ -776,46 +1004,77 @@ static void pci_init_pi4(void) {
     /*
      * Step 6: Enable Memory Space + Bus Master in the VL805.
      *
-     * FLR (Function Level Reset) deliberately REMOVED.
+     * The VL805 MCU firmware needs Memory Space and Bus Master enabled before
+     * it can run its xHCI internal init (it DMAs to its own internal buffers
+     * over PCIe).  CNR is cleared by HCRST inside xhci_init.
      *
-     * The VL805 has already been reset twice before this point:
-     *   1. start4.elf issues XHCI-STOP + PCI0 reset at handoff
-     *   2. pcie_bring_up_link() issues PERST# which reloads SPI firmware
-     *
-     * Each reset causes the VL805 SPI firmware to run its own internal init
-     * sequence and post diagnostic events to an internal event ring, leaving
-     * USBSTS.EINT=1.  A third reset (FLR here) adds another round of firmware
-     * init, guaranteeing EINT=1 when xhci_init() runs HCRST.
-     *
-     * When RS=1 is set with EINT=1, the VL805 immediately tries to deliver
-     * the pending event using its internal stale ring pointer — not our ERSTBA.
-     * That DMA write targets an unmapped address → silent posted-write drop →
-     * VL805 internal watchdog fires → HSE at ~10µs, event ring empty.
-     *
-     * The VL805 is already in a clean post-SPI state after PERST#.  No FLR
-     * needed.  Just enable Memory Space + Bus Master and proceed.
+     * FLR deliberately skipped — VL805 already clean after PERST#.
      */
     uart_puts("[PCI] 1/4 (FLR skipped — VL805 already clean after PERST#)\n");
-
     uart_puts("[PCI] 2/4 Enable VL805 Memory Space + Bus Master\n");
-    uint32_t cmd = pci_read_config(&vl805_dev, 0x04);
-    uart_puts("[PCI] VL805 Command before: "); print_hex32(cmd); uart_puts("\n");
-    cmd |= (1U << 1) | (1U << 2);
-    pci_write_config(&vl805_dev, 0x04, cmd);
-    asm volatile("dsb sy; isb" ::: "memory");
-    delay_ms(20);
-    cmd = pci_read_config(&vl805_dev, 0x04);
-    uart_puts("[PCI] VL805 Command after:  "); print_hex32(cmd); uart_puts("\n");
+    {
+        uint32_t cmd = pci_read_config(&vl805_dev, 0x04);
+        uart_puts("[PCI] VL805 Command before: "); print_hex32(cmd); uart_puts("\n");
+        cmd |= (1U << 1) | (1U << 2);   /* Memory Space | Bus Master */
+        pci_write_config(&vl805_dev, 0x04, cmd);
+        asm volatile("dsb sy; isb" ::: "memory");
+        delay_ms(5);
+        cmd = pci_read_config(&vl805_dev, 0x04);
+        uart_puts("[PCI] VL805 Command after:  "); print_hex32(cmd); uart_puts("\n");
+    }
 
     /*
-     * Step 7: Map VL805 MMIO.
-     * CPU 0x600000000 -> PCI pci_bar (= VL805 BAR base).
-     * The xHCI capability registers begin at offset 0 of the BAR.
+     * Map MMIO before xhci_init.
      */
     uart_puts("[PCI] 3/4 Map MMIO (CPU 0x600000000 = PCI "); print_hex32(pci_bar);
     uart_puts(")\n");
     xhci_base = ioremap(VL805_BAR0_CPU, 0x10000);
     if (!xhci_base) { uart_puts("[PCI] ERROR: ioremap failed\n"); return; }
+
+    /*
+     * Wait for VL805 MCU cold-boot to complete.
+     *
+     * After mailbox power-on + Memory Space enable, the MCU runs its
+     * firmware init from SPI flash.  USBSTS.CNR (bit 11) stays set
+     * until the MCU finishes (~800ms on this board).
+     *
+     * We must NOT issue HCRST — that restarts the MCU init cycle and
+     * puts the MCU into a defensive state where it fights our ring
+     * pointers (overwrites CRCR/DCBAA, then asserts HCH+HSE ~60us
+     * after RS=1).  Instead we wait here for exactly ONE cold-boot
+     * cycle to complete, then xhci_init writes our rings on top of
+     * the warm/halted MCU state and sets RS=1.
+     *
+     * USBSTS is at: xhci_base + CAPLENGTH + 0x04
+     * CAPLENGTH is at byte 0 of the capability registers.
+     */
+    uart_puts("[VL805] Waiting for MCU cold-boot (CNR=0, up to 2000ms)...\n");
+    {
+        uint8_t caplength = readb(xhci_base);
+        volatile uint32_t *usbsts_reg =
+            (volatile uint32_t *)((uint8_t *)xhci_base + caplength + 0x04);
+        int cnr_cleared = 0;
+        for (int w = 0; w < 2000; w++) {
+            delay_ms(1);
+            if (!(*usbsts_reg & (1U << 11))) {
+                uart_puts("[VL805] MCU ready after ");
+                print_hex32(w + 1);
+                uart_puts("ms  USBSTS=");
+                print_hex32(*usbsts_reg);
+                uart_puts("\n");
+                cnr_cleared = 1;
+                break;
+            }
+        }
+        if (!cnr_cleared) {
+            uart_puts("[VL805] WARNING: CNR still set after 2000ms — proceeding\n");
+            uart_puts("[VL805] USBSTS="); print_hex32(*usbsts_reg); uart_puts("\n");
+        }
+    }
+
+    /* Wire MSI before xhci_init so the handler is registered before
+     * RS=1 is set. */
+    xhci_setup_msi();
 
     uart_puts("[PCI] 4/4 Full xHCI init\n");
     extern int xhci_init(uint64_t base_addr);
