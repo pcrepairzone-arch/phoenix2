@@ -2,82 +2,284 @@
 RISC OS PHOENIX KERNEL — xHCI DRIVER DEVELOPMENT JOURNAL
 ═══════════════════════════════════════════════════════════════
 
-SESSION: 2026-03-10  xHCI HSE root cause found + controller running
+HARDWARE
+═══════════════════════════════════════════════════════════════
+Board:       Raspberry Pi 4 (BCM2711 rev C0, boardrev d03114)
+Case:        DeskPi Pro
+USB device:  Port 2 — SS 5Gbps, CCS=1, PED=1 (DeskPi hub/SSD)
+xHCI:        VL805 via BCM2711 PCIe RC
+xHCI base:   CPU 0x0000000600000000 (PCIe BAR 0x00000000)
+CAPLENGTH:   0x20   HCIVERSION: 0x0100
+MaxSlots:    32     MaxPorts: 5     Scratchpads: 31
+PAGESIZE:    0x00000001 (4KB)
+
+Build:  aarch64-linux-gnu-gcc -Wall -O2 -ffreestanding
+        -mcpu=cortex-a72 -mgeneral-regs-only -nostdlib
+        -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp -DPI_MODEL=4
+
+Output files:
+  drivers/usb/usb_xhci.c   — xHCI driver (v35)
+  pci.c                     — PCIe RC + VL805 init
+  journal.txt               — this file
+
+Transcripts: /mnt/transcripts/  (see catalog below)
+
+
+DMA BUFFER LAYOUT
+═══════════════════════════════════════════════════════════════
+Region:  0x080b3000–0x080f5000  (Normal-NC, MMU identity map)
+Size:    0x42000 (264KB)
+Offset   Name             Size    Notes
+──────────────────────────────────────────────────────────────
+0x0000   DCBAA            2KB     Device Context Base Address Array
+0x0800   cmd_ring         1KB     64 TRBs x 16B
+0x0C00   evt_ring         1KB     64 TRBs x 16B
+0x1000   erst             16B     Event Ring Segment Table (1 entry)
+0x1040   scratch_arr      248B    31 x 8B scratch pointer array
+0x2000   scratch_pgs      124KB   31 x 4096B scratch pages
+0x21000  input_ctx        1088B   Input Context (CSZ=0, 32B entries)
+0x21500  out_ctx          1024B   Output Device Context
+0x21900  ep0_ring         1KB     EP0 transfer ring (64 TRBs)
+0x21D00  ep0_data         512B    EP0 data buffer
+
+Key constants:
+  DMA_OFFSET    = 0xC0000000ULL   (PCIe 0xC0000000 -> CPU 0x0)
+  CTX_ENTRY_SZ  = 32              (CSZ=0)
+  CMD_RING_TRBS = 64
+  EVT_RING_TRBS = 64
+
+
+SESSION 1: 2026-03-10  v1-v17  HSE root cause + controller running
 ═══════════════════════════════════════════════════════════════
 
 BREAKTHROUGH: Controller running as of v17.
 
-ROOT CAUSE OF HSE (all previous versions):
-After HCRST, the VL805 MCU re-runs its firmware init and posts events
-to its own internal ring, setting USBSTS.EINT. If RS=1 is written while
-EINT=1, the MCU delivers that pending event using its stale internal ring
-pointer (not our ERSTBA) → DMA to unmapped address → HSE in <1ms.
-Fix: poll until EINT+HSE both clear after HCRST, then tight register
-burst + RS=1 immediately. One millisecond wait was all it took.
+ROOT CAUSE OF HSE (all versions before v17):
+  After HCRST the VL805 MCU re-runs its firmware init and posts
+  events to its own internal ring, setting USBSTS.EINT.
+  Writing RS=1 while EINT=1 causes the MCU to deliver that
+  pending event using its stale internal ring pointer (not our
+  ERSTBA) -> DMA to unmapped address -> HSE in <1ms.
+  Fix: poll until EINT+HSE both clear after HCRST, then write
+  all ring registers in a tight burst and set RS=1 immediately.
 
-SECONDARY BUGS FIXED THIS SESSION:
-- v13: PAGESIZE register now read and validated (0x00000001 = 4KB OK)
-- v14: ERST address corruption fixed — s_erst computed from
-       xhci_dma_buf+DMA_ERST_OFF without (uint64_t) cast gave high
-       word 0x00000010. Fix: use erst pointer with explicit cast.
-- v15: HCRST reinstated (incorrectly skipped in v12)
-- v16: Port change bits cleared after HCRST. PORTSC dump added.
+Secondary bugs fixed v13-v16:
+  v13  PAGESIZE register read and validated (0x00000001 = 4KB OK)
+  v14  ERST address corruption — missing (uint64_t) cast on
+       xhci_dma_buf+DMA_ERST_OFF gave high word 0x00000010
+  v15  HCRST reinstated (incorrectly skipped in v12)
+  v16  Port change bits cleared after HCRST. PORTSC dump added.
        Revealed ports 0,1,2 have connected devices.
-- v17: THE FIX — EINT poll after HCRST + tight register burst
-       + retry loop on HCH only (CMD_HSEE=0, cosmetic HSE ignored)
+  v17  THE FIX — EINT poll after HCRST + tight register burst
+       + retry loop on HCH only (CMD_HSEE=0)
 
-v17 BOOT LOG CONFIRMS:
+v17 boot log confirms:
   [xHCI] MCU settled after 1ms  USBSTS=0x00000001
   [xHCI] attempt 1: USBCMD=0x00000004 USBSTS=0x00000005 RUNNING
   [xHCI] Controller running. USBSTS=0x00000001
 
-HARDWARE (DeskPi Pro case, Pi 4 boardrev c03112):
-  USB3 stick confirmed on Port 3 (Super 5Gbps, PED=1, U0)
-  Show target: USB keyboard + mouse (HID boot protocol)
-  M.2 500GB SSD via DeskPi breakout board
-  Full-size HDMI + front USB via DeskPi
 
-DMA BUFFER LAYOUT (our driver):
-  0x0000  DCBAA        2KB
-  0x0800  cmd_ring     1KB  (64 TRBs)
-  0x0C00  evt_ring     1KB  (64 TRBs)
-  0x1000  erst         64B
-  0x1040  scratch_arr  31×8B
-  0x2000  scratch_pgs  31×4KB = 0x1F000
-  Total:  0x21000 — fits in 0x42000 buffer
-  MMU:    0x080b2000–0x080f4000, Normal-NC
+SESSION 2: 2026-03-12  v18-v35  Enumeration stack + CNR deadlock
+═══════════════════════════════════════════════════════════════
 
-  Friend's driver adds (needed for enumeration):
-  0x1240  input_ctx    1088B
-  0x16C0  out_ctx      1024B
-  0x1AC0  ep0_ring     1024B  (64 TRBs)
-  0x1EC0  ep0_data     512B
+GOAL: Graft friend's enumeration stack (Enable Slot, Address
+Device, GET_DESCRIPTOR) onto the running controller, plus add
+MSI interrupt support.
 
-KEY CONSTANTS:
-  DMA_OFFSET   = 0xC0000000ULL
-  RC_BAR2_LO   = 0xC0000012   (PCIe 0xC0000000–0xFFFFFFFF → CPU 0x0)
-  xHCI base    = 0x0000000600000000
-  CAPLENGTH    = 0x20, HCIVERSION = 0x0100
-  MaxSlots=32, MaxPorts=5, Scratchpads=31
-  PAGESIZE reg = 0x00000001 (4KB)
+── pci.c fixes ──────────────────────────────────────────────
 
-NEXT STEPS FOR SHOW:
-  1. Graft enumeration stack onto v17
-     (port_scan, port_reset, Enable Slot, Address Device,
-      GET_DESCRIPTOR, string descriptors, VID/PID)
-  2. HID boot protocol — no descriptor parse needed:
-     SET_PROTOCOL(0), poll GET_REPORT every 10ms
+Fix 1 — RGR1 write ordering (root cause of intermittent PERST#)
+  start4.elf leaves RGR1=0x00000003.
+  Writing MISC_CTRL while RGR1=0x3 silently drops the write
+  (SCB_ACCESS_EN=0), causing PERST# every boot.
+  Fix: clear RGR1 bit 1 first, wait 1ms, then write MISC_CTRL.
+
+Fix 2 — Mailbox GET_POWER_STATE guard
+  Calling SET_POWER_STATE when USB is already ON causes the VC
+  to reset the VL805 MCU mid-init.
+  Fix: call mbox_get_power_state() first; skip all mailbox
+  calls if USB already ON.
+
+Fix 3 — Memory Space ordering
+  VL805 Command already reads 0x10100146 after firmware load
+  (firmware sets Memory Space + Bus Master itself).
+  Our write is harmless but the ordering is critical — Memory
+  Space must be enabled BEFORE the CNR poll or the MCU stalls.
+
+Fix 4 — MSI setup: xhci_setup_msi() in pci.c
+  Walks VL805 PCIe cap list to MSI cap (ID=0x05, offset 0x90).
+  Programs MISC_MSI_BAR_CONFIG_LO/HI with PCIe target address
+  (xhci_dma_phys() + 0x1000 + 0xC0000000).
+  Sets MSI Enable bit in cap dword (bit 16).
+  irq_set_handler(180, xhci_irq_handler, NULL).
+  irq_unmask(180) -> GICD_ISENABLER[5] bit 20.
+  Falls back to INTx (INTID 175) if MSI cap not found.
+
+── usb_xhci.c enumeration code ─────────────────────────────
+
+Added between v18-v30 (friend's stack grafted in):
+  cmd_ring_submit()     — submit TRB to command ring + doorbell
+  xhci_wait_event()     — spin on pending_event_ready flag
+  xhci_irq_handler()    — drain event ring on MSI, set flag
+  xhci_dma_phys()       — return DMA buf physical base for MSI
+  cmd_enable_slot()     — Enable Slot command + wait event
+  cmd_address_device()  — setup input context, Address Device
+  do_get_descriptor()   — EP0 transfer ring, GET_DESCRIPTOR
+
+Bug: TRB_TC on command TRBs
+  cmd_ring[b+3] had TRB_TC set on every TRB.
+  TRB_TC (Toggle Cycle) belongs ONLY on the Link TRB.
+  Fix: normal TRBs -> (type << TRB_TYPE_SHIFT) | cmd_cycle
+       Link TRB only -> add TRB_TC.
+
+Bug: No CRCR re-write before doorbell
+  VL805 MCU can zero CRCR between ring setup and doorbell.
+  Fix: re-write CRCR (cmd_ring_dma | cycle | RCS) immediately
+  before db[0]=0 with dsb sy; isb fence between the two.
+
+Bug: IRQ handler missing cycle bit check
+  Events consumed without checking ev_ptr[3] & 1 vs evt_cycle.
+  Stale TRBs from previous ring cycle treated as valid.
+  Fix: check (ev_ptr[3] & 1) != evt_cycle before consuming.
+  Toggle evt_cycle when evt_dequeue wraps (prevents drift).
+
+── The CNR deadlock saga (v31-v35) ──────────────────────────
+
+SYMPTOM: xhci_init failed silently after MaxSlots/MaxPorts
+printed, with no further output from do_reset().
+
+The problem was a pre-HCRST CNR poll in do_reset().  On VL805
+cold boot CNR=1 always before HCRST, so the poll spun 2000ms
+then returned -1.  This led to a series of wrong fixes:
+
+  v32: Removed pre-HCRST CNR poll. Added HCRST.
+       Result: HCRST timed out (USBSTS=0x00000815 after 5s).
+
+  v33: Switched to direct write CMD_HCRST (no RMW).
+       Added two-stage poll: wait HCRST bit clear, then CNR.
+       Result: HCRST bit never cleared (stuck for 500ms).
+
+  v34: Kept direct write, added USBCMD readback diagnostic.
+       Readback showed 0x00000002 (bit set correctly) but
+       HCRST bit still never self-cleared after 500ms.
+
+ROOT CAUSE (from earlier session transcript):
+  HCRST on VL805 triggers a SECOND MCU firmware init cycle.
+  After that second init the MCU treats our ring pointers as
+  "foreign" (it didn't write them) and fires its watchdog:
+  overwrites CRCR/DCBAA, asserts HCH+HSE ~60us after RS=1.
+  This was actually the same root cause as the HSE in Session 1.
+  Session 1's "fix" (EINT poll) worked by accident.
+
+  Linux xhci_pci never hits this because it runs on a VL805
+  that start4.elf already warmed up and parked cleanly.
+  We power-cycle via mailbox, forcing a cold boot that Linux
+  never sees.
+
+CORRECT SEQUENCE FOR VL805 COLD BOOT:
+  1. Mailbox power-on
+  2. Enable Memory Space + Bus Master
+  3. ioremap MMIO
+  4. Poll CNR in pci.c (MCU cold-boot settle window)
+  5. xhci_setup_msi()
+  6. xhci_init() — NO HCRST, just clear stale status bits
+
+BOARD-SPECIFIC DISCOVERY (boardrev d03114):
+  CNR NEVER clears on this board during cold boot.
+  USBSTS stays 0x00000805 (HCH+HSE+CNR) throughout.
+  This is NORMAL. The MCU IS running.
+  MMIO reads work, PAGESIZE=1, RS=1 succeeds without HSE.
+  Always proceed past the CNR poll timeout — it is not an error.
+
+v35 RESULT — FIRST SUCCESSFUL BOOT (2026-03-12):
+  [VL805] CNR did not clear (expected on this board) — proceeding
+  [VL805] USBSTS=0x00000805
+  [xHCI] driver v35 init base=0x0000000600000000
+  [xHCI] CAPLENGTH=0x20  HCIVERSION=0x0100
+  [xHCI] MaxSlots=32  MaxPorts=5  Scratchpads=31
+  [xHCI] do_reset: USBSTS=0x00000805  USBCMD=0x00000000
+  [xHCI] do_reset done. USBSTS=0x00000801
+  [xHCI] PAGESIZE reg = 0x00000001 (4KB OK)
+  [xHCI] Waiting for MCU to settle...
+  [xHCI] Controller launched
+  [xHCI] Port scan (5 port(s)):
+  [USB] Host controller registered
+  xHCI online — USB ready
+
+
+CURRENT STATE (v35)
+═══════════════════════════════════════════════════════════════
+WORKING:
+  [x] PCIe link up (PERST# reset, 100ms settle)
+  [x] VL805 firmware loaded via mailbox
+  [x] Memory Space + Bus Master enabled
+  [x] MMIO mapped (CPU 0x600000000)
+  [x] MSI armed (GIC INTID 180, irq_handler registered)
+  [x] Controller running (RS=1, no HSE)
+  [x] Port scan running (5 ports detected)
+  [x] HC ops registered with USB subsystem
+
+NOT YET CONFIRMED (port scan output cut off in log):
+  [ ] Port 2 CONNECTED Super 5Gbps detected
+  [ ] Enable Slot command completing via xhci_wait_event
+  [ ] Address Device completing
+  [ ] GET_DESCRIPTOR returning data
+
+NEXT STEPS:
+  1. Capture full boot log past port scan line
+  2. If Enable Slot hangs -> check MSI delivery / xhci_wait_event
+     fallback to evt_ring_poll on timeout
+  3. If GET_DESCRIPTOR returns data -> parse VID/PID/class
+  4. HID boot protocol: SET_PROTOCOL(0), poll GET_REPORT 10ms
      8-byte boot report: [modifier, 0, key0..key5]
-  3. Decode keycodes → ASCII → framebuffer text output
-  4. Mouse: same approach, 3-4 byte boot report
+  5. Decode keycodes -> ASCII -> framebuffer text output
 
-UPLOAD PRIORITY (do one at a time):
-  usb.c / usb.h — USB core, usb_enumerate_device()
-  usb_hid.c     — HID class driver (if exists)
-  kernel.h      — type definitions, virt_to_phys etc
-  framebuffer text layer — for on-screen key echo
 
-OUTPUT FILES:
-  usb_xhci.c  — v17, controller running, no enumeration yet
-  journal.txt — this file
+KEY RULES FOR FUTURE DEVELOPERS
+═══════════════════════════════════════════════════════════════
+
+1. NEVER issue HCRST on VL805 cold boot.
+   It triggers a second MCU init cycle. The MCU will then
+   fight your ring pointers and assert HSE ~60us after RS=1.
+   If you issue HCRST and it appears to work, it is working
+   by accident and will break under different timing.
+
+2. CNR will NOT clear on this board (boardrev d03114).
+   USBSTS=0x00000805 throughout cold boot is NORMAL.
+   Always proceed past the CNR poll — it is not an error.
+   Do not return -1 from xhci_init if CNR is set.
+
+3. Memory Space must be enabled BEFORE calling xhci_init.
+   The MCU needs it to DMA to its own internal buffers.
+   Correct sequence: power-on -> Memory Space -> ioremap
+   -> CNR poll -> xhci_setup_msi -> xhci_init.
+
+4. Do NOT read-modify-write USBCMD while CNR=1.
+   USBCMD readback is unreliable during cold boot on VL805.
+   If you ever need to write USBCMD, write the value directly.
+
+5. TRB_TC (Toggle Cycle) belongs ONLY on the Link TRB.
+   Never set it on normal command TRBs — it corrupts dword 3
+   and the controller will misparse the TRB type.
+
+6. Re-write CRCR immediately before ringing doorbell[0].
+   The VL805 MCU can zero CRCR in the window between ring
+   setup and the doorbell. Use dsb sy; isb between the CRCR
+   write and db[0]=0.
+
+7. Check cycle bit in xhci_irq_handler before consuming.
+   (ev_ptr[3] & 1) must equal evt_cycle. Toggle evt_cycle
+   when evt_dequeue wraps to avoid drift across ring passes.
+
+8. RGR1 must be cleared before writing MISC_CTRL.
+   start4.elf leaves RGR1=0x3. Write to MISC_CTRL with RGR1
+   bit 1 set is silently dropped. Clear RGR1 bit 1 first.
+
+
+TRANSCRIPT CATALOG
+═══════════════════════════════════════════════════════════════
+2026-03-12-10-42-23-pi4-xhci-vl805-v32-cnr-hcrst-fix.txt
+  Session 2 full transcript.
+  Covers: CNR/HCRST investigation v32-v35, enumeration code
+  review, all pci.c and usb_xhci.c fixes, first successful boot.
 ═══════════════════════════════════════════════════════════════
