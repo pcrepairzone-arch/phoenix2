@@ -1,0 +1,54 @@
+# Build outputs
+*.o
+*.elf
+*.img
+*.bin
+phoenix64.img
+kernel8.img
+build.log
+
+# Old / scratch files
+old/
+old xchi files/
+bootlogs/
+latest boot files/
+phoenix_fixed/
+phoenix_fixed.zip
+end of log chat on the mac.rtfd/
+*.rtf
+*.rtfd
+
+# Boot logs (keep only latest; archive externally)
+bootlog*.txt
+newbootlog.txt
+piosbootlog.txt
+
+# Scratch / notes / diffs
+diff1
+diff2.txt
+grap.txt
+one more.txt
+Selection1
+TextFile
+ls\ -lh\ of\ phoenix_fixed3
+ls\ of\ my\ sd\ card.txt
+*.txt.linux*
+*.c.linux*
+build\ test\ results.txt
+quirks.c.txt
+linker.ld\ *
+riscc\ os\ config.txt
+
+# macOS
+.DS_Store
+
+# Standalone copies of source (use files in subdirs)
+/usb_xhci.c
+xhci-pci.c.linux.text
+xhci.clinux.txt
+/pci.c
+test_mmc.c
+
+# Kernel binaries
+kernel.elf
+kernel8\ copy.img

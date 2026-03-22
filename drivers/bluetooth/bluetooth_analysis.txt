@@ -1,0 +1,72 @@
+BLUETOOTH DRIVER ANALYSIS - BTSdioTypeA
+========================================
+
+GOOD PARTS (can reuse):
+-----------------------
+✓ Ring buffer implementation - clean and efficient
+✓ HCI packet type definitions (command/ACL/SCO/event)
+✓ Intel HEX parser for firmware loading
+✓ L2CAP/RFCOMM state machine logic
+✓ Pairing mode handling (Just-Works / Legacy PIN)
+✓ BCM4345C0 device IDs and initialization sequence
+
+PROBLEMATIC PARTS (need replacement):
+--------------------------------------
+✗ _swix() calls - RISC OS kernel services
+✗ SDIODriver module dependency - need bare-metal SDIO driver
+✗ DeviceFS - need VFS integration
+✗ OS_Find/OS_GBPB file I/O - need our VFS layer
+✗ _kernel_oswrch for debug - use our uart_putc
+✗ malloc() without initialization - need our heap
+
+MISSING INFRASTRUCTURE:
+-----------------------
+1. SDIO Host Controller Driver
+   - BCM2711 EMMC2 peripheral (0xFE340000)
+   - WiFi/BT combo chip on SDIO bus
+   - CMD/DATA transfer, interrupts
+
+2. Firmware File Access
+   - Need to read BCM4345C0.hcd from SD card
+   - Or embed firmware in kernel binary
+
+3. IRQ Handler
+   - SDIO card interrupt
+   - Data available notification
+
+ADAPTATION PLAN:
+----------------
+
+Phase 1: SDIO Infrastructure (NEW FILES)
+  drivers/sdio/sdio_host.c   - BCM2711 EMMC2 controller
+  drivers/sdio/sdio_core.c   - SDIO protocol layer
+  drivers/sdio/sdio.h        - SDIO interface
+
+Phase 2: Bluetooth Adaptation (REWRITE)
+  drivers/bluetooth/bt_sdio.c    - SDIO transport layer
+  drivers/bluetooth/bt_hci.c     - HCI command/event
+  drivers/bluetooth/bt_l2cap.c   - L2CAP protocol
+  drivers/bluetooth/bt_rfcomm.c  - RFCOMM (serial profile)
+  drivers/bluetooth/bt_core.c    - Core BT stack
+
+Phase 3: Device Interface
+  /dev/bluetooth0  - HCI device
+  /dev/rfcomm0     - Serial-over-BT
+
+IMMEDIATE ACTION:
+-----------------
+The driver is well-structured but needs complete rewrite of:
+1. Hardware layer (SDIO)
+2. OS service calls (file I/O, memory, debug)
+3. Device model (VFS integration)
+
+This is a MAJOR subsystem - estimate 2000+ lines of new code.
+
+RECOMMENDATION:
+---------------
+1. First: Get keyboard/mouse working (more critical)
+2. Then: Build SDIO host driver (enables WiFi too)
+3. Finally: Port Bluetooth stack
+
+Let me create a minimal SDIO stub and adapted BT skeleton
+to show the structure, even if not fully functional yet.
