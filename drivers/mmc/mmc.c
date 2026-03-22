@@ -73,13 +73,33 @@ static mmc_host_t mmc_host;
 #define ACMD41_SD_APP_OP_COND   41
 #define ACMD51_SEND_SCR         51
 
-/* Response types */
-#define RESP_NONE   0x00
-#define RESP_R1     0x1A  /* Normal response */
-#define RESP_R2     0x09  /* CID, CSD register */
-#define RESP_R3     0x02  /* OCR register */
-#define RESP_R6     0x1A  /* Published RCA response */
-#define RESP_R7     0x1A  /* Card interface condition */
+/* Response types (COMMAND register bits [4:0]) */
+#define RESP_NONE   0x00  /* No response                        */
+#define RESP_R1     0x1A  /* 48-bit, CRC + index check          */
+#define RESP_R2     0x09  /* 136-bit CID/CSD, CRC check         */
+#define RESP_R3     0x02  /* 48-bit OCR, no checks              */
+#define RESP_R6     0x1A  /* Published RCA response             */
+#define RESP_R7     0x1A  /* Card interface condition           */
+
+/*
+ * COMMAND register bit 5 — DATA_PRESENT_SELECT.
+ * Set this for commands that have a data phase (CMD17/18/24/25).
+ * Without it the SDHCI will not drive the data lines or post
+ * BUFFER_READ_READY / BUFFER_WRITE_READY status bits.
+ */
+#define CMD_DATA_PRESENT    (1 << 5)
+
+/*
+ * TRANSFER_MODE register bits (16-bit, offset 0x0C lower half).
+ * TRANSFER_MODE and COMMAND must ALWAYS be written together as a
+ * single 32-bit write to SDHCI_TRANSFER_MODE (0x0C).
+ * Writing to SDHCI_COMMAND (0x0E) as a 32-bit access is an unaligned
+ * Device-memory write on AArch64 and will cause an alignment fault.
+ */
+#define TMODE_DMA_EN        (1 << 0)  /* 0 = PIO (we use PIO)          */
+#define TMODE_BCEN          (1 << 1)  /* Block count enable            */
+#define TMODE_READ          (1 << 4)  /* 1 = card→host (read)          */
+#define TMODE_MULTI         (1 << 5)  /* Multi-block transfer          */
 
 /* Helper: read SDHCI register */
 static inline uint32_t sdhci_read(uint32_t offset)
@@ -164,18 +184,31 @@ static int sdhci_wait_data_ready(void)
     return timeout > 0 ? 0 : -1;
 }
 
-/* Send SD command */
-static int mmc_send_cmd(uint32_t cmd, uint32_t arg, uint32_t *response)
+/*
+ * mmc_send_cmd — issue one SD/MMC command.
+ *
+ * @xfer_mode  TMODE_* bits for data commands; 0 for non-data commands.
+ *             For read commands pass TMODE_READ (and TMODE_MULTI|TMODE_BCEN
+ *             for multi-block).  For write commands pass TMODE_MULTI|TMODE_BCEN
+ *             if multi-block; 0 for single-block write.
+ *
+ * SDHCI_TRANSFER_MODE (0x0C) and SDHCI_COMMAND (0x0E) must be written as
+ * one 32-bit store to the aligned address 0x0C.  Writing to 0x0E directly
+ * is an unaligned Device-memory access and causes an alignment fault on
+ * AArch64.
+ */
+static int mmc_send_cmd(uint32_t cmd, uint32_t arg,
+                        uint32_t *response, uint16_t xfer_mode)
 {
     uint32_t cmd_reg;
     uint32_t resp_type;
-    
+
     /* Wait for command line ready */
     if (sdhci_wait_cmd_ready() < 0) {
         debug_print("MMC: CMD%d timeout waiting for ready\n", cmd & 0x3F);
         return -1;
     }
-    
+
     /* Determine response type */
     switch (cmd) {
         case CMD0_GO_IDLE_STATE:
@@ -195,18 +228,26 @@ static int mmc_send_cmd(uint32_t cmd, uint32_t arg, uint32_t *response)
             resp_type = RESP_R1;
             break;
     }
-    
+
     /* Write argument */
     sdhci_write(SDHCI_ARGUMENT, arg);
-    
-    /* Build command register */
+
+    /* Build command register.
+     * Set DATA_PRESENT_SELECT for commands that transfer data over DAT lines. */
     cmd_reg = ((cmd & 0x3F) << 8) | resp_type;
-    
+    if (xfer_mode != 0)
+        cmd_reg |= CMD_DATA_PRESENT;
+
     /* Clear interrupt status */
     sdhci_write(SDHCI_INT_STATUS, 0xFFFFFFFF);
-    
-    /* Issue command */
-    sdhci_write(SDHCI_COMMAND, cmd_reg);
+
+    /*
+     * Issue command — combined 32-bit write to SDHCI_TRANSFER_MODE (0x0C).
+     * Lower 16 bits = TRANSFER_MODE, upper 16 bits = COMMAND.
+     * This is the only correctly-aligned way to reach the COMMAND register.
+     */
+    sdhci_write(SDHCI_TRANSFER_MODE,
+                ((uint32_t)cmd_reg << 16) | (uint32_t)xfer_mode);
     
     /* Wait for command complete */
     int timeout = 10000;
@@ -250,16 +291,12 @@ static int mmc_send_cmd(uint32_t cmd, uint32_t arg, uint32_t *response)
     return 0;
 }
 
-/* Send application command (CMD55 + ACMD) */
+/* Send application command (CMD55 + ACMD) — both are non-data, xfer_mode=0 */
 static int mmc_send_app_cmd(uint32_t acmd, uint32_t arg, uint32_t *response)
 {
-    /* Send CMD55 first */
-    if (mmc_send_cmd(CMD55_APP_CMD, mmc_host.rca << 16, NULL) < 0) {
+    if (mmc_send_cmd(CMD55_APP_CMD, mmc_host.rca << 16, NULL, 0) < 0)
         return -1;
-    }
-    
-    /* Then send the actual ACMD */
-    return mmc_send_cmd(acmd, arg, response);
+    return mmc_send_cmd(acmd, arg, response, 0);
 }
 
 /* Reset SD controller */
@@ -360,11 +397,11 @@ int mmc_init(void)
     
     debug_print("MMC: Clock enabled\n");
     
-    /* CMD0: GO_IDLE_STATE */
-    mmc_send_cmd(CMD0_GO_IDLE_STATE, 0, NULL);
-    
-    /* CMD8: SEND_IF_COND (SD 2.0+ voltage check) */
-    if (mmc_send_cmd(CMD8_SEND_IF_COND, 0x1AA, response) == 0) {
+    /* CMD0: GO_IDLE_STATE — no response, no data */
+    mmc_send_cmd(CMD0_GO_IDLE_STATE, 0, NULL, 0);
+
+    /* CMD8: SEND_IF_COND (SD 2.0+ voltage check) — no data */
+    if (mmc_send_cmd(CMD8_SEND_IF_COND, 0x1AA, response, 0) == 0) {
         if ((response[0] & 0xFF) == 0xAA) {
             debug_print("MMC: SD 2.0+ card detected\n");
             mmc_host.version = 2;
@@ -401,23 +438,23 @@ int mmc_init(void)
         return -1;
     }
     
-    /* CMD2: ALL_SEND_CID */
-    if (mmc_send_cmd(CMD2_ALL_SEND_CID, 0, response) < 0) {
+    /* CMD2: ALL_SEND_CID — no data */
+    if (mmc_send_cmd(CMD2_ALL_SEND_CID, 0, response, 0) < 0) {
         debug_print("MMC: Failed to get CID\n");
         return -1;
     }
-    
-    /* CMD3: SEND_RELATIVE_ADDR */
-    if (mmc_send_cmd(CMD3_SEND_RELATIVE_ADDR, 0, response) < 0) {
+
+    /* CMD3: SEND_RELATIVE_ADDR — no data */
+    if (mmc_send_cmd(CMD3_SEND_RELATIVE_ADDR, 0, response, 0) < 0) {
         debug_print("MMC: Failed to get RCA\n");
         return -1;
     }
-    
+
     mmc_host.rca = response[0] >> 16;
     debug_print("MMC: RCA = 0x%x\n", mmc_host.rca);
-    
-    /* CMD9: SEND_CSD (get card capacity) */
-    if (mmc_send_cmd(CMD9_SEND_CSD, mmc_host.rca << 16, response) < 0) {
+
+    /* CMD9: SEND_CSD (get card capacity) — R2 response, no DAT lines */
+    if (mmc_send_cmd(CMD9_SEND_CSD, mmc_host.rca << 16, response, 0) < 0) {
         debug_print("MMC: Failed to get CSD\n");
         return -1;
     }
@@ -437,14 +474,14 @@ int mmc_init(void)
     
     debug_print("MMC: Capacity = %llu MB\n", (mmc_host.capacity * 512) / (1024 * 1024));
     
-    /* CMD7: SELECT_CARD */
-    if (mmc_send_cmd(CMD7_SELECT_CARD, mmc_host.rca << 16, NULL) < 0) {
+    /* CMD7: SELECT_CARD — no data */
+    if (mmc_send_cmd(CMD7_SELECT_CARD, mmc_host.rca << 16, NULL, 0) < 0) {
         debug_print("MMC: Failed to select card\n");
         return -1;
     }
-    
-    /* Set block size to 512 bytes */
-    if (mmc_send_cmd(CMD16_SET_BLOCKLEN, 512, NULL) < 0) {
+
+    /* CMD16: SET_BLOCKLEN — no data */
+    if (mmc_send_cmd(CMD16_SET_BLOCKLEN, 512, NULL, 0) < 0) {
         debug_print("MMC: Failed to set block size\n");
         return -1;
     }
@@ -485,9 +522,13 @@ int mmc_read_blocks(uint32_t start_block, uint32_t num_blocks, void *buffer)
     sdhci_write(SDHCI_BLOCK_SIZE,
                 ((uint32_t)num_blocks << 16) | (512 | (7 << 12)));
 
-    /* Send read command */
+    /* Send read command with TRANSFER_MODE:
+     *   TMODE_READ  — data direction card→host
+     *   TMODE_MULTI + TMODE_BCEN — enable block counter for multi-block */
     uint32_t cmd = (num_blocks == 1) ? CMD17_READ_SINGLE_BLOCK : CMD18_READ_MULTIPLE_BLOCK;
-    if (mmc_send_cmd(cmd, addr, NULL) < 0) {
+    uint16_t xm  = (num_blocks == 1) ? TMODE_READ
+                                      : (TMODE_READ | TMODE_MULTI | TMODE_BCEN);
+    if (mmc_send_cmd(cmd, addr, NULL, xm) < 0) {
         return -1;
     }
     
@@ -542,8 +583,12 @@ int mmc_write_blocks(uint32_t start_block, uint32_t num_blocks, const void *buff
     sdhci_write(SDHCI_BLOCK_SIZE,
                 ((uint32_t)num_blocks << 16) | (512 | (7 << 12)));
 
+    /* Send write command with TRANSFER_MODE:
+     *   direction bit clear — host→card (write)
+     *   TMODE_MULTI + TMODE_BCEN for multi-block */
     uint32_t cmd = (num_blocks == 1) ? CMD24_WRITE_SINGLE_BLOCK : CMD25_WRITE_MULTIPLE_BLOCK;
-    if (mmc_send_cmd(cmd, addr, NULL) < 0) {
+    uint16_t xm  = (num_blocks == 1) ? 0 : (TMODE_MULTI | TMODE_BCEN);
+    if (mmc_send_cmd(cmd, addr, NULL, xm) < 0) {
         return -1;
     }
     
