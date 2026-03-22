@@ -7,6 +7,7 @@
 
 #include "kernel.h"
 #include "mmc.h"
+#include "blockdriver.h"   /* blockdev_register(), blockdev_ops_t */
 
 /* Global MMC state - keep it simple */
 static mmc_host_t mmc_host;
@@ -15,8 +16,13 @@ static mmc_host_t mmc_host;
 #define MMIO_READ(addr)   (*(volatile uint32_t*)(addr))
 #define MMIO_WRITE(addr, val) (*(volatile uint32_t*)(addr) = (val))
 
-/* Pi 4: EMMC2 (SD card slot) */
-#define SDHCI_BASE      0xFE340000ULL
+/*
+ * EMMC2 is at peripheral_base + 0x340000.
+ * peripheral_base is set by detect_peripheral_base() before mmc_init() runs,
+ * so this resolves correctly for both Pi 4 (0xFE000000) and Pi 5 (0x107C000000).
+ * DO NOT use a hardcoded 0xFE340000 — it breaks on Pi 5.
+ */
+#define EMMC2_OFFSET    0x340000ULL
 
 /* SDHCI Register offsets */
 #define SDHCI_DMA_ADDRESS       0x00
@@ -274,6 +280,35 @@ static void sdhci_reset(void)
     debug_print("MMC: Reset %s\n", timeout > 0 ? "OK" : "TIMEOUT");
 }
 
+/* ── Block device ops ────────────────────────────────────────────────────────
+ * Thin wrappers so the blockdriver layer can call mmc_read/write_blocks.
+ * mmc_read_blocks / mmc_write_blocks return 0 on success; blockdev_ops_t
+ * expects bytes-transferred on success or -1 on error.
+ */
+static ssize_t mmc_bd_read(blockdev_t *dev, uint64_t lba,
+                           uint32_t count, void *buf)
+{
+    (void)dev;
+    return mmc_read_blocks((uint32_t)lba, count, buf) == 0
+           ? (ssize_t)(count * 512) : -1;
+}
+
+static ssize_t mmc_bd_write(blockdev_t *dev, uint64_t lba,
+                            uint32_t count, const void *buf)
+{
+    (void)dev;
+    return mmc_write_blocks((uint32_t)lba, count, (void *)buf) == 0
+           ? (ssize_t)(count * 512) : -1;
+}
+
+static blockdev_ops_t mmc_bd_ops = {
+    .read  = mmc_bd_read,
+    .write = mmc_bd_write,
+    .trim  = NULL,
+    .poll  = NULL,
+    .close = NULL,
+};
+
 /* Initialize SD card */
 int mmc_init(void)
 {
@@ -282,8 +317,8 @@ int mmc_init(void)
     
     debug_print("MMC: Initializing SD host controller\n");
     
-    /* Set up host structure */
-    mmc_host.base = SDHCI_BASE;
+    /* Set up host structure — base address from board detection */
+    mmc_host.base = peripheral_base + EMMC2_OFFSET;
     mmc_host.rca = 0;
     mmc_host.capacity = 0;
     mmc_host.block_size = 512;
@@ -414,6 +449,16 @@ int mmc_init(void)
         return -1;
     }
     
+    /* Register with the block device layer — see mmc_bd_* below */
+    blockdev_t *bd = blockdev_register("mmc", mmc_host.capacity, 512);
+    if (bd) {
+        bd->ops = &mmc_bd_ops;
+        debug_print("MMC: Registered as block device unit %d (%llu blocks)\n",
+                    bd->unit, mmc_host.capacity);
+    } else {
+        debug_print("MMC: blockdev_register failed\n");
+    }
+
     debug_print("MMC: Initialization complete\n");
     return 0;
 }
@@ -433,10 +478,13 @@ int mmc_read_blocks(uint32_t start_block, uint32_t num_blocks, void *buffer)
         return -1;
     }
     
-    /* Set block size and count */
-    sdhci_write(SDHCI_BLOCK_SIZE, 512 | (7 << 12));  /* 512 bytes, no DMA boundary */
-    sdhci_write(SDHCI_BLOCK_COUNT, num_blocks);
-    
+    /* Set block size and count in one 32-bit write to 0x04.
+     * Lower 16 bits → BLOCK_SIZE: 512 bytes, SDMA boundary = 512KB (7<<12)
+     * Upper 16 bits → BLOCK_COUNT: number of blocks to transfer.
+     * Writing them atomically avoids an unaligned 32-bit write to 0x06. */
+    sdhci_write(SDHCI_BLOCK_SIZE,
+                ((uint32_t)num_blocks << 16) | (512 | (7 << 12)));
+
     /* Send read command */
     uint32_t cmd = (num_blocks == 1) ? CMD17_READ_SINGLE_BLOCK : CMD18_READ_MULTIPLE_BLOCK;
     if (mmc_send_cmd(cmd, addr, NULL) < 0) {
@@ -490,9 +538,10 @@ int mmc_write_blocks(uint32_t start_block, uint32_t num_blocks, const void *buff
         return -1;
     }
     
-    sdhci_write(SDHCI_BLOCK_SIZE, 512 | (7 << 12));
-    sdhci_write(SDHCI_BLOCK_COUNT, num_blocks);
-    
+    /* Same combined 32-bit write as mmc_read_blocks — see comment there */
+    sdhci_write(SDHCI_BLOCK_SIZE,
+                ((uint32_t)num_blocks << 16) | (512 | (7 << 12)));
+
     uint32_t cmd = (num_blocks == 1) ? CMD24_WRITE_SINGLE_BLOCK : CMD25_WRITE_MULTIPLE_BLOCK;
     if (mmc_send_cmd(cmd, addr, NULL) < 0) {
         return -1;

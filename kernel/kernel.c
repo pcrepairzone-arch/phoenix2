@@ -40,6 +40,7 @@ extern void timer_init_cpu(void);       /* kernel/timer.c           */
 extern void pci_init(void);             /* kernel/pci.c             */
 
 extern int usb_init(void);
+extern int mmc_init(void);              /* drivers/mmc/mmc.c        */
 extern void vfs_init(void);             /* kernel/vfs.c (stub)      */
 extern void filecore_init(void);        /* kernel/filecore.c (stub) */
 extern void net_init(void);             /* net/tcpip.c (stub)       */
@@ -145,18 +146,25 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("sched_init_cpu returned OK\n");
     debug_print("Scheduler initialized for %d CPUs\n\n", nr_cpus);
 
-    /* [7/9] PCI bus */
-    debug_print("\n[7/9] PCI bus...\n");
+    /* [7/10] PCI bus */
+    debug_print("\n[7/10] PCI bus...\n");
     pci_init();
     debug_print("PCI ready\n");
 
-    /* [8/9] USB subsystem */
-    debug_print("\n[8/9] USB subsystem...\n");
+    /* [8/10] USB subsystem */
+    debug_print("\n[8/10] USB subsystem...\n");
     usb_init();
     debug_print("USB ready\n");
 
-    /* [9/9] VFS + Network + Signals */
-    debug_print("\n[9/9] VFS / Network / Signals...\n");
+    /* [9/10] MMC / SD card */
+    debug_print("\n[9/10] MMC / SD card...\n");
+    if (mmc_init() == 0)
+        debug_print("MMC ready\n");
+    else
+        debug_print("MMC: no card or init failed (continuing)\n");
+
+    /* [10/10] VFS + Network + Signals */
+    debug_print("\n[10/10] VFS / Network / Signals...\n");
     vfs_init();
     filecore_init();
     net_init();
