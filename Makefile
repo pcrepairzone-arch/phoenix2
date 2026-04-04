@@ -74,6 +74,9 @@ OBJS = \
     drivers/usb/usb_xhci.o \
     drivers/usb/usb_core.o \
     drivers/usb/usb_hid.o \
+    drivers/usb/usb_dwc2.o \
+    drivers/usb/usb_init.o \
+    drivers/input/input_stub.o \
     drivers/gpu/mailbox.o \
     drivers/gpu/mailbox_property.o \
     drivers/gpu/mailbox_test.o \

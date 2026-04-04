@@ -296,7 +296,7 @@ int usb_enumerate_device(usb_device_t *dev, int port) {
  *
  * @return 0 always (failures are logged but non-fatal at subsystem level)
  */
-int usb_init(void) {
+int usb_core_init(void) {
     uart_puts("[USB] Initialising USB subsystem\n");
 
     /* Register class drivers — must happen before port_scan.

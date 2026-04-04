@@ -128,11 +128,11 @@ static uint64_t l2_first_gb[512] __attribute__((aligned(4096)));
 /*
  * l3_dma_2mb: splits the 2 MB block that contains .xhci_dma into
  *   512 × 4 KB pages.  Pages inside [__xhci_dma_start, __xhci_dma_end)
- *   are marked Device nGnRnE (non-cacheable); all others are Normal WB.
+ *   are marked Normal Non-Cacheable (MAIR index 2, 0x44); all others are Normal WB.
  *
- *   This ensures the xHCI DMA ring buffers (DCBAA, command ring, event
- *   ring, ERST) require NO explicit cache maintenance — the hardware
- *   observes writes immediately without D-cache involvement.
+ *   Normal-NC lets the compiler use unaligned accesses and memset, while
+ *   still guaranteeing PCIe write visibility without D-cache maintenance.
+ *   The volatile uint32_t * helpers prevent LDP/STP pair instructions.
  */
 static uint64_t l3_dma_2mb[512] __attribute__((aligned(4096)));
 
@@ -176,7 +176,7 @@ void mmu_init(void)
     /* 4 KB L3 page descriptor (Normal WB) */
 #define L3_NORMAL(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
                          PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NORMAL))
-    /* 4 KB L3 page descriptor (Device nGnRnE) — MMIO only, not for DMA */
+    /* 4 KB L3 page descriptor (Device nGnRnE) — MMIO and DMA ring buffers */
 #define L3_DEVICE(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
                          PTE_SH_OUTER | PTE_AP_RW | PTE_ATTRINDX(MAIR_DEVICE) | \
                          PTE_PXN | PTE_UXN)
@@ -238,7 +238,7 @@ void mmu_init(void)
         else
             l3_dma_2mb[i] = L3_NORMAL(pa); /* Everything else — Normal WB */
     }
-    debug_print("[MMU] L3 DMA pages: entries %llu–%llu marked Device\n",
+    debug_print("[MMU] L3 DMA pages: entries %llu-%llu marked NC\n",
                 (unsigned long long)dma_l3_first,
                 (unsigned long long)dma_l3_last - 1);
 

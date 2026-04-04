@@ -258,7 +258,21 @@ static int mmc_send_cmd(uint32_t cmd, uint32_t arg,
         
         if (status & 0x8000) {  /* Error */
             debug_print("MMC: CMD%d error, status=0x%x\n", cmd & 0x3F, status);
-            sdhci_write(SDHCI_INT_STATUS, 0xFFFF);
+            sdhci_write(SDHCI_INT_STATUS, 0xFFFFFFFF);
+            /*
+             * Reset CMD line (and DAT line if a data error occurred) so that
+             * CMD_INHIBIT (and DAT_INHIBIT) clear before the next command.
+             * Without this reset the controller refuses all further commands.
+             */
+            uint8_t srst = 0x02;                    /* SRST_CMD always */
+            if (status & 0x0070) srst |= 0x04;      /* SRST_DAT on data errors */
+            sdhci_write8(SDHCI_SOFTWARE_RESET, srst);
+            {
+                int rst_wait = 1000;
+                while ((*(volatile uint8_t *)(mmc_host.base + SDHCI_SOFTWARE_RESET) & srst)
+                       && rst_wait--)
+                    for (volatile int i = 0; i < 100; i++);
+            }
             return -1;
         }
         
@@ -272,6 +286,19 @@ static int mmc_send_cmd(uint32_t cmd, uint32_t arg,
     
     if (timeout == 0) {
         debug_print("MMC: CMD%d timeout\n", cmd & 0x3F);
+        /*
+         * CMD_INHIBIT stays asserted after a command timeout.  Reset the CMD
+         * line so the next call to sdhci_wait_cmd_ready() doesn't see a
+         * permanently-stuck bit and return -1 immediately for every subsequent
+         * command (which was the CMD55 spam seen in boot 63).
+         */
+        sdhci_write8(SDHCI_SOFTWARE_RESET, 0x02);   /* SRST_CMD */
+        {
+            int rst_wait = 1000;
+            while ((*(volatile uint8_t *)(mmc_host.base + SDHCI_SOFTWARE_RESET) & 0x02)
+                   && rst_wait--)
+                for (volatile int i = 0; i < 100; i++);
+        }
         return -1;
     }
     
@@ -375,10 +402,20 @@ int mmc_init(void)
      * 0x0F = SDVSEL(3.3V)=0xE | SD_BUS_POWER=1 */
     sdhci_write8(SDHCI_POWER_CONTROL, 0x0F);
     
-    /* FIX-B: CLOCK_CONTROL is 16-bit at 0x2C. 32-bit writes also hit
-     * TIMEOUT_CONTROL at 0x2E, potentially resetting the timeout register.
-     * Use 16-bit writes and reads for all clock control operations. */
-    sdhci_write16(SDHCI_CLOCK_CONTROL, 0x0001);  /* Internal clock enable */
+    /*
+     * CLOCK_CONTROL (16-bit at 0x2C) — set divider for ≤400KHz init clock.
+     *
+     * Bits [15:8] = SDCLK_FREQ_SEL.  For SDHCI 2.0+ the divider is:
+     *   SDCLK = base_clock / (2 × SDCLK_FREQ_SEL)
+     * BCM2711 EMMC2 base clock from firmware is typically 100 MHz.
+     * SDCLK_FREQ_SEL = 0x80 (128) → 100 MHz / 256 ≈ 390 KHz  ✓
+     *
+     * Previous value 0x0001 set SDCLK_FREQ_SEL=0 → base_clock / 2 ≈ 50 MHz,
+     * far too fast for card initialisation — explains CMD0/CMD8 timeouts.
+     *
+     * Use 16-bit writes only; 32-bit writes would stomp TIMEOUT_CONTROL at 0x2E.
+     */
+    sdhci_write16(SDHCI_CLOCK_CONTROL, 0x8001);  /* div=128 (~390KHz) + int-clk-en */
 
     /* Wait for Internal Clock Stable (bit 1) */
     int timeout = 10000;
@@ -394,9 +431,42 @@ int mmc_init(void)
      * (the aligned address) would overwrite CLOCK_CONTROL.
      * 0x0E = data timeout = TMCLK × 2^(0x0E+13) ≈ 1 second */
     sdhci_write8(SDHCI_TIMEOUT_CONTROL, 0x0E);
-    
+
+    /*
+     * SDHCI spec §3.5 (Normal Interrupt Status Enable Register, 0x34):
+     *   "If a bit is set to 0, the corresponding Normal Interrupt Status
+     *    Register bit is always 0."
+     * After SRST_ALL the register resets to 0x00000000, so CMD_COMPLETE
+     * (bit 0 of INT_STATUS) can NEVER be latched — every command poll
+     * of INT_STATUS & 0x01 returns 0 → timeout.  This was the root cause
+     * of ALL MMC command timeouts in boots 63 and 64.
+     *
+     * Lower 16 bits = Normal INT Status Enable:
+     *   bit 0  CMD_COMPLETE    ← essential for mmc_send_cmd polling
+     *   bit 1  XFER_COMPLETE   ← essential for data read/write
+     *   bit 2  BLOCK_GAP
+     *   bit 4  BWR (buffer write ready)
+     *   bit 5  BRR (buffer read ready)
+     *   bit 15 ERROR_INT summary  ← essential for error detection
+     * Upper 16 bits = Error INT Status Enable:
+     *   0x00FF = CMD timeout, CMD CRC, CMD end-bit, CMD index,
+     *            DATA timeout, DATA CRC, DATA end-bit, current limit
+     *
+     * SIGNAL_ENABLE (0x38) stays 0: polling mode, no hardware IRQ output.
+     */
+    sdhci_write(SDHCI_INT_ENABLE,    0x00FF8037U);
+    sdhci_write(SDHCI_SIGNAL_ENABLE, 0x00000000U);
+
     debug_print("MMC: Clock enabled\n");
-    
+
+    /*
+     * SD spec §6.4.1.1 — host must supply ≥74 SD clock cycles to the card
+     * before issuing CMD0.  At 390 KHz that is ≈190 µs; we busy-wait ~2 ms
+     * to give comfortable headroom and let the card's internal power rail
+     * settle completely.
+     */
+    for (volatile int i = 0; i < 1000000; i++);
+
     /* CMD0: GO_IDLE_STATE — no response, no data */
     mmc_send_cmd(CMD0_GO_IDLE_STATE, 0, NULL, 0);
 

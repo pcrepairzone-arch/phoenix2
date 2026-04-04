@@ -1,6 +1,89 @@
-/**
+ /**
  * @file usb_xhci.c
  * @brief xHCI Host Controller Driver — spec-compliant init for VL805 on Pi 4
+ *
+ * boot89 fixes applied (search "FIX-89" for all change sites):
+ *
+ * FIX-89-1  ERSTBA root cause (setup_event_ring):
+ *   erst_dma_addr was computed correctly as phys_to_dma(erst_phys) but
+ *   then overwritten with 0ULL.  With .xhci_dma at 0x30000000 (PCIe
+ *   0xF0000000) this made ERSTBA=0, pointing the VL805 MCU at PCIe 0x0
+ *   (CPU 0xC0000000) instead of the real ERST at 0xF0001040.  The MCU
+ *   wrote all events to the wrong PCIe address → canary unchanged,
+ *   INTR2=0x100 (TLPs generated but landing nowhere), scratch=0.
+ *   Fix: erst_dma_addr = erst_dma  (real DMA address).
+ *
+ * FIX-89-2  TRUE RUNNING stability hold (run_controller):
+ *   Added 20ms hold-and-recheck after the 5ms poll detects clean state.
+ *   Prevents declaring TRUE RUNNING when MCU fires HSE within the poll
+ *   window.  If HSE fires during the hold, treated as another retry.
+ *
+ * FIX-89-3  xhci_wait_event full ring re-arm on HSE:
+ *   Previously only W1C HSE + RS=1.  VL805 MCU resets ALL ring registers
+ *   (CRCR, ERSTBA, DCBAAP) on HSE.  Now re-arms everything — same as the
+ *   retry and settle loops — so ERSTBA is not lost to a mid-transfer HSE.
+ *
+ * FIX-89-4  No-op timeout extended to 200ms + post-timeout ring re-arm:
+ *   50ms was marginal.  On a clean ERSTBA the No-op CCE should arrive in
+ *   < 5ms, but 200ms gives headroom.  On timeout, rings are re-armed
+ *   before enumeration so Enable Slot is not submitted to dead rings.
+ *
+ * FIX-89-5  dma_region_size off-by-one (xhci_init):
+ *   Previous: __xhci_dma_end - __xhci_dma_start - 1  (last byte never
+ *   zeroed).  Fixed: - 0 (full region zeroed).
+ *
+ * boot91 diagnostic additions (search "BOOT91"):
+ *
+ * BOOT91-A  USBSTS snapshot between TRUE RUNNING and No-op submit:
+ *   Boot 90 showed USBSTS=0x00000005 at the No-op timeout, meaning the
+ *   MCU had already re-fired HSE during the 100ms MSI check window before
+ *   the No-op was even submitted.  New: read USBSTS immediately after the
+ *   MSI check block so we can see exactly when the MCU drops out.
+ *
+ * BOOT91-B  Explicit full re-arm + RS=1 verify immediately before No-op:
+ *   If USBSTS shows HSE/HCH at that point, do a complete ring re-arm and
+ *   wait for clean TRUE RUNNING again before submitting the No-op.  This
+ *   ensures the No-op is never submitted to a halted controller.
+ *
+ * BOOT91-C  USBSTS timestamped poll during No-op wait:
+ *   Sample USBSTS at 5ms, 10ms, 20ms, 50ms, 100ms into the No-op wait
+ *   to see exactly when HSE fires relative to the doorbell ring.
+ *
+ * BOOT91-D  RC_BAR2 window coverage check:
+ *   Print RC_BAR2_CFG_LO and compute whether 0xF0000000–0xF0042000 fits
+ *   inside the programmed window.  DMA at 0x30000000 = PCIe 0xF0000000
+ *   is right at the top edge of a 1GB window from 0xC0000000.
+ *
+ * boot92 scratchpad canary test (search "BOOT92"):
+ *   INTR2=0x100 (TLPs arriving) + all canaries intact proved that the MCU
+ *   IS writing via PCIe but the CPU cannot see those writes.  Root cause:
+ *   .xhci_dma mapped as Device nGnRnE which is OUTSIDE the ARM inner-shareable
+ *   coherency domain.  PCIe inbound writes commit to DRAM via the RC/UBUS/SCB
+ *   pipeline but no coherency notification reaches the CPU.  dsb sy only orders
+ *   CPU-initiated transactions — it cannot drain the RC's write-posting buffer.
+ *   Linux/BSD/LibreELEC/OSMC all use dma_alloc_coherent() → Normal-NC
+ *   (Inner Shareable), which participates in the ARM coherency protocol and
+ *   makes PCIe writes visible to the CPU after dsb sy.
+ *
+ * boot93 result: Normal-NC confirmed (ATTR=0x44 via AT S1E1R) but canaries
+ *   still intact and behaviour identical to boot92. INTR2=0x100 is the VL805
+ *   MSI write, not a scratchpad/event-ring MemWrite — coherency was not the
+ *   root cause. The MCU fires HSE within 100ms consistently regardless of MMU
+ *   type because the writes go somewhere wrong.
+ *
+ * boot94 hypothesis test (search "BOOT94"):
+ *   VL805 firmware may only accept inbound DMA addresses with PCIe top nibble
+ *   0xC (range 0xC0000000–0xCFFFFFFF). Our DMA was at phys 0x30000000 giving
+ *   PCIe 0xF0000000 (top nibble 0xF). Boots 71–83 used phys 0x10000 giving
+ *   PCIe 0xC0010000 (top nibble 0xC) and showed more progress.
+ *
+ *   Test: move .xhci_dma to phys 0x0C000000 → PCIe 0xCC000000 (top nibble C).
+ *   DMA_OFFSET stays 0xC0000000 — only the linker script changes.
+ *   All PCIe addresses: 0xCC000000–0xCC042000, every address 0xCCxxxxxx.
+ *
+ *   Expected if hypothesis correct: scratchpad canaries changed, event ring
+ *   written, No-op CCE received, MFINDEX running, settle hse drops to 0.
+ *   Expected if hypothesis wrong: identical failure — need new theory.
  */
 
 #include "kernel.h"
@@ -57,6 +140,7 @@ static int evt_ring_poll(uint32_t ev[4]);
 #define CMD_RS          (1U << 0)
 #define CMD_HCRST       (1U << 1)
 #define CMD_INTE        (1U << 2)
+#define CMD_HSEE        (1U << 3)   /* Host System Error Enable — boot109: set alongside RS */
 
 #define STS_HCH         (1U << 0)
 #define STS_HSE         (1U << 2)
@@ -72,6 +156,30 @@ static int evt_ring_poll(uint32_t ev[4]);
 #define IR_ERDP_LO      0x18
 #define IR_ERDP_HI      0x1C
 
+/* ERDP_REARM(ir0, dma) — write the event ring dequeue pointer with EHB=0.
+ *
+ * boot107 fix: EHB (Event Handler Busy, ERDP bit 3) must be CLEAR for the
+ * MCU to write new events into the ring.  EHB=1 tells the MCU "host is busy
+ * processing, hold new events" — so if we ever leave EHB=1, the MCU silently
+ * swallows all completions and the ring stays empty forever.
+ *
+ * Previous code wrote (evt_dma | 0x8) everywhere, permanently setting EHB=1.
+ * The MCU processed commands (CRCR advanced) but never wrote CCEs (boot 105/106).
+ *
+ * Correct protocol (xHCI §5.5.2.3.3):
+ *   After reset or re-arm: write ERDP with EHB=0 to arm the interrupter.
+ *   During event consumption: write ERDP | EHB=1 to signal "busy", then
+ *   immediately write ERDP | EHB=0 (new dequeue pointer, no EHB) to re-arm.
+ *
+ * In polling mode we skip the EHB=1 intermediate write entirely — just
+ * always write a clean dequeue pointer so the MCU can write at any time.
+ */
+#define ERDP_REARM(ir0_, dma_) \
+    do { \
+        reg_write64((ir0_), IR_ERDP_LO, (dma_)); \
+        asm volatile("dsb sy; isb" ::: "memory"); \
+    } while (0)
+
 #define PORTSC_CCS      (1U <<  0)
 #define PORTSC_PED      (1U <<  1)
 #define PORTSC_PP       (1U <<  9)
@@ -82,6 +190,7 @@ static int evt_ring_poll(uint32_t ev[4]);
 #define TRB_TYPE_SHIFT      10
 #define TRB_TYPE_LINK        6
 #define TRB_TYPE_ENABLE_SLOT 9
+#define TRB_TYPE_NOOP_CMD   23  /* xHCI §6.4.3.9 Command No-op — MCU keepalive ping */
 #define TRB_TYPE_PORT_CHNG_EVT 34
 
 #define CC_SUCCESS          1
@@ -133,17 +242,52 @@ static uint8_t  cmd_cycle   = 1;  /* CRCR.RCS=1 required by VL805 MCU firmware.
 static uint32_t cmd_enqueue = 0;
 static uint8_t  g_slot_id   = 0;  /* set after successful Enable Slot CCE */
 
-static volatile uint32_t pending_event[4]  = {0, 0, 0, 0};
-static volatile int      pending_event_ready = 0;
+/* boot87: pending_event / pending_event_ready removed.
+ * xhci_wait_event now uses pure CNTPCT_EL0 tight-poll — no WFI,
+ * no IRQ-staged fast path.  VL805 MSI→GIC confirmed non-functional
+ * on BCM2711 after 86 boots; polling is the definitive approach.    */
+
+/*
+ * msi_fire_count — incremented every time xhci_irq_handler is entered.
+ * This lets the boot log confirm whether GIC INTID 180 / MSI delivery
+ * is working at all, independent of whether the event ring contains data.
+ * Printed in the xhci_wait_event timeout block and in the handler itself.
+ */
+static volatile uint32_t msi_fire_count = 0;
 
 static uint64_t cmd_ring_dma  = 0;
 static uint64_t evt_ring_dma  = 0;
 static uint64_t erst_dma_addr = 0;
 
-/* DMA_OFFSET = 0.
- * RC_BAR2 maps PCIe 0x00000000 → CPU 0x00000000 (1 GB window).
- * Physical addresses equal PCIe/DMA addresses — no offset needed.  */
-#define DMA_OFFSET  0x00000000ULL
+/* DMA_OFFSET = 0xC0000000  (BCM2711 native inbound DMA convention).
+ *
+ * boot77 root-cause fix: DMA_OFFSET=0 placed every VL805 DMA write target
+ * squarely inside PCIe 0x00000000–0x3FFFFFFF — the same range used by the
+ * outbound ATU for VL805 BAR0 MMIO accesses.  The BCM2711 RC could not
+ * correctly route inbound Memory Write TLPs from the VL805 in this range.
+ *
+ * DMA_OFFSET=0xC0000000 places all DMA at PCIe 0xCxxxxxxx–0xFxxxxxxx,
+ * completely clear of the outbound window.
+ *
+ * boot94 hypothesis: VL805 firmware may only accept inbound DMA to addresses
+ * where bits[31:28] == 0xC (range 0xC0000000–0xCFFFFFFF).  Our previous DMA
+ * base was phys 0x30000000 → PCIe 0xF0000000 (top nibble 0xF).  Boots 71–83
+ * used phys 0x00010000 → PCIe 0xC0010000 (top nibble 0xC) and the MCU reached
+ * further before failing.
+ *
+ * boot94 test: .xhci_dma at phys 0x0C000000 → PCIe 0xCC000000.
+ * Every DMA address (DCBAA, rings, ERST, scratchpad, MSI pad) has top nibble C:
+ *   DCBAA       phys 0x0C000000  PCIe 0xCC000000
+ *   CMD_RING    phys 0x0C000800  PCIe 0xCC000800
+ *   EVT_RING    phys 0x0C000C00  PCIe 0xCC000C00
+ *   MSI_PAD     phys 0x0C001000  PCIe 0xCC001000
+ *   ERST        phys 0x0C001040  PCIe 0xCC001040
+ *   SCRATCH[0]  phys 0x0C002000  PCIe 0xCC002000
+ *
+ * RC_BAR2 window (0xC0000000–0xFFFFFFFF) covers all of these ✓
+ * UBUS_BAR2_REMAP=0x00000001: PCIe 0xCCxxxxxx → CPU 0x0Cxxxxxx ✓
+ */
+#define DMA_OFFSET  0xC0000000ULL
 static inline uint64_t phys_to_dma(uint64_t phys) {
     return phys + DMA_OFFSET;
 }
@@ -213,12 +357,103 @@ static void reg_write64(void *base, uint32_t lo_off, uint64_t val) {
     asm volatile("dsb sy" ::: "memory");
 }
 
+/* fast_delay_ms() is provided by kernel.h / lib.c but calling it from the xHCI
+ * driver caused hard freezes (bootlogpi4, both boots) — the lib.c version
+ * corrupts the call stack or callee-saved registers when called from bare-
+ * metal PCI init context.  Use fast_delay_ms() built on CNTPCT_EL0 instead.
+ * This is the same approach as fast_delay_ms() — cycle-counter only,
+ * no lib.c dependency, safe from any calling-convention mismatch.          */
 static void delay_us(int us) {
-    for (volatile int i = 0; i < us * 150; i++) {}
+    /* Simple busy-wait using cycle counter — 54 MHz on BCM2711 */
+    uint64_t t0, t1;
+    asm volatile("isb; mrs %0, cntpct_el0" : "=r"(t0) :: "memory");
+    uint64_t ticks = (uint64_t)us * 54ULL;
+    do {
+        asm volatile("mrs %0, cntpct_el0" : "=r"(t1));
+    } while ((t1 - t0) < ticks);
+}
+void fast_delay_ms(int ms) {
+    delay_us(ms * 1000);
 }
 
-static void delay_ms(int ms) {
-    delay_us(ms * 1000);
+
+/* ── Real-time millisecond counter using ARM system counter ──────────────────
+ *
+ * CNTPCT_EL0: free-running 64-bit counter driven by the system reference
+ * clock.  On BCM2711 (Pi 4) this runs at 54 MHz (confirmed via MFINDEX
+ * sanity check at boot — see run_controller()).
+ *
+ * get_time_ms() returns the low 32 bits of elapsed milliseconds.  Wraps
+ * every ~49.7 days — fine for boot-time timeout loops.
+ *
+ * Used by xhci_wait_event for real wall-clock timeouts without WFI or the
+ * timer-tick interrupt.  Pure busy-poll: CPU never sleeps between polls.
+ */
+static inline uint64_t read_cntpct(void) {
+    uint64_t v;
+    asm volatile("isb; mrs %0, cntpct_el0" : "=r"(v) :: "memory");
+    return v;
+}
+static inline uint32_t get_time_ms(void) {
+    /* 54 MHz → 54,000 ticks per ms */
+    return (uint32_t)(read_cntpct() / 54000ULL);
+}
+
+/* ── Normal-NC DMA buffer helpers ────────────────────────────────────────────
+ *
+ * BOOT93: .xhci_dma is now mapped as Normal Non-Cacheable Inner-Shareable.
+ *
+ * Normal-NC on AArch64:
+ *   - CPU reads/writes bypass the D-cache (non-cacheable), so all CPU accesses
+ *     go directly to DRAM.  This is the same behaviour as Device memory for
+ *     CPU-side accesses.
+ *   - PCIe inbound writes (VL805 → RC → UBUS → DRAM) ARE visible to the CPU
+ *     after a DSB SY, because Normal-NC participates in the inner-shareable
+ *     coherency domain.  Device nGnRnE does NOT — that was the root cause of
+ *     92 boots of invisible DMA writes.
+ *   - LDP/STP instructions are architecturally permitted on Normal memory
+ *     (unlike Device memory).  However, our volatile helpers prevent the
+ *     compiler from emitting LDP/STP by forcing individual 32-bit accesses.
+ *     This is belt-and-suspenders: LDP/STP on Normal-NC would not fault,
+ *     but the volatile barrier ensures the compiler does not coalesce
+ *     adjacent writes into a pair which would defeat the volatile semantics.
+ *
+ * These helpers are kept as-is — they work correctly for Normal-NC and the
+ * volatile constraint remains valuable for compiler correctness.
+ * dc civac cache-flush calls have been removed from the DMA readback paths
+ * (BOOT93-B) because Normal-NC memory is never cached: there is nothing to
+ * flush.  A plain DSB SY is the correct and sufficient barrier.
+ */
+
+/* Zero a DMA buffer — Device-memory safe (no LDP/STP) */
+static void dma_zero(volatile void *ptr, size_t bytes)
+{
+    volatile uint32_t *p = (volatile uint32_t *)ptr;
+    size_t words = bytes >> 2;
+    for (size_t i = 0; i < words; i++)
+        p[i] = 0U;
+    /* trailing bytes (never hit in practice — all DMA sizes are DWORD-aligned) */
+    volatile uint8_t *pb = (volatile uint8_t *)ptr + (words << 2);
+    for (size_t i = 0; i < (bytes & 3U); i++)
+        pb[i] = 0U;
+}
+
+/* Copy from normal CPU memory INTO a DMA (Device) buffer */
+static void dma_copy_to(volatile void *dst, const void *src, size_t bytes)
+{
+    volatile uint8_t *d = (volatile uint8_t *)dst;
+    const uint8_t    *s = (const uint8_t *)src;
+    for (size_t i = 0; i < bytes; i++)
+        d[i] = s[i];
+}
+
+/* Copy from a DMA (Device) buffer INTO normal CPU memory */
+static void dma_copy_from(void *dst, const volatile void *src, size_t bytes)
+{
+    uint8_t                *d = (uint8_t *)dst;
+    const volatile uint8_t *s = (const volatile uint8_t *)src;
+    for (size_t i = 0; i < bytes; i++)
+        d[i] = s[i];
 }
 
 static void *ir_base(int n) {
@@ -282,7 +517,7 @@ static int do_reset(void) {
 
 static int setup_dcbaa(void) {
     dcbaa = (volatile uint64_t *)(xhci_dma_buf + DMA_DCBAA_OFF);
-    memset((void *)dcbaa, 0, 2048);
+    dma_zero(dcbaa, 2048);
 
     uint32_t pgsz = readl(xhci_ctrl.op_regs + OP_PAGESIZE);
     debug_print("[xHCI] PAGESIZE reg = 0x%08x (%s)\n", pgsz,
@@ -294,10 +529,10 @@ static int setup_dcbaa(void) {
 
     if (n > 0) {
         volatile uint64_t *scratch_arr = (volatile uint64_t *)(xhci_dma_buf + DMA_SCRATCH_OFF);
-        memset((void *)scratch_arr, 0, MAX_SCRATCH_PAGES * 8);
+        dma_zero(scratch_arr, MAX_SCRATCH_PAGES * 8);
 
         uint8_t *pages_base = xhci_dma_buf + DMA_SCRATCH_PAGES_OFF;
-        memset(pages_base, 0, n * 4096);
+        dma_zero(pages_base, n * 4096);
         asm volatile("dsb sy" ::: "memory");
 
         for (uint32_t i = 0; i < n; i++) {
@@ -308,6 +543,64 @@ static int setup_dcbaa(void) {
 
         uint64_t scratch_arr_dma = phys_to_dma((uint64_t)virt_to_phys((void *)scratch_arr));
         dcbaa[0] = scratch_arr_dma;
+        asm volatile("dsb sy" ::: "memory");
+
+        /* BOOT92-A: Full scratchpad array dump.
+         *
+         * Print every pointer the MCU will DMA-read when it initialises its
+         * internal context at RS=1.  All must be 4KB-aligned DMA addresses
+         * within the RC_BAR2 inbound window (0xC0000000–0xFFFFFFFF).
+         * Any entry that is 0 or misaligned will cause the MCU to fire HSE
+         * immediately.
+         */
+        uart_puts("[BOOT92-A] Scratchpad array: DCBAA[0]=");
+        print_hex32((uint32_t)dcbaa[0]);
+        uart_puts("  n="); print_hex32(n); uart_puts("\n");
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t entry = scratch_arr[i];
+            uint32_t lo = (uint32_t)entry;
+            uint32_t hi = (uint32_t)(entry >> 32);
+            int ok = (hi == 0) && (lo != 0) && ((lo & 0xFFFU) == 0);
+            if (i < 4 || i == n - 1 || !ok) {
+                uart_puts("[BOOT92-A]   ["); print_hex32(i); uart_puts("]=");
+                print_hex32(hi); uart_puts(":"); print_hex32(lo);
+                uart_puts(ok ? "\n" : "  *** BAD — not 4KB-aligned or zero ***\n");
+            }
+        }
+        if (n > 5)  { uart_puts("[BOOT92-A]   (entries 4–"); print_hex32(n-2); uart_puts(" all OK — omitted)\n"); }
+
+        /* BOOT92-B: Write canary pattern to the first 8 bytes of every
+         * scratchpad page.
+         *
+         * Pattern: word0=0xABCD1234  word1=0xDEAD5678
+         * These are distinctive and will survive any zero-check.
+         * Device nGnRnE: CPU writes go directly to DRAM — no flush needed.
+         * The MCU will overwrite these when it writes its internal context.
+         * We read them back in BOOT92-C (post-HSE) to see which pages it
+         * touched.
+         *
+         * We write AFTER dma_zero so the zero is not confused with
+         * "MCU wrote zero", and AFTER the array pointers are set so the
+         * addresses are confirmed correct before we annotate them.
+         */
+        uart_puts("[BOOT92-B] Writing scratchpad page canaries...\n");
+        for (uint32_t i = 0; i < n; i++) {
+            volatile uint32_t *pg =
+                (volatile uint32_t *)(xhci_dma_buf + DMA_SCRATCH_PAGES_OFF + i * 4096);
+            pg[0] = 0xABCD1234U;
+            pg[1] = 0xDEAD5678U;
+        }
+        asm volatile("dsb sy" ::: "memory");
+        /* Verify first page canary wrote correctly (Device mem sanity check) */
+        {
+            volatile uint32_t *pg0 =
+                (volatile uint32_t *)(xhci_dma_buf + DMA_SCRATCH_PAGES_OFF);
+            uart_puts("[BOOT92-B]   page[0][0]="); print_hex32(pg0[0]);
+            uart_puts("  page[0][1]="); print_hex32(pg0[1]);
+            uart_puts((pg0[0] == 0xABCD1234U && pg0[1] == 0xDEAD5678U) ?
+                      "  [canary OK]\n" :
+                      "  *** canary readback WRONG — Device mem write broken ***\n");
+        }
     }
 
     uint64_t dcbaa_dma = phys_to_dma((uint64_t)virt_to_phys((void *)dcbaa));
@@ -321,7 +614,7 @@ static int setup_cmd_ring(void) {
     cmd_ring    = (volatile uint32_t *)(xhci_dma_buf + DMA_CMD_RING_OFF);
     cmd_cycle   = 1;  /* RCS=1: VL805 MCU requires this; see static initialiser comment */
     cmd_enqueue = 0;
-    memset((void *)cmd_ring, 0, CMD_RING_TRBS * 16);
+    dma_zero(cmd_ring, CMD_RING_TRBS * 16);
 
     uint64_t ring_phys = (uint64_t)virt_to_phys((void *)cmd_ring);
     uint64_t ring_dma  = phys_to_dma(ring_phys);
@@ -345,8 +638,8 @@ static int setup_event_ring(void) {
     evt_ring = (volatile uint32_t *)(xhci_dma_buf + DMA_EVT_RING_OFF);
     erst     = (volatile uint64_t *)(xhci_dma_buf + DMA_ERST_OFF);
 
-    memset((void *)evt_ring, 0, EVT_RING_TRBS * 16);
-    memset((void *)erst,     0, 16);
+    dma_zero(evt_ring, EVT_RING_TRBS * 16);
+    dma_zero(erst, 16);
 
     uint64_t evt_phys  = (uint64_t)virt_to_phys((void *)evt_ring);
     uint64_t erst_phys = (uint64_t)virt_to_phys((void *)erst);
@@ -401,17 +694,32 @@ static int setup_event_ring(void) {
         p[1] = (uint32_t)(evt_dma >> 32);
         p[2] = (uint32_t)EVT_RING_TRBS;
         p[3] = 0;
-        asm volatile("dc civac, %0\n\tdsb sy\n\tisb" :: "r"(pa) : "memory");
+        /* dsb sy sufficient — phys 0 is Normal memory, no dc civac needed */
+        asm volatile("dsb sy; isb" ::: "memory");
     }
 
-    /* ERSTBA = real DMA address (Normal-NC, RC_BAR2 accessible).
-     * Previously: 0ULL (matched ERSTBA_cache=0 theory).
-     * Now: real address so MCU can DMA-read ERST from a verified region.  */
+    /* FIX-89 (boot89): ERSTBA must point at the real DMA buffer.
+     *
+     * The bug: erstba_dma was computed correctly above (= erst_dma =
+     * phys_to_dma(erst_phys) = 0xF0001040 with DMA base 0x30000000), but
+     * then discarded by "erst_dma_addr = 0ULL".  run_controller() then
+     * programmed ERSTBA=0 into the hardware, so the VL805 MCU read its
+     * ERST from PCIe 0x00000000 → CPU 0xC0000000 (the old DMA base).
+     * With .xhci_dma now at 0x30000000 (PCIe 0xF0000000), the ERST at
+     * PCIe 0 pointed the MCU at evt_ring PCIe 0xC0000C00, but the real
+     * ring is at PCIe 0xF0000C00.  All MCU TLP writes went to the wrong
+     * address → canary unchanged → INTR2=0x100 (TLPs sent but landed
+     * nowhere), scratch=0 (MCU never wrote to our scratchpad region).
+     *
+     * Fix: use the real erst_dma.  The phys-0 fallback write below is
+     * kept for belt-and-suspenders but the primary ERSTBA is now correct.
+     */
     erst_dma_addr = erst_dma;
 
-    uart_puts("[xHCI] ERST setup (boot48: ERSTBA=real DMA, phys0 fallback kept)\n");
+    uart_puts("[xHCI] ERST setup (boot89: ERSTBA=real DMA addr fixed)\n");
     uart_puts("[xHCI]   evt_ring DMA="); print_hex32((uint32_t)evt_dma);
     uart_puts("  erst_buf DMA="); print_hex32((uint32_t)erst_dma);
+    uart_puts("  ERSTBA stored="); print_hex32((uint32_t)erst_dma_addr);
     uart_puts("  size="); print_hex32(EVT_RING_TRBS); uart_puts("\n");
 
     /* Readback verification */
@@ -419,7 +727,7 @@ static int setup_event_ring(void) {
         uintptr_t pa = 0;
         asm volatile("" : "+r"(pa));
         volatile uint32_t *p = (volatile uint32_t *)pa;
-        asm volatile("dc civac, %0\n\tdsb sy\n\tisb" :: "r"(pa) : "memory");
+        asm volatile("dsb sy; isb" ::: "memory"); /* phys 0 = Normal memory */
         uart_puts("[xHCI]   phys0:    [");
         print_hex32(p[0]); uart_puts(","); print_hex32(p[1]);
         uart_puts(","); print_hex32(p[2]); uart_puts(","); print_hex32(p[3]);
@@ -441,12 +749,76 @@ static int run_controller(void) {
     uint64_t erstba_dma = erst_dma_addr;
     uint64_t evt_dma    = evt_ring_dma;
     uint64_t crcr_val   = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
-    uint32_t cfg_val    = (readl(op + OP_CONFIG) & ~0xFFU) | (xhci_ctrl.max_slots & 0xFFU);
+    /* boot108: use CONFIG=1 (MaxSlots=1) instead of MaxSlots=32.
+     * Some VL805 firmware rejects CONFIG>1 at startup and silently refuses
+     * to generate events until a valid slot count it accepts is set.
+     * Boot 105-107 showed CRCR advancing (MCU alive) but zero events even
+     * with a connected device — consistent with the MCU treating CONFIG=32
+     * as invalid and suppressing all event output.
+     * We will increment CONFIG to match actual slot allocations later.     */
+    uint32_t cfg_val    = 1U;
 
-    /*
-     * Boot 27 refactor: follow Linux's xHCI init sequence.
+    /* BOOT91-D: RC_BAR2 inbound window coverage check.
      *
-     * Linux programs ALL ring pointers AND enables the event ring (ERSTSZ=1)
+     * .xhci_dma at 0x30000000 → PCIe 0xF0000000 (with DMA_OFFSET=0xC0000000).
+     * RC_BAR2 is configured as PCIe base 0xC0000000, 1GB window.
+     * 1GB from 0xC0000000 = 0xC0000000 to 0xFFFFFFFF inclusive.
+     * Our DMA top = 0xF0042000 — this is inside a 1GB window from C0000000,
+     * BUT 0xF0000000 + 0x42000 = 0xF0042000 < 0xFFFFFFFF ✓ in theory.
+     *
+     * Read the actual programmed BAR2 value and compute the real window end
+     * to confirm the MCU's inbound DMA range is definitely covered.
+     *
+     * RC_BAR2_CFG_LO is at PCIE_MISC base + 0x4034 (confirmed boot85).
+     * Bits[3:0] encode size: 0xF=1GB, 0xE=512MB, etc.
+     * Bit[1]=enable.  Bits[31:4]=base address >> 4 (PCIe address, 1MB aligned).
+     */
+    {
+        extern void *pcie_base;
+        uint32_t bar2_lo = readl(pcie_base + 0x4034U);
+        uint32_t bar2_hi = readl(pcie_base + 0x4038U);
+        uint32_t bar2_sz_bits = bar2_lo & 0xFU;
+        uint64_t bar2_base = (uint64_t)(bar2_lo & 0xFFFFFFF0U);
+        /* Size from low bits: 0xF=1GB (2^30), 0xE=512MB (2^29), ... */
+        uint64_t bar2_size = (bar2_sz_bits == 0xFU) ? (1ULL << 30) :
+                             (bar2_sz_bits == 0xEU) ? (1ULL << 29) :
+                             (bar2_sz_bits == 0xDU) ? (1ULL << 28) :
+                             (bar2_sz_bits == 0xCU) ? (1ULL << 27) : 0ULL;
+        uint64_t bar2_end  = bar2_base + bar2_size - 1;
+        uint64_t dma_start = phys_to_dma((uint64_t)virt_to_phys((void *)xhci_dma_buf));
+        uint64_t dma_end   = dma_start + 0x42000ULL - 1;
+        int covered = (dma_start >= bar2_base) && (dma_end <= bar2_end);
+        uart_puts("[BOOT91-D] RC_BAR2: lo="); print_hex32(bar2_lo);
+        uart_puts(" hi="); print_hex32(bar2_hi);
+        uart_puts("  base="); print_hex32((uint32_t)bar2_base);
+        uart_puts(" end="); print_hex32((uint32_t)bar2_end);
+        uart_puts("  DMA="); print_hex32((uint32_t)dma_start);
+        uart_puts("-"); print_hex32((uint32_t)dma_end);
+        uart_puts(covered ? "  [COVERED OK]\n" : "  [*** NOT COVERED — DMA OUT OF WINDOW ***]\n");
+    }
+
+    /* BOOT94: DMA address range sanity check.
+     * With .xhci_dma at phys 0x0C000000, all PCIe addresses should be
+     * 0xCC000000–0xCC042000 (top nibble = 0xC). Print the key addresses
+     * so the boot log confirms the linker placed the section correctly.   */
+    {
+        uint8_t top_dcbaa = (uint8_t)(dcbaa_dma >> 28);
+        uint8_t top_evt   = (uint8_t)(evt_dma    >> 28);
+        uint8_t top_erst  = (uint8_t)(erstba_dma >> 28);
+        int     all_c     = (top_dcbaa == 0xC) && (top_evt == 0xC) && (top_erst == 0xC);
+        uart_puts("[BOOT94] DMA PCIe addresses:\n");
+        uart_puts("[BOOT94]   DCBAA  PCIe="); print_hex32((uint32_t)dcbaa_dma);
+        uart_puts("  top=0x"); print_hex32(top_dcbaa); uart_puts("\n");
+        uart_puts("[BOOT94]   EVTRING PCIe="); print_hex32((uint32_t)evt_dma);
+        uart_puts("  top=0x"); print_hex32(top_evt); uart_puts("\n");
+        uart_puts("[BOOT94]   ERSTBA PCIe="); print_hex32((uint32_t)erstba_dma);
+        uart_puts("  top=0x"); print_hex32(top_erst); uart_puts("\n");
+        uart_puts(all_c ?
+            "[BOOT94]   All top nibbles = 0xC ✓ — VL805-compatible range\n" :
+            "[BOOT94]   *** WARNING: top nibble != 0xC — linker change not applied? ***\n");
+    }
+
+    /* Linux programs ALL ring pointers AND enables the event ring (ERSTSZ=1)
      * BEFORE setting RS=1.  Previous boots (19-26) suppressed ERSTSZ=0 during
      * RS=1 then latched it post-settle — this may have prevented the MCU from
      * ever seeing a valid ERST.  Now we do it the Linux way:
@@ -470,30 +842,67 @@ static int run_controller(void) {
     asm volatile("dsb sy; isb" ::: "memory");
 
     /* Step 3: Program interrupter 0.
-     * ERSTBA=0 (matches MCU's immutable ERSTBA_cache=0; confirmed boot 27).
-     * The actual ERST is at phys 0 — MCU DMAs there regardless of MMIO.
-     * ERSTSZ=1 enables event generation.  ERDP points to our event ring.  */
+     * FIX-89: erstba_dma is now the real DMA address of the ERST buffer
+     * (boot89 fix — was incorrectly forced to 0 since the DMA region moved
+     * to 0x30000000, making the old phys-0 fallback point the MCU at the
+     * wrong event ring).  ERSTSZ=1 enables event generation.
+     * ERDP points to evt_dma (ring base, dequeue starts at TRB 0).       */
     writel(0U, ir0 + IR_ERSTSZ);                      /* clear first      */
     reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);        /* 0 = MCU target   */
     asm volatile("dsb sy; isb" ::: "memory");
     writel(1U, ir0 + IR_ERSTSZ);                       /* enable: 1 segment */
     asm volatile("dsb sy; isb" ::: "memory");
-    reg_write64(ir0, IR_ERDP_LO, evt_dma | 0x8ULL);   /* ERDP + W1C EHB   */
-    writel(0x00000002U, ir0 + IR_IMAN);                 /* IE=1, IP W1C     */
-    writel(0x0FA00FA0U, ir0 + IR_IMOD);                 /* IMOD             */
+    /* boot107: write ERDP with EHB=0 — arm the interrupter so the MCU can
+     * write events immediately after RS=1.  Do NOT OR in 0x8 here; that
+     * would set EHB=1 and permanently block event writes (proved boot105/106:
+     * CRCR advanced but CCE never arrived because MCU saw EHB=1). */
+    ERDP_REARM(ir0, evt_dma);
+    writel(0x00000002U, ir0 + IR_IMAN);   /* IE=1, W1C IP */
+    /* boot108: IMOD=0 — disable interrupt moderation entirely.
+     * Previous value 0x0FA00FA0 set IMODI=4000 (1ms min between events)
+     * and IMODC=4000 (counter starts at max delay). Some VL805 firmware
+     * treats a non-zero initial IMODC as "interrupt not ready" and defers
+     * all event writes. Zero disables the throttle — events fire immediately. */
+    writel(0x00000000U, ir0 + IR_IMOD);
     asm volatile("dsb sy; isb" ::: "memory");
 
     /* Diagnostic readback: verify all ring pointers landed */
     uart_puts("[xHCI] Rings programmed (Linux order). Readback:\n");
     uart_puts("[xHCI]   DCBAAP=");  print_hex32(readl(op + OP_DCBAAP_LO));
     uart_puts("  CRCR=");    print_hex32(readl(op + OP_CRCR_LO));
-    uart_puts("  CONFIG=");  print_hex32(readl(op + OP_CONFIG)); uart_puts("\n");
+    uart_puts("  CONFIG=");  print_hex32(readl(op + OP_CONFIG));
+    uart_puts("  (boot108: =1)\n");
     uart_puts("[xHCI]   ERSTBA=");  print_hex32(readl(ir0 + IR_ERSTBA_LO));
     uart_puts("  ERSTSZ=");  print_hex32(readl(ir0 + IR_ERSTSZ));
     uart_puts("  ERDP=");    print_hex32(readl(ir0 + IR_ERDP_LO));
-    uart_puts("  IMAN=");    print_hex32(readl(ir0 + IR_IMAN)); uart_puts("\n");
+    uart_puts("  IMAN=");    print_hex32(readl(ir0 + IR_IMAN));
+    uart_puts("  IMOD=");    print_hex32(readl(ir0 + IR_IMOD));
+    uart_puts("  (boot108: =0)\n");
     uart_puts("[xHCI]   USBSTS=");  print_hex32(readl(op + OP_USBSTS));
     uart_puts("  USBCMD=");  print_hex32(readl(op + OP_USBCMD)); uart_puts("\n");
+
+    /* boot116: CANARY REMOVED.
+     *
+     * Boots 85–115 wrote 0xDEADBEEF/0xCAFEF00D to TRB[0] words 0-1
+     * before RS=1 as a "did the MCU write here?" detection mechanism.
+     *
+     * Analysis from boot 115 timing work showed this was PREVENTING the
+     * MCU from writing events entirely.  The VL805 firmware appears to
+     * do a non-standard sanity check: if TRB[0].word0 is non-zero when
+     * the MCU tries to write its first event, it treats the slot as
+     * occupied and ABORTS event generation — USBSTS.EINT never gets set,
+     * the ring stays empty, and we see no events.
+     *
+     * The correct detection mechanism is the CYCLE BIT (TRB.word3 bit 0):
+     *   Before RS=1: all TRBs have word3.bit0 = 0 (ring is zero-filled)
+     *   MCU writes event with CCS=1, setting word3.bit0 = 1
+     *   Host polls: if (TRB[deq].word3 & 1) == evt_cycle → event ready
+     *
+     * The ring is already zeroed by dma_zero() above.  No sentinel needed.
+     * evt_ring_poll() uses the cycle bit correctly — this is the right way.
+     */
+    uart_puts("[xHCI] [CYCLE] Event ring zeroed — cycle bit protocol active (boot116)\n");
+    uart_puts("[xHCI]   Polling: TRB.word3.bit0 == evt_cycle(1) signals MCU wrote event\n");
 
     /* Step 4: RS=1 with minimal HSE retry loop.
      *
@@ -525,7 +934,7 @@ static int run_controller(void) {
         asm volatile("dsb sy; isb" ::: "memory");
 
         /* First RS=1 attempt. */
-        writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
+        writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
         asm volatile("dsb sy; isb" ::: "memory");
 
         uart_puts("[xHCI] RS=1 (HSE-retry, no CRCR rewrites)\n");
@@ -536,28 +945,191 @@ static int run_controller(void) {
         int hse_retries  = 0;
 
         for (int t = 0; t < 600 && !settled; t++) {
-            delay_ms(5);
+            fast_delay_ms(5);
             s     = readl(op + OP_USBSTS);
             cmd_v = readl(op + OP_USBCMD);
 
             if (!(s & STS_HCH) && (cmd_v & CMD_RS) && !(s & STS_HSE)) {
-                /* TRUE RUNNING — controller accepted RS=1 cleanly */
+                /* Candidate TRUE RUNNING — hold 20ms and recheck.
+                 *
+                 * FIX-89: boots 86-88 showed the MCU fires HSE within
+                 * microseconds of the 5ms poll window, so "TRUE RUNNING"
+                 * at the poll point did not mean the MCU stayed stable.
+                 * The settle loop then saw hse=100 (every slot) because
+                 * ERSTBA=0 caused constant MCU watchdog trips.
+                 *
+                 * With ERSTBA now correct (Fix 1), the MCU should remain
+                 * stable, but we add a 20ms hold to verify and log it.
+                 * If HSE fires during the hold we treat it as another retry
+                 * rather than declaring settled — this prevents the settle
+                 * loop from inheriting a flapping MCU state.              */
+                fast_delay_ms(20);
+                s     = readl(op + OP_USBSTS);
+                cmd_v = readl(op + OP_USBCMD);
+
+                if ((s & STS_HCH) || !(cmd_v & CMD_RS) || (s & STS_HSE)) {
+                    /* HSE fired during hold — treat as another retry */
+                    uart_puts("[xHCI] TR-hold: MCU fired HSE in 20ms hold window, retrying\n");
+                    hse_retries++;
+                    writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    fast_delay_ms(2);
+                    reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
+                    writel(cfg_val, op + OP_CONFIG);
+                    reg_write64(op, OP_CRCR_LO, crcr_val);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    writel(0U, ir0 + IR_ERSTSZ);
+                    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    writel(1U, ir0 + IR_ERSTSZ);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+                    evt_dequeue = 0;
+                    evt_cycle   = 1;
+                    writel(0x00000002U, ir0 + IR_IMAN);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    continue;
+                }
+
+                /* Stable TRUE RUNNING confirmed */
                 uart_puts("[xHCI] TRUE RUNNING at ");
                 print_hex32((uint32_t)((t + 1) * 5));
                 uart_puts("ms  hse_retries=");
                 print_hex32((uint32_t)hse_retries); uart_puts("\n");
+
+                /* boot109-A: Ring doorbell 0 immediately after TRUE RUNNING. */
+                {
+                    volatile uint32_t *db0 =
+                        (volatile uint32_t *)xhci_ctrl.doorbell_regs;
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    *db0 = 0U;
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    uart_puts("[BOOT109-A] DB[0]=0 rung after TRUE RUNNING\n");
+                }
+
+                /* boot109-B REMOVED (boot117): writing IMAN=0x3 post-TRUE-RUNNING
+                 * caused MFINDEX to go static in boot116 — suspected to reset MCU
+                 * interrupt state in a way that stalls the frame timer.
+                 * IMAN is already correctly set to 0x2 (IE=1) during ring setup.  */
+
+                /* boot71: MFINDEX check — moved BEFORE the tight poll (boot117).
+                 * In boot116 MFINDEX was read at t≈55ms (after 50ms tight poll).
+                 * In boots 105-108 it was read at t≈5ms and showed running fine.
+                 * Read it here at t≈1ms to get a clean pre-poll baseline, then
+                 * again after the tight poll to see if it's still running.       */
+                {
+                    volatile uint32_t *mf = (volatile uint32_t *)xhci_ctrl.runtime_regs;
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    uint32_t mf0 = *mf;
+                    fast_delay_ms(5);
+                    uint32_t mf1 = *mf;
+                    uart_puts("[xHCI] MFINDEX t0="); print_hex32(mf0);
+                    uart_puts(" t5ms="); print_hex32(mf1);
+                    uart_puts(mf1 != mf0 ? "  (running OK)\n" : "  (STATIC — frame timer not started)\n");
+                }
+
+                /* boot116: TIGHT EVENT RING POLL — immediately after TRUE RUNNING. */
+                {
+                    uint32_t ev[4];
+                    int     evts_found = 0;
+                    uint32_t poll_start = get_time_ms();
+
+                    uart_puts("[BOOT116] Tight event ring poll (50ms window)...\n");
+
+                    while ((get_time_ms() - poll_start) < 50U) {
+                        asm volatile("dsb sy; isb" ::: "memory");
+
+                        /* Check USBSTS.EINT — MCU signalled events pending */
+                        uint32_t sts = readl(op + OP_USBSTS);
+                        if (sts & STS_EINT) {
+                            /* W1C EINT before draining — standard Linux sequence */
+                            writel(STS_EINT, op + OP_USBSTS);
+                            asm volatile("dsb sy; isb" ::: "memory");
+                        }
+
+                        /* Drain all available events */
+                        while (evt_ring_poll(ev)) {
+                            evts_found++;
+                            uint32_t trb_type = (ev[3] >> 10) & 0x3FU;
+                            uint32_t cc       = (ev[2] >> 24) & 0xFFU;
+                            uart_puts("[BOOT116]   evt type=");
+                            print_hex32(trb_type);
+                            uart_puts(" cc="); print_hex32(cc);
+                            uart_puts(" dw0="); print_hex32(ev[0]);
+                            uart_puts(" dw2="); print_hex32(ev[2]);
+                            uart_puts("\n");
+                        }
+
+                        if (evts_found > 0) break; /* got events — stop tight loop */
+
+                        /* ~100µs delay using cycle counter */
+                        {
+                            uint64_t t0, t1;
+                            asm volatile("mrs %0, cntpct_el0" : "=r"(t0));
+                            do {
+                                asm volatile("mrs %0, cntpct_el0" : "=r"(t1));
+                            } while ((t1 - t0) < 5400ULL); /* 54MHz/1000×10 ≈ 100µs */
+                        }
+                    }
+
+                    if (evts_found > 0) {
+                        uart_puts("[BOOT116]   *** ");
+                        print_hex32((uint32_t)evts_found);
+                        uart_puts(" event(s) received — event ring WORKING! ***\n");
+                    } else {
+                        uart_puts("[BOOT116]   No events in 50ms — MCU not posting events\n");
+                        uart_puts("[BOOT116]   USBSTS="); print_hex32(readl(op + OP_USBSTS));
+                        uart_puts("  IMAN="); print_hex32(readl(ir0 + IR_IMAN));
+                        uart_puts("  TRB[0].w3=");
+                        print_hex32(((volatile uint32_t *)(xhci_dma_buf + DMA_EVT_RING_OFF))[3]);
+                        uart_puts("\n");
+                    }
+                }
+
                 settled = 1;
                 break;
             }
 
             /* Not TRUE RUNNING — MCU fired HSE and cleared RS.
-             * Recovery: W1C HSE to acknowledge, then re-assert RS=1.
-             * NO CRCR write — register already holds the value set above.    */
+             * Recovery: W1C HSE, re-write CRCR (while RS=0), then RS=1.
+             *
+             * boot76 root cause: VL805 MCU zeroes its internal CRCR when
+             * firing the watchdog HSE.  If we only write RS=1 without
+             * re-writing CRCR, the MCU captures CRCR=0 at the RS=0→1
+             * transition and walks its command ring from address 0x0.
+             * At address 0 all TRBs have cycle=0 ≠ RCS=1 → ring appears
+             * empty → MCU generates zero TLPs forever.
+             * Fix: re-write CRCR BEFORE each RS=1 (while RS is 0).        */
             hse_retries++;
             writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
             asm volatile("dsb sy; isb" ::: "memory");
-            delay_ms(2);
-            writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
+            fast_delay_ms(2);
+
+            /* boot79: VL805 MCU zeroes ALL ring registers (not just CRCR)
+             * when it fires HSE.  Re-arm the complete event ring state every
+             * time we cycle RS=0→1, otherwise ERSTBA stays 0 and VL805
+             * writes all events into its own BAR0 MMIO instead of DRAM.    */
+            reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
+            writel(cfg_val, op + OP_CONFIG);
+            reg_write64(op, OP_CRCR_LO, crcr_val);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(0U, ir0 + IR_ERSTSZ);
+            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(1U, ir0 + IR_ERSTSZ);
+            asm volatile("dsb sy; isb" ::: "memory");
+            ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+            /* boot86: reset software dequeue ptr to match ERDP reset to ring base.
+             * After HSE the MCU resets its producer; we must reset our consumer.
+             * Without this, evt_dequeue stays > 0 so poll reads the wrong slot. */
+            evt_dequeue = 0;
+            evt_cycle   = 1;
+            writel(0x00000002U, ir0 + IR_IMAN);
+            asm volatile("dsb sy; isb" ::: "memory");
+
+            writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
             asm volatile("dsb sy; isb" ::: "memory");
 
             if (hse_retries <= 5 || (hse_retries % 20) == 0) {
@@ -575,6 +1147,347 @@ static int run_controller(void) {
         }
     }
 
+    /* ── Spontaneous MSI check (boot 69) ───────────────────────────────────
+     * User diagnostic from MSI debug.txt.  At this point the MCU is in TRUE
+     * RUNNING and the full MSI data chain is correct (DATA_CONFIG=0xFFE0 ==
+     * VL805 data, boot 68 fix).  Wait 100ms: if the MCU fires an unsolicited
+     * MSI on startup msi_fire_count will increase — full path confirmed.
+     * Also read CRCR.CRR (bit 3) to verify MCU started its ring walker.  */
+    {
+        uart_puts("[DEBUG] Checking if VL805 is sending MSI automatically...\n");
+        /* VL805 CRCR is write-only — reads back 0; CRR check via readback is useless.
+         * Print scratchpad page 0 instead: if MCU DMA-wrote to scratch, DMA writes work.
+         *
+         * BUG FIX (boot84 false positive): was hardcoded to 0x12000UL which was only
+         * correct when .xhci_dma was at 0x10000 (phoenix_fixed3).  Now computed from
+         * xhci_dma_buf + DMA_SCRATCH_PAGES_OFF so it works regardless of linker placement.
+         * With .xhci_dma at 0x30000000 (phoenix_fixed5), scratchpad page 0 is at 0x30002000.
+         * Boot 84's scratch[0]=0xd453fae0 was reading stale VideoCore RAM at 0x12000. */
+        volatile uint32_t *scratch_page0 =
+            (volatile uint32_t *)(xhci_dma_buf + DMA_SCRATCH_PAGES_OFF);
+        /* BOOT93-B: Normal-NC — no dc civac needed. dsb sy ensures the CPU
+         * load is ordered after any in-flight RC write-buffer drain.        */
+        asm volatile("dsb sy; isb" ::: "memory");
+        uart_puts("[DEBUG]   scratchpad_phys=0x");
+        print_hex32((uint32_t)((uint64_t)(uintptr_t)scratch_page0 >> 32));
+        print_hex32((uint32_t)(uint64_t)(uintptr_t)scratch_page0);
+        uart_puts("\n");
+        uart_puts("[DEBUG]   scratch[0]="); print_hex32(scratch_page0[0]);
+        uart_puts(" scratch[1]="); print_hex32(scratch_page0[1]);
+        uart_puts("  (non-zero = MCU DMA writes working)\n");
+        uint32_t initial_count = msi_fire_count;
+        fast_delay_ms(100);
+        if (msi_fire_count > initial_count) {
+            uart_puts("[DEBUG] \xe2\x9c\x93 VL805 MSI auto-delivery WORKING!\n");
+        } else {
+            uart_puts("[DEBUG] \xe2\x9c\x97 VL805 MSI auto-delivery still BROKEN\n");
+        }
+    }
+
+    /* BOOT91-A: USBSTS snapshot between TRUE RUNNING and No-op submit.
+     *
+     * Boot 90: USBSTS=0x00000005 at No-op timeout → MCU had already fired
+     * HSE during the 100ms MSI delay above.  Sample here to see how fast
+     * the MCU drops out after TRUE RUNNING is declared, and snapshot all
+     * ring registers to confirm they haven't been zeroed by the MCU yet.
+     */
+    {
+        uint32_t sts_snap = readl(op + OP_USBSTS);
+        uint32_t cmd_snap = readl(op + OP_USBCMD);
+        uart_puts("[BOOT91-A] Pre-Noop snapshot:\n");
+        uart_puts("[BOOT91-A]   USBSTS="); print_hex32(sts_snap);
+        uart_puts("  USBCMD="); print_hex32(cmd_snap);
+        uart_puts(((sts_snap & STS_HCH) || (sts_snap & STS_HSE)) ?
+                  "  *** MCU already HALTED/HSE before No-op! ***\n" :
+                  "  (running clean)\n");
+        uart_puts("[BOOT91-A]   DCBAAP="); print_hex32(readl(op + OP_DCBAAP_LO));
+        uart_puts("  ERSTBA="); print_hex32(readl(ir0 + IR_ERSTBA_LO));
+        uart_puts("  ERSTSZ="); print_hex32(readl(ir0 + IR_ERSTSZ));
+        uart_puts("  ERDP=");   print_hex32(readl(ir0 + IR_ERDP_LO));
+        uart_puts("\n");
+        /* BOOT92-C: Post-HSE full scratchpad canary readback.
+         *
+         * The MCU fires HSE within ~1ms of RS=1 (boot91).  It should have
+         * read the scratchpad array and attempted to write its internal
+         * context into the pages before dying.  Flush D-cache across every
+         * page and check each canary:
+         *
+         *   canary UNCHANGED (0xABCD1234) → MCU never wrote to this page
+         *   canary CHANGED               → MCU DMA-wrote to this page ✓
+         *
+         * Also dump the first 64 bytes of page 0 raw — if the MCU wrote
+         * anything there, this shows what it actually wrote.
+         *
+         * Device nGnRnE memory: CPU reads are uncached, but we still issue
+         * dc civac to invalidate any speculative prefetch lines.
+         */
+        uart_puts("[BOOT92-C] Scratchpad canary readback (post-HSE):\n");
+        {
+            uint32_t n_sp = xhci_ctrl.scratchpad_count;
+            int any_changed = 0;
+            int any_zero    = 0;
+
+            for (uint32_t i = 0; i < n_sp; i++) {
+                volatile uint32_t *pg =
+                    (volatile uint32_t *)(xhci_dma_buf + DMA_SCRATCH_PAGES_OFF + i * 4096);
+                /* BOOT93-B: Normal-NC memory is never cached — dc civac is
+                 * wrong here (nothing to flush).  A plain dsb sy ensures the
+                 * CPU's load is ordered after any prior RC write-buffer drain. */
+                asm volatile("dsb sy; isb" ::: "memory");
+
+                uint32_t w0 = pg[0], w1 = pg[1];
+                int changed = (w0 != 0xABCD1234U) || (w1 != 0xDEAD5678U);
+                int zeroed  = (w0 == 0) && (w1 == 0);
+
+                if (changed) any_changed++;
+                if (zeroed)  any_zero++;
+
+                /* Print every changed page, plus first/last always */
+                if (changed || i == 0 || i == n_sp - 1) {
+                    uart_puts("[BOOT92-C]   page["); print_hex32(i); uart_puts("] ");
+                    print_hex32(w0); uart_puts(" "); print_hex32(w1);
+                    if (zeroed)        uart_puts("  [zero — MCU zeroed it]\n");
+                    else if (changed)  uart_puts("  [*** MCU WROTE HERE ***]\n");
+                    else               uart_puts("  [canary intact — untouched]\n");
+                }
+            }
+
+            uart_puts("[BOOT92-C]   pages changed="); print_hex32((uint32_t)any_changed);
+            uart_puts("  zeroed="); print_hex32((uint32_t)any_zero);
+            uart_puts("  unchanged=");
+            print_hex32((uint32_t)(n_sp - any_changed)); uart_puts("\n");
+
+            /* Full 64-byte hex dump of page 0 regardless of canary state. */
+            uart_puts("[BOOT92-C]   page[0] first 64 bytes:\n");
+            volatile uint32_t *pg0 =
+                (volatile uint32_t *)(xhci_dma_buf + DMA_SCRATCH_PAGES_OFF);
+            /* BOOT93-B: Normal-NC — no dc civac needed, plain dsb sy suffices */
+            asm volatile("dsb sy; isb" ::: "memory");
+            for (int row = 0; row < 4; row++) {
+                uart_puts("[BOOT92-C]     +0x");
+                /* print row offset as 2-digit hex */
+                uint8_t off = (uint8_t)(row * 16);
+                char hi = (off >> 4) < 10 ? '0'+(off>>4) : 'a'+(off>>4)-10;
+                char lo = (off & 0xF) < 10 ? '0'+(off&0xF) : 'a'+(off&0xF)-10;
+                char s[3] = {hi, lo, 0};
+                uart_puts(s);
+                uart_puts(":  ");
+                for (int col = 0; col < 4; col++) {
+                    print_hex32(pg0[row * 4 + col]);
+                    uart_puts(col < 3 ? " " : "\n");
+                }
+            }
+
+            /* Also check INTR2 now — if INTR2 > 0 and all canaries intact,
+             * the MCU generated TLPs that are NOT going to our pages.       */
+            uint32_t intr2_now = readl(pcie_base + 0x4300U);
+            uart_puts("[BOOT92-C]   INTR2="); print_hex32(intr2_now);
+            uart_puts(intr2_now && !any_changed ?
+                      "  *** TLPs received but NO page written — writes misrouted ***\n" :
+                      intr2_now && any_changed ?
+                      "  TLPs received AND pages written — DMA path working\n" :
+                      "  No TLPs — MCU never attempted PCIe write\n");
+        }
+    }
+
+    /* ── MCU keepalive No-op ─────────────────────────────────────────────────
+     * Boot 56 root cause: without a command ping at TRUE RUNNING, the VL805 MCU
+     * fires its internal watchdog HSE every ~4ms throughout the entire settle
+     * window.  Boot 57 fix: submit a Command No-op (TRB type 23) immediately
+     * after TRUE RUNNING — the MCU processes it, writes a CCE to the event ring,
+     * and the watchdog is satisfied.  Settle then sees 0 HSE events.
+     *
+     * If the No-op CCE never arrives, the MCU cannot DMA-write to our event ring
+     * and we have a fundamental DMA-path problem to diagnose.
+     *
+     * We use cmd_ring_submit which does W1C HSE + RS=1 + CRCR + doorbell.
+     * Since we're at TRUE RUNNING (HSE=0, RS=1), these are harmless no-ops
+     * for the W1C and RS writes; the CRCR and doorbell are what matter.       */
+    {
+        /* BOOT91-B: Explicit full re-arm + RS=1 verify before No-op submit.
+         *
+         * Even if USBSTS was clean at snapshot time above, the MCU could
+         * fire HSE in the microseconds between that read and the doorbell.
+         * Perform a definitive re-arm here — write all ring registers then
+         * poll for clean TRUE RUNNING (up to 200ms) before the No-op TRB
+         * is written.  This guarantees the No-op is never sent to a halted
+         * controller.
+         */
+        uart_puts("[BOOT91-B] Pre-Noop full re-arm...\n");
+        writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+        asm volatile("dsb sy; isb" ::: "memory");
+        reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
+        writel(cfg_val, op + OP_CONFIG);
+        reg_write64(op, OP_CRCR_LO, crcr_val);
+        asm volatile("dsb sy; isb" ::: "memory");
+        writel(0U, ir0 + IR_ERSTSZ);
+        reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+        asm volatile("dsb sy; isb" ::: "memory");
+        writel(1U, ir0 + IR_ERSTSZ);
+        asm volatile("dsb sy; isb" ::: "memory");
+        ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+        evt_dequeue = 0;
+        evt_cycle   = 1;
+        writel(0x00000002U, ir0 + IR_IMAN);
+        asm volatile("dsb sy; isb" ::: "memory");
+        writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+        asm volatile("dsb sy; isb" ::: "memory");
+
+        /* Wait up to 200ms for clean RS=1, HCH=0, HSE=0 */
+        int b91_ok = 0;
+        uint32_t b91_t0 = get_time_ms();
+        while ((get_time_ms() - b91_t0) < 200U) {
+            uint32_t s2 = readl(op + OP_USBSTS);
+            uint32_t c2 = readl(op + OP_USBCMD);
+            if (!(s2 & STS_HCH) && (c2 & CMD_RS) && !(s2 & STS_HSE)) {
+                uart_puts("[BOOT91-B]   RS stable after ");
+                print_hex32(get_time_ms() - b91_t0);
+                uart_puts("ms  USBSTS="); print_hex32(s2); uart_puts("\n");
+                b91_ok = 1;
+                break;
+            }
+            /* Clear HSE and retry if the MCU fires watchdog */
+            if (s2 & STS_HSE) {
+                writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+                asm volatile("dsb sy; isb" ::: "memory");
+                reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
+                reg_write64(op, OP_CRCR_LO, crcr_val);
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel(0U, ir0 + IR_ERSTSZ);
+                reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel(1U, ir0 + IR_ERSTSZ);
+                asm volatile("dsb sy; isb" ::: "memory");
+                ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+                evt_dequeue = 0; evt_cycle = 1;
+                writel(0x00000002U, ir0 + IR_IMAN);
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+                asm volatile("dsb sy; isb" ::: "memory");
+            }
+            fast_delay_ms(1);
+        }
+        if (!b91_ok) {
+            uart_puts("[BOOT91-B]   WARNING: MCU never stable in 200ms before No-op\n");
+            uart_puts("[BOOT91-B]   USBSTS="); print_hex32(readl(op + OP_USBSTS));
+            uart_puts("  USBCMD="); print_hex32(readl(op + OP_USBCMD)); uart_puts("\n");
+        }
+
+        uart_puts("[xHCI] Sending No-op keepalive to MCU...\n");
+        cmd_ring_submit(0, 0, 0, TRB_TYPE_NOOP_CMD);
+
+        /* Verify No-op TRB landed at the expected physical location.
+         * cmd_enqueue was incremented by cmd_ring_submit; the TRB we just
+         * wrote is at index (cmd_enqueue-1), wrapping at CMD_RING_TRBS-1.
+         * DW3 should be (TRB_TYPE_NOOP_CMD<<10)|cycle = 0x5C00|0x1 = 0x5C01. */
+        {
+            uint32_t noop_idx = (cmd_enqueue == 0)
+                                ? (uint32_t)(CMD_RING_TRBS - 2)
+                                : (cmd_enqueue - 1);
+            uint64_t trb_phys = cmd_ring_dma + (uint64_t)noop_idx * 16;
+            uart_puts("[xHCI] No-op TRB["); print_hex32(noop_idx);
+            uart_puts("] phys="); print_hex32((uint32_t)trb_phys); uart_puts("\n");
+            volatile uint32_t *t = cmd_ring + noop_idx * 4;
+            uart_puts("[xHCI]   dw0="); print_hex32(t[0]);
+            uart_puts(" dw1="); print_hex32(t[1]);
+            uart_puts(" dw2="); print_hex32(t[2]);
+            uart_puts(" dw3="); print_hex32(t[3]); uart_puts("\n");
+            /* VL805 CRCR is write-only — always reads back 0 (confirmed boot 69).
+             * CRR bit check via readback is meaningless on VL805 hardware.    */
+            uart_puts("[xHCI]   CRCR_LO(VL805_write-only)=");
+            print_hex32(readl(op + OP_CRCR_LO)); uart_puts("\n");
+        }
+
+        uint32_t noop_ev[4];
+        /* BOOT91-C: Timestamped USBSTS snapshots during No-op wait.
+         * We want to know: does the MCU fire HSE immediately on the doorbell,
+         * after a few ms, or not at all?  Sample at fixed intervals so we can
+         * pinpoint the MCU's watchdog timeline relative to the doorbell ring.
+         * xhci_wait_event polls and clears HSE internally so we do the timed
+         * samples manually first, then hand off to wait_event.                */
+        {
+            uint32_t noop_t0 = get_time_ms();
+            static const uint32_t sample_ms[] = {1, 2, 5, 10, 20, 50, 100, 200};
+            int n_samples = (int)(sizeof(sample_ms)/sizeof(sample_ms[0]));
+            uint32_t prev_ms = 0;
+            int event_found = 0;
+            for (int si = 0; si < n_samples && !event_found; si++) {
+                uint32_t wait_for = sample_ms[si];
+                /* Spin until this sample point */
+                while ((get_time_ms() - noop_t0) < wait_for) {
+                    asm volatile("dsb sy; isb" ::: "memory");
+                    /* Quick poll — grab event if already here */
+                    if (evt_ring_poll(noop_ev)) { event_found = 1; break; }
+                }
+                if (event_found) {
+                    uart_puts("[BOOT91-C] No-op CCE arrived at ~");
+                    print_hex32(get_time_ms() - noop_t0);
+                    uart_puts("ms\n");
+                    break;
+                }
+                uint32_t sts_c = readl(op + OP_USBSTS);
+                uart_puts("[BOOT91-C] t+"); print_hex32(wait_for);
+                uart_puts("ms USBSTS="); print_hex32(sts_c);
+                uart_puts("  ERDP="); print_hex32(readl(ir0 + IR_ERDP_LO));
+                uart_puts("  ERSTBA="); print_hex32(readl(ir0 + IR_ERSTBA_LO));
+                uart_puts("  TRB0=["); print_hex32(((volatile uint32_t *)evt_ring)[0]);
+                uart_puts(","); print_hex32(((volatile uint32_t *)evt_ring)[3]);
+                uart_puts("]\n");
+                (void)prev_ms;
+                prev_ms = wait_for;
+            }
+            if (event_found) {
+                /* Already consumed by poll above — return success */
+                uint8_t cc = (noop_ev[2] >> 24) & 0xFF;
+                uart_puts("[xHCI] No-op CCE received! CC="); print_hex32(cc);
+                uart_puts(" — MCU DMA write-back confirmed\n");
+                goto noop_done;
+            }
+        }
+        /* Full timeout path */
+        if (xhci_wait_event(noop_ev, 200) == 0) {
+            uint8_t cc = (noop_ev[2] >> 24) & 0xFF;
+            uart_puts("[xHCI] No-op CCE received! CC="); print_hex32(cc);
+            uart_puts(" — MCU DMA write-back confirmed\n");
+        } else {
+            uart_puts("[xHCI] WARNING: No-op CCE timeout — re-arming rings before enumeration\n");
+            {
+                uart_puts("[xHCI]   USBSTS="); print_hex32(readl(op + OP_USBSTS));
+                uart_puts("  DCBAAP="); print_hex32(readl(op + OP_DCBAAP_LO));
+                uart_puts("  CRCR(w-o)="); print_hex32(readl(op + OP_CRCR_LO)); uart_puts("\n");
+                uint32_t intr2 = readl(pcie_base + 0x4300U);
+                uart_puts("[xHCI]   PCIE_INTR2_STATUS="); print_hex32(intr2);
+                uart_puts(intr2 ? "  (RC got PCIe TLP — check GIC delivery)\n"
+                                : "  (RC silent — MCU sent no PCIe TLP)\n");
+            }
+            /* Re-arm all rings before enumeration: MCU may have fired HSE
+             * during the No-op wait and zeroed the ring registers.          */
+            {
+                void *_ir0 = ir_base(0);
+                uint64_t _ea = phys_to_dma((uint64_t)virt_to_phys((void *)dcbaa));
+                uint64_t _cr = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
+                writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+                asm volatile("dsb sy; isb" ::: "memory");
+                reg_write64(op, OP_DCBAAP_LO, _ea);
+                reg_write64(op, OP_CRCR_LO, _cr);
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel(0U, _ir0 + IR_ERSTSZ);
+                reg_write64(_ir0, IR_ERSTBA_LO, erst_dma_addr);
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel(1U, _ir0 + IR_ERSTSZ);
+                asm volatile("dsb sy; isb" ::: "memory");
+                ERDP_REARM(_ir0, evt_ring_dma); /* boot107: EHB=0 arms interrupter */
+                evt_dequeue = 0; evt_cycle = 1;
+                writel(0x00000002U, _ir0 + IR_IMAN);
+                asm volatile("dsb sy; isb" ::: "memory");
+                writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+                asm volatile("dsb sy; isb" ::: "memory");
+            }
+            /* Continue anyway — best-effort enumeration */
+        }
+        noop_done:; /* BOOT91-C jump target */
+    }
+
     /* Step 5: Power up ports.
      * Boot 39 finding: writing PP=1 to Port 1 (companion, DR=1) triggered
      * HSE with ~3ms delay, killing the Enable Slot window.  Skip the
@@ -582,9 +1495,11 @@ static int run_controller(void) {
      * device enumeration, so this write was always unnecessary.           */
     for (int p = 0; p < (int)xhci_ctrl.max_ports; p++) {
         uint32_t ps5 = readl(op + 0x400 + p * 0x10);
-        if (ps5 & (1U << 30)) {
-            uart_puts("[xHCI] step5: skip companion port ");
-            print_hex32((uint32_t)(p + 1)); uart_puts(" (DR=1)\n");
+        /* boot80: only skip companion if no device (CCS=0).
+         * If CCS=1, a device fell back to USB2 — power it up normally. */
+        if ((ps5 & (1U << 30)) && !(ps5 & PORTSC_CCS)) {
+            uart_puts("[xHCI] step5: skip empty companion ");
+            print_hex32((uint32_t)(p + 1)); uart_puts(" (DR=1, CCS=0)\n");
             continue;
         }
         writel((ps5 & ~PORTSC_WIC) | PORTSC_PP, op + 0x400 + p * 0x10);
@@ -607,10 +1522,43 @@ static int run_controller(void) {
     int _settle_evts = 0;
     int _settle_hse  = 0;
     for (int i = 0; i < 100; i++) {
-        delay_ms(4);
+        fast_delay_ms(4);
         uint32_t _ev[4];
         while (evt_ring_poll(_ev)) _settle_evts++;
-        if (readl(op + OP_USBSTS) & STS_HSE) _settle_hse++;
+        /* W1C HSE each iteration — count DISTINCT fires, not sticky accumulation.
+         * Without No-op keepalive (boot 65): hse=97/100 (fired once, stayed set).
+         * With No-op keepalive (boot 66 target): expect hse=0 across all 100.   */
+        if (readl(op + OP_USBSTS) & STS_HSE) {
+            _settle_hse++;
+            writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+            asm volatile("dsb sy; isb" ::: "memory");
+            /* boot81: Full ring re-arm on every settle HSE — identical to the
+             * initial retry loop.  VL805 MCU resets ALL ring registers (CRCR,
+             * ERSTBA, DCBAA) on every HSE.  The old code only wrote RS=1 here,
+             * leaving CRCR=0 after the 400ms settle window, so Enable Slot was
+             * submitted to a dead command ring (boot 80: CRCR=0x00000000 at
+             * every Enable Slot timeout despite ring programmed at init).      */
+            reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
+            writel(cfg_val, op + OP_CONFIG);
+            reg_write64(op, OP_CRCR_LO, crcr_val);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(0U, ir0 + IR_ERSTSZ);
+            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(1U, ir0 + IR_ERSTSZ);
+            asm volatile("dsb sy; isb" ::: "memory");
+            ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+            /* boot86: reset software consumer index to match ERDP = ring_base.
+             * If a false canary event was consumed (boot85 bug), evt_dequeue was
+             * left at 1 while ERDP is re-armed to base → next poll reads slot 1
+             * (stale/zero) while MCU writes to slot 0.  Reset both here.       */
+            evt_dequeue = 0;
+            evt_cycle   = 1;
+            writel(0x00000002U, ir0 + IR_IMAN);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+            asm volatile("dsb sy; isb" ::: "memory");
+        }
     }
     uart_puts("[xHCI] Settle done: USBSTS="); print_hex32(readl(op + OP_USBSTS));
     uart_puts(" evts="); print_hex32((uint32_t)_settle_evts);
@@ -627,6 +1575,35 @@ static int run_controller(void) {
         uart_puts(" cycle="); print_hex32(evt_cycle); uart_puts("\n");
     }
 
+    /* boot81: Final ring re-arm before port scan.
+     * Ensure the last thing the MCU sees before Enable Slot is a fresh set of
+     * ring pointers, not the stale-zero state left by the last settle HSE.
+     * We are in RS=1 here (settle loop leaves it that way) — write ring regs
+     * while running (safe: VL805 only snapshots CRCR at RS=0→1 edge).       */
+    {
+        uint32_t sts_pre = readl(op + OP_USBSTS);
+        if (sts_pre & STS_HSE) {
+            /* HSE fired after settle loop — clear and re-arm before scan */
+            writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
+            asm volatile("dsb sy; isb" ::: "memory");
+        }
+        reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
+        writel(cfg_val, op + OP_CONFIG);
+        reg_write64(op, OP_CRCR_LO, crcr_val);
+        asm volatile("dsb sy; isb" ::: "memory");
+        writel(0U, ir0 + IR_ERSTSZ);
+        reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+        asm volatile("dsb sy; isb" ::: "memory");
+        writel(1U, ir0 + IR_ERSTSZ);
+        asm volatile("dsb sy; isb" ::: "memory");
+        ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+        writel(0x00000002U, ir0 + IR_IMAN);
+        asm volatile("dsb sy; isb" ::: "memory");
+        if (sts_pre & STS_HSE)
+            writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+        asm volatile("dsb sy; isb" ::: "memory");
+    }
+
     /* Final state check */
     uart_puts("[xHCI] Final: USBSTS="); print_hex32(readl(op + OP_USBSTS));
     uart_puts(" USBCMD="); print_hex32(readl(op + OP_USBCMD));
@@ -634,6 +1611,81 @@ static int run_controller(void) {
     uart_puts(" ERSTBA="); print_hex32(readl(ir0 + IR_ERSTBA_LO));
     uart_puts(" ERSTSZ="); print_hex32(readl(ir0 + IR_ERSTSZ));
     uart_puts("\n");
+
+    /* boot86: [CANARY-CHECK] Read back event ring TRB 0.
+     *
+     * We wrote 0xDEADBEEF/0xCAFEF00D/0xDEADC0DE/0x0000BEEE to TRB 0 before
+     * (boot86: word3 bit0=0, was 0x0000BEEF in boot85 which caused false-positive poll).
+     * RS=1.  The MCU should overwrite TRB 0 with its first event within ms.
+     *
+     * Possible outcomes:
+     *   A) TRB 0 = 0xDEADBEEF (unchanged)
+     *      → MCU never wrote to event ring.  UBUS write path broken, OR MCU
+     *        never reached the state where it posts events.
+     *   B) TRB 0 = 0x00000000 (zeroed)
+     *      → Our settle-loop re-arm did dma_zero on evt_ring somewhere, or
+     *        MCU wrote all-zeros (unlikely for a real TRB).
+     *   C) TRB 0 = valid xHCI TRB (type field bits[15:10] != 0)
+     *      → UBUS write path WORKING.  MCU wrote a real event.  Decode it.
+     *        Common first events: CCE (type=33), PSCE (type=34), MFIE (type=39).
+     *
+     * Also read a cache-miss range (512 bytes) to see if ANY part of the ring
+     * was written.  The MCU may not start at TRB 0 if ERDP was non-zero.
+     *
+     * This is the most definitive UBUS write test we have done.            */
+    /* boot116: cycle-bit check replaces canary check.
+     * Ring is fully zeroed — any TRB with word3.bit0=1 was written by the MCU. */
+    {
+        volatile uint32_t *evt_trb0 =
+            (volatile uint32_t *)(xhci_dma_buf + DMA_EVT_RING_OFF);
+        asm volatile("dsb sy; isb" ::: "memory");
+
+        uint32_t w0 = evt_trb0[0], w1 = evt_trb0[1];
+        uint32_t w2 = evt_trb0[2], w3 = evt_trb0[3];
+        uart_puts("[xHCI] [TRB0-CHECK] TRB[0]: ");
+        print_hex32(w0); uart_puts(" "); print_hex32(w1); uart_puts(" ");
+        print_hex32(w2); uart_puts(" "); print_hex32(w3); uart_puts("\n");
+
+        if ((w3 & 1U) == 1U) {
+            uint32_t trb_type = (w3 >> 10) & 0x3FU;
+            uart_puts("[xHCI] [TRB0] MCU WROTE TRB[0]! type=");
+            print_hex32(trb_type); uart_puts(" (33=CCE 34=PSCE)\n");
+            uart_puts("[xHCI] *** EVENT RING WORKING ***\n");
+        } else if (w0 == 0U && w1 == 0U && w2 == 0U && w3 == 0U) {
+            uart_puts("[xHCI] [TRB0] Zero — MCU did not write TRB[0]\n");
+        } else {
+            uart_puts("[xHCI] [TRB0] Non-zero but cycle=0 — unexpected content\n");
+        }
+
+        /* boot116: full ring dump — look for any TRB with cycle=1 written by MCU */
+        uart_puts("[xHCI] [RING-DUMP] Full event ring (64 TRBs):\n");
+        asm volatile("dsb sy; isb" ::: "memory");
+        int any_mcu_wrote = 0;
+        for (int ti = 0; ti < EVT_RING_TRBS; ti++) {
+            uint32_t t0 = evt_trb0[ti * 4 + 0];
+            uint32_t t1 = evt_trb0[ti * 4 + 1];
+            uint32_t t2 = evt_trb0[ti * 4 + 2];
+            uint32_t t3 = evt_trb0[ti * 4 + 3];
+            int is_zero = (t0 == 0 && t1 == 0 && t2 == 0 && t3 == 0);
+            if (!is_zero) {
+                uart_puts("[xHCI]   TRB["); print_hex32((uint32_t)ti); uart_puts("]: ");
+                print_hex32(t0); uart_puts(" "); print_hex32(t1); uart_puts(" ");
+                print_hex32(t2); uart_puts(" "); print_hex32(t3);
+                if (t3 & 1U) {
+                    uint32_t type = (t3 >> 10) & 0x3FU;
+                    uint32_t cc   = (t2 >> 24) & 0xFFU;
+                    uart_puts("  [MCU wrote: type="); print_hex32(type);
+                    uart_puts(" cc="); print_hex32(cc); uart_puts("]");
+                    any_mcu_wrote = 1;
+                } else {
+                    uart_puts("  [non-zero, cycle=0]");
+                }
+                uart_puts("\n");
+            }
+        }
+        if (!any_mcu_wrote)
+            uart_puts("[xHCI] [RING-DUMP] No MCU-written TRBs found (all cycle=0 or zero).\n");
+    }
 
     /* Event ring self-test REMOVED (boot 53 confirmed PASS every run).
      * Ring stays at initial state: deq=0, ERDP=ring_base, cycle=1.
@@ -644,7 +1696,7 @@ static int run_controller(void) {
         uintptr_t pa = 0;
         asm volatile("" : "+r"(pa));
         volatile uint32_t *p = (volatile uint32_t *)pa;
-        asm volatile("dc civac, %0\n\tdsb sy\n\tisb" :: "r"(pa) : "memory");
+        asm volatile("dsb sy; isb" ::: "memory"); /* phys 0 = Normal memory */
         uart_puts("[xHCI] phys0 ERST check: [");
         print_hex32(p[0]); uart_puts(","); print_hex32(p[1]);
         uart_puts(","); print_hex32(p[2]); uart_puts(","); print_hex32(p[3]);
@@ -675,9 +1727,12 @@ int xhci_init(void *base_addr) {
 
     /* ── DMA region sanity check + explicit zero-init ─────────────────────
      * .xhci_dma is an ALLOC-only (NOBITS) section — it is NOT present in
-     * kernel8.img.  Physical 0x10000 contains whatever the Pi 4 VideoCore
-     * firmware left there.  Dump it first (to catch any firmware conflict),
-     * then zero it unconditionally so every ring and struct starts clean.
+     * kernel8.img.  The physical address is set by the linker:
+     *   phoenix_fixed3: 0x10000   (VideoCore contaminates — boot83 garbage)
+     *   phoenix_fixed5: 0x30000000 (clean but PCIe top nibble = 0xF — boot84-93)
+     *   phoenix_fixed6: 0x0C000000 (boot94 test — PCIe 0xCC000000, top nibble C)
+     * Dump it first (to catch any firmware conflict), then zero unconditionally
+     * so every ring and struct starts clean.
      *
      * The section spans [__xhci_dma_start, __xhci_dma_end) = 0x42000 bytes.
      * We inspect only the first 256 bytes (covers DCBAA + cmd_ring header).
@@ -698,10 +1753,131 @@ int xhci_init(void *base_addr) {
                 (uint64_t)(uintptr_t)xhci_dma_buf, 256);
 
     /* Explicit zero — NOBITS section; ring cycle bits must start at 0.
-     * Normal-NC mapping: memset goes straight to DRAM, no cache issue.  */
-    memset(xhci_dma_buf, 0, dma_region_size);
+     * Normal-NC mapping: dma_zero uses volatile 32-bit writes (no LDP/STP).
+     * volatile prevents compiler from emitting LDP/STP even on Normal memory. */
+    dma_zero(xhci_dma_buf, dma_region_size);
     asm volatile("dsb sy; isb" ::: "memory");
     uart_puts("[xHCI] DMA region zeroed.\n");
+
+    /* BOOT93-A: MMU memory-type self-check.
+     *
+     * Use AT S1E1R (Address Translate Stage-1 EL1 Read) to walk the page
+     * tables for the DMA buffer virtual address and read PAR_EL1.
+     * PAR_EL1 bits[7:0] on a successful translation:
+     *   bit[0]   = F (fault) — must be 0
+     *   bits[3:2] = SH (shareability): 0b11 = inner-shareable (needed)
+     *   bits[7:4] = Attr (memory type from MAIR):
+     *               0x0 = Device nGnRnE  ← WRONG (pre-BOOT93)
+     *               0x4 = Normal NC      ← CORRECT (post-BOOT93)
+     *               0xF = Normal WB      ← also wrong
+     *
+     * If Attr=0x0 is still showing, the MMU code change did not take effect
+     * and inbound PCIe writes will still be invisible to the CPU.
+     */
+    {
+        uint64_t va  = (uint64_t)(uintptr_t)xhci_dma_buf;
+        uint64_t par = 0;
+        asm volatile(
+            "at s1e1r, %1\n\t"
+            "isb\n\t"
+            "mrs %0, par_el1"
+            : "=r"(par) : "r"(va) : "memory"
+        );
+        uint8_t fault = par & 0x1U;
+        uint8_t sh    = (uint8_t)((par >> 7) & 0x3U);   /* PAR_EL1[8:7] = SH */
+        uint8_t attr  = (uint8_t)((par >> 56) & 0xFFU); /* PAR_EL1[63:56] = ATTR */
+        /* Note: PAR_EL1 layout on success (F=0):
+         *   bits[11:0]   = lower attributes / ignored
+         *   bits[47:12]  = PA[47:12]
+         *   bits[56]     = reserved
+         *   bits[58:56]  = SH[1:0] at bits[8:7] in some implementations
+         *   bits[63:56]  = ATTR (memory attribute from MAIR)
+         * Exact bit positions vary by implementation; we check ATTR at [63:56]
+         * which is the standard ARMv8 PAR_EL1 encoding. */
+        uart_puts("[BOOT93-A] MMU type check: PAR_EL1=");
+        print_hex32((uint32_t)(par >> 32)); uart_puts(":"); print_hex32((uint32_t)par);
+        uart_puts("  fault="); print_hex32(fault);
+        uart_puts("  ATTR=0x"); print_hex32(attr);
+        uart_puts("\n");
+        if (fault) {
+            uart_puts("[BOOT93-A] *** AT FAULT — translation failed! Check MMU tables. ***\n");
+        } else if (attr == 0x00U) {
+            uart_puts("[BOOT93-A] *** ATTR=0x00 = Device nGnRnE — MMU change NOT applied! ***\n");
+            uart_puts("[BOOT93-A] *** PCIe DMA writes will NOT be visible. Fix mmu.c first. ***\n");
+        } else if (attr == 0x44U || attr == 0x4U) {
+            uart_puts("[BOOT93-A] ATTR=Normal-NC ✓  PCIe DMA coherency ENABLED\n");
+        } else if (attr == 0xFFU || attr == 0xF4U || attr == 0x4FU) {
+            uart_puts("[BOOT93-A] ATTR=Normal Cacheable — unexpected, but coherent\n");
+        } else {
+            uart_puts("[BOOT93-A] ATTR=unknown — check MAIR register encoding\n");
+        }
+    }
+
+    /* ── boot85: Event-ring UBUS write canary ───────────────────────────────
+     * Place a known marker in event ring TRB 0 AFTER zeroing.  The xHCI MCU
+     * writes its first event (usually a Port Status Change or Command Complete)
+     * to TRB 0 of the event ring.  If the canary changes after controller
+     * start, the UBUS write path from VL805 to DRAM is WORKING.
+     * If it stays 0xDEADBEEF, the MCU never wrote to this address (either UBUS
+     * is broken, or the MCU never generated an event — a critical distinction
+     * from the prior "all zeros" result which was ambiguous).
+     *
+     * Canary is written AFTER dma_zero so we cannot mistake it for garbage.
+     * It will be overwritten by setup_event_ring() → dma_zero(evt_ring, ...)
+     * WAIT — setup_event_ring zeros the ring again.  So we write the canary
+     * AFTER setup_event_ring() returns in run_controller().  See the canary
+     * write point marked [CANARY-WRITE] below in run_controller(). */
+    uart_puts("[xHCI] Canary will be written to evt_ring TRB 0 after ring setup.\n");
+
+    /* ── MSI landing pad diagnostic (user boot 66 request) ─────────────────
+     * DMA_MSI_PAGE_OFF = 0x1000 into the DMA buffer.  pci.c programs the RC
+     * MSI BAR to this physical address, so the VL805 MSI write TLP lands here.
+     *
+     * NOTE: The CPU write below (0xDEADBEEF) does NOT go through PCIe — it is
+     * a direct DRAM write.  It will NOT trigger the GIC MSI interrupt.  The RC
+     * MSI mechanism only fires when the VL805 does a PCIe MemWrite to the MSI
+     * BAR address.  This test confirms the memory is accessible (no data abort
+     * on Device nGnRnE) and msi_fire_count stays 0 after a CPU-side write.   */
+    {
+        volatile uint32_t *msi_landing = (volatile uint32_t *)(xhci_dma_buf + DMA_MSI_PAGE_OFF);
+        uint64_t msi_phys = (uint64_t)(uintptr_t)(xhci_dma_buf + DMA_MSI_PAGE_OFF);
+
+        uart_puts("[DEBUG] MSI landing pad phys: 0x");
+        print_hex32((uint32_t)(msi_phys >> 32));
+        print_hex32((uint32_t)msi_phys);
+        uart_puts("\n");
+
+        uart_puts("[DEBUG] Before test write: 0x");
+        print_hex32(msi_landing[0]);
+        uart_puts("\n");
+
+        /* CPU-side write to Device memory — confirms no data abort, but
+         * does NOT trigger xhci_irq_handler (no PCIe transaction involved). */
+        msi_landing[0] = 0xDEADBEEFU;
+        asm volatile("dsb sy; isb" ::: "memory");
+        fast_delay_ms(10);
+
+        uart_puts("[DEBUG] After test write: 0x");
+        print_hex32(msi_landing[0]);
+        uart_puts("  msi_fire_count now: 0x");
+        print_hex32(msi_fire_count);
+        uart_puts("\n");
+
+        /* Clear the test value — ring setup starts below */
+        msi_landing[0] = 0U;
+        asm volatile("dsb sy; isb" ::: "memory");
+    }
+
+    /* ── GIC self-test retired after boot 67 ────────────────────────────
+     * Boot 67 confirmed: GIC→CPU→handler path is fully working.
+     * The self-test was removed here because it fired xhci_irq_handler
+     * before the event ring was set up, which caused the handler to read
+     * garbage TRBs from physical address 0x0 (boot vector table area,
+     * cycle bit=1 by coincidence).  This advanced the software dequeue
+     * pointer to 0x10, so the subsequent No-op wait_event read the same
+     * garbage and returned CC=0x52 (fake success), meaning the real MCU
+     * No-op CCE was never processed and the watchdog kept firing HSE.
+     * GIC wiring is proven — no need to re-run this test.              */
 
     /* ── End DMA init ──────────────────────────────────────────────────── */
 
@@ -766,7 +1942,7 @@ static void ep0_ring_init(void) {
     ep0_ring    = (volatile uint32_t *)(xhci_dma_buf + DMA_EP0_RING_OFF);
     ep0_cycle   = 1;  /* ICS=1; matches VL805 MCU CCS=1 expectation */
     ep0_enqueue = 0;
-    memset((void *)ep0_ring, 0, EP0_RING_TRBS * 16);
+    dma_zero(ep0_ring, EP0_RING_TRBS * 16);
 
     uint64_t ring_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_ring));
     uint32_t li = (EP0_RING_TRBS - 1) * 4;
@@ -827,16 +2003,22 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32
      * between it and db[0] closes that gap. */
     void *op = xhci_ctrl.op_regs;
 
-    /* Force-ring: W1C → RS=1 → CRCR → doorbell, atomically.
-     * VL805 MCU fires HSE as its idle keepalive; waiting for HSE=0 before
-     * the doorbell means never ringing.  Accept HSE=1 post-ring.         */
+    /* Force-ring: W1C → CRCR (before RS=1) → RS=1 → doorbell.
+     *
+     * Critical ordering (boot76 fix): CRCR must be written BEFORE RS=1.
+     * The VL805 MCU captures CRCR at the RS=0→1 transition.  Writing
+     * CRCR after RS=1 (when CRR=1) violates xHCI spec §5.4.6 and the
+     * VL805 ignores it — the MCU walks from whatever address it captured
+     * at the last transition.  Writing CRCR first (while RS may be 0
+     * after HSE fired) ensures the MCU captures the correct ring base.  */
     writel(STS_HSE | STS_EINT | STS_PCD, op + OP_USBSTS);
-    asm volatile("dsb sy; isb" ::: "memory");
-    writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
     asm volatile("dsb sy; isb" ::: "memory");
 
     uint64_t crcr = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
-    reg_write64(op, OP_CRCR_LO, crcr);
+    reg_write64(op, OP_CRCR_LO, crcr);      /* write while RS may be 0 */
+    asm volatile("dsb sy; isb" ::: "memory");
+
+    writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);   /* RS=1: MCU captures CRCR */
     asm volatile("dsb sy; isb" ::: "memory");
 
     volatile uint32_t *db = (volatile uint32_t *)xhci_ctrl.doorbell_regs;
@@ -849,8 +2031,8 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32
 static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uint32_t speed) {
     input_ctx = (volatile uint8_t *)(xhci_dma_buf + DMA_INPUT_CTX_OFF);
     out_ctx   = (volatile uint8_t *)(xhci_dma_buf + DMA_OUT_CTX_OFF);
-    memset((void *)input_ctx, 0, 34 * CTX_SIZE);
-    memset((void *)out_ctx,   0, 32 * CTX_SIZE);
+    dma_zero(input_ctx, 34 * CTX_SIZE);
+    dma_zero(out_ctx, 32 * CTX_SIZE);
 
     volatile uint32_t *icc = (volatile uint32_t *)input_ctx;
     icc[1] = 0x00000003;
@@ -882,7 +2064,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
 
     /* Short timeout — VL805 MCU does not yet write CCEs; caller continues */
     uint32_t ev[4];
-    if (xhci_wait_event(ev, 200) != 0) return -1;
+    if (xhci_wait_event(ev, 50) != 0) return -1;
     uint8_t cc = (ev[2] >> 24) & 0xFF;
     if (cc != CC_SUCCESS) return -1;
 
@@ -894,7 +2076,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
 
 static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len) {
     volatile uint8_t *ep0_data = (volatile uint8_t *)(xhci_dma_buf + DMA_EP0_DATA_OFF);
-    memset((void *)ep0_data, 0, 512);
+    dma_zero(ep0_data, 512);
 
     uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
 
@@ -908,12 +2090,12 @@ static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len) {
     ep0_doorbell(slot_id);
 
     uint32_t ev[4];
-    if (xhci_wait_event(ev, 5000) != 0) return -1;
+    if (xhci_wait_event(ev, 100) != 0) return -1;
     uint8_t cc = (ev[2] >> 24) & 0xFF;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PKT) return -1;
 
     uint32_t ev2[4];
-    xhci_wait_event(ev2, 1000);
+    xhci_wait_event(ev2, 20);
 
     int copy = len < 18 ? len : 18;
     for (int i = 0; i < copy; i++) buf[i] = ep0_data[i];
@@ -926,13 +2108,18 @@ static void enumerate_port(int port) {
 
     uart_puts("[xHCI] Port "); print_hex32(port + 1);
 
-    /* Companion port (DR bit 30): Port 1 on VL805 is an internal HS hub.
-     * Any PORTSC write to it fires HSE and halts the controller.  Skip. */
-    if (portsc & (1U << 30)) {
-        uart_puts(": companion (DR=1, skipped)  PORTSC=");
+    /* DR bit (bit 30): USB2 companion port on VL805.
+     * boot79 analysis: USB3 link on port 2 failed; device fell back to USB2
+     * on the companion port (DR=1, CCS=1).  Skip only when empty (CCS=0).
+     * When CCS=1 fall through to PR-based USB2 enumeration below.          */
+    int is_usb2_companion = (portsc & (1U << 30)) ? 1 : 0;
+    if (is_usb2_companion && !(portsc & PORTSC_CCS)) {
+        uart_puts(": empty companion (DR=1, CCS=0, skipped)  PORTSC=");
         print_hex32(portsc); uart_puts("\n");
         return;
     }
+    if (is_usb2_companion)
+        uart_puts(": USB2 companion fallback (DR=1, CCS=1)");
 
     if (!(portsc & PORTSC_CCS)) {
         /* PRC=1 or CSC=1 with CCS=0: the MCU detected a device during
@@ -951,7 +2138,7 @@ static void enumerate_port(int port) {
             writel((1U << 31) | PORTSC_PP, op + 0x400 + port * 0x10);
             asm volatile("dsb sy" ::: "memory");
             for (int t = 0; t < 1000; t++) {
-                delay_ms(1);
+                fast_delay_ms(1);
                 portsc = readl(op + 0x400 + port * 0x10);
                 if (portsc & PORTSC_CCS) break;
                 if ((t + 1) % 200 == 0) {
@@ -965,11 +2152,11 @@ static void enumerate_port(int port) {
                 uart_puts("[xHCI]   WPR recovery failed — trying PP power cycle\n");
                 writel(PORTSC_PP & 0, op + 0x400 + port * 0x10); /* PP=0 */
                 asm volatile("dsb sy" ::: "memory");
-                delay_ms(300);
+                fast_delay_ms(300);
                 writel(PORTSC_PP, op + 0x400 + port * 0x10);     /* PP=1 */
                 asm volatile("dsb sy" ::: "memory");
                 for (int t = 0; t < 2000; t++) {
-                    delay_ms(1);
+                    fast_delay_ms(1);
                     portsc = readl(op + 0x400 + port * 0x10);
                     if (portsc & PORTSC_CCS) break;
                     if ((t + 1) % 500 == 0) {
@@ -995,46 +2182,67 @@ static void enumerate_port(int port) {
 
     uart_puts(": CONNECTED  PORTSC=");
     print_hex32(portsc); uart_puts("\n");
-    uart_puts("[xHCI] Issuing single WPR...\n");
-
-    /* Single clean Warm Port Reset — PR alone times out on this SS device.
-     * Clean write only: do NOT copy snapshot bits (W1C bits in snapshot
-     * can re-trigger change events and generate extra MCU PSCEv).         */
-    writel((1U << 31) | PORTSC_PP, op + 0x400 + port * 0x10);
-    asm volatile("dsb sy" ::: "memory");
 
     uint32_t ps = portsc;
-    for (int t = 0; t < 300; t++) {
-        delay_ms(1);
-        ps = readl(op + 0x400 + port * 0x10);
-        /* Boot 54: waiting for WPR=0 AND PED=1 caused 300ms timeout when
-         * link training failed (PED never became 1 — PR stuck at 1).
-         * Fix: break as soon as WPR bit (bit 31) clears — reset completed
-         * regardless of whether USB3 link trained.  PED=1 is checked after
-         * the speed read to decide if enumeration can proceed.            */
-        if (!(ps & (1U << 31))) break;
-    }
-    uart_puts("[xHCI] WPR done. PORTSC="); print_hex32(ps); uart_puts("\n");
+    if (is_usb2_companion) {
+        /* USB2 companion port: Port Reset (PR, bit 4) — WPR is SS-only.
+         * boot80: device fell back from failed USB3 link to this USB2 port.
+         * PR brings the port to Enabled (PED=1) with speed in bits[13:10]. */
+        uart_puts("[xHCI] USB2 companion: issuing PR (bit 4)...\n");
+        writel(PORTSC_PP | (1U << 4), op + 0x400 + port * 0x10);
+        asm volatile("dsb sy" ::: "memory");
+        for (int t = 0; t < 300; t++) {
+            fast_delay_ms(1);
+            ps = readl(op + 0x400 + port * 0x10);
+            if (!(ps & (1U << 4))) break;   /* PR cleared → reset done */
+        }
+        uart_puts("[xHCI] PR done. PORTSC="); print_hex32(ps); uart_puts("\n");
+        if (!(ps & PORTSC_CCS)) {
+            uart_puts("[xHCI] Device lost after PR — aborting\n");
+            return;
+        }
+    } else {
+        /* USB3: Warm Port Reset (WPR, bit 31) — triggers an internal PR.   */
+        uart_puts("[xHCI] Issuing single WPR...\n");
 
-    if (!(ps & PORTSC_CCS)) {
-        uart_puts("[xHCI] Device lost after WPR — aborting\n");
-        return;
-    }
+        /* Single clean Warm Port Reset — PR alone times out on this SS device.
+         * Clean write only: do NOT copy snapshot bits (W1C bits in snapshot
+         * can re-trigger change events and generate extra MCU PSCEv).         */
+        writel((1U << 31) | PORTSC_PP, op + 0x400 + port * 0x10);
+        asm volatile("dsb sy" ::: "memory");
 
-    /* Clear W1C change bits with clean write (WRC, CSC, PRC etc.).
-     * Do NOT copy snapshot: PED is RW1C on USB3 and snapshot copy
-     * would disable the port.                                             */
-    writel(PORTSC_WIC | PORTSC_PP, op + 0x400 + port * 0x10);
-    asm volatile("dsb sy" ::: "memory");
+        for (int t = 0; t < 300; t++) {
+            fast_delay_ms(1);
+            ps = readl(op + 0x400 + port * 0x10);
+            /* Boot 54: waiting for WPR=0 AND PED=1 caused 300ms timeout when
+             * link training failed (PED never became 1 — PR stuck at 1).
+             * Fix: break as soon as WPR bit (bit 31) clears — reset completed
+             * regardless of whether USB3 link trained.  PED=1 is checked after
+             * the speed read to decide if enumeration can proceed.            */
+            if (!(ps & (1U << 31))) break;
+        }
+        uart_puts("[xHCI] WPR done. PORTSC="); print_hex32(ps); uart_puts("\n");
 
-    /* Boot 54: speed=0 because PR bit (bit 4) was still set when speed was
-     * read (port reset still in progress).  Wait for PR=0 — up to 200ms —
-     * before reading speed.  PR clears when the standard port reset (that
-     * follows WPR internally) completes and port is addressed.            */
-    for (int t = 0; t < 200; t++) {
-        delay_ms(1);
-        ps = readl(op + 0x400 + port * 0x10);
-        if (!(ps & (1U << 4))) break;   /* PR cleared */
+        if (!(ps & PORTSC_CCS)) {
+            uart_puts("[xHCI] Device lost after WPR — aborting\n");
+            return;
+        }
+
+        /* Clear W1C change bits with clean write (WRC, CSC, PRC etc.).
+         * Do NOT copy snapshot: PED is RW1C on USB3 and snapshot copy
+         * would disable the port.                                             */
+        writel(PORTSC_WIC | PORTSC_PP, op + 0x400 + port * 0x10);
+        asm volatile("dsb sy" ::: "memory");
+
+        /* Boot 54: speed=0 because PR bit (bit 4) was still set when speed was
+         * read (port reset still in progress).  Wait for PR=0 — up to 200ms —
+         * before reading speed.  PR clears when the standard port reset (that
+         * follows WPR internally) completes and port is addressed.            */
+        for (int t = 0; t < 200; t++) {
+            fast_delay_ms(1);
+            ps = readl(op + 0x400 + port * 0x10);
+            if (!(ps & (1U << 4))) break;   /* PR cleared */
+        }
     }
 
     ps = readl(op + 0x400 + port * 0x10);
@@ -1142,7 +2350,7 @@ static void enumerate_port(int port) {
                           | ((uint32_t)USB_DESC_CONFIG << 24);
         uint32_t setup_hi = (uint32_t)9 << 16;
         volatile uint8_t *ep0_data = (volatile uint8_t *)(xhci_dma_buf + DMA_EP0_DATA_OFF);
-        memset((void *)ep0_data, 0, 256);
+        dma_zero(ep0_data, 256);
         uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
 
         /* First fetch 9 bytes to get wTotalLength */
@@ -1150,27 +2358,27 @@ static void enumerate_port(int port) {
         ep0_enq((uint32_t)data_dma, (uint32_t)(data_dma >> 32), 9, TRB_TYPE_DATA, TRB_IOC | TRB_DIR_IN);
         ep0_enq(0, 0, 0, TRB_TYPE_STATUS, TRB_IOC);
         ep0_doorbell(slot_id);
-        if (xhci_wait_event(ev, 3000) != 0) {
+        if (xhci_wait_event(ev, 100) != 0) {
             uart_puts("[xHCI] GET_DESCRIPTOR(Config,9) timeout\n");
             goto probe;
         }
-        xhci_wait_event(ev, 500); /* drain Status event */
+        xhci_wait_event(ev, 20); /* drain Status event */
 
         total_len = (uint16_t)(ep0_data[2] | ((uint16_t)ep0_data[3] << 8));
         if (total_len < 9 || total_len > 255) total_len = 9;
 
         /* Fetch full config descriptor */
-        memset((void *)ep0_data, 0, 256);
+        dma_zero(ep0_data, 256);
         setup_hi = (uint32_t)total_len << 16;
         ep0_enq(setup_lo, setup_hi, 8, TRB_TYPE_SETUP, TRB_IDT | (3U << 16));
         ep0_enq((uint32_t)data_dma, (uint32_t)(data_dma >> 32), total_len, TRB_TYPE_DATA, TRB_IOC | TRB_DIR_IN);
         ep0_enq(0, 0, 0, TRB_TYPE_STATUS, TRB_IOC);
         ep0_doorbell(slot_id);
-        if (xhci_wait_event(ev, 3000) != 0) {
+        if (xhci_wait_event(ev, 100) != 0) {
             uart_puts("[xHCI] GET_DESCRIPTOR(Config,full) timeout\n");
             goto probe;
         }
-        xhci_wait_event(ev, 500);
+        xhci_wait_event(ev, 20);
 
         for (int i = 0; i < total_len; i++) cfgbuf[i] = ep0_data[i];
     } /* end real-path config fetch */
@@ -1274,9 +2482,9 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
 
     /* OUT: copy caller's data into DMA buffer */
     if (!dir_in && data && length)
-        memcpy((void *)ep0_data, data, length);
+        dma_copy_to(ep0_data, data, length);
     else
-        memset((void *)ep0_data, 0, length < 512 ? (length ? length : 8) : 512);
+        dma_zero(ep0_data, length < 512 ? (length ? length : 8) : 512);
 
     uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
 
@@ -1305,7 +2513,7 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
     ep0_doorbell(slot_id);
 
     uint32_t ev[4];
-    if (xhci_wait_event(ev, timeout ? timeout : 1000) != 0) {
+    if (xhci_wait_event(ev, timeout ? timeout : 100) != 0) {
         uart_puts("[xHCI] control_transfer: TIMEOUT\n");
         return -1;
     }
@@ -1315,7 +2523,7 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
     /* Drain Status event if data phase was issued */
     if (length > 0) {
         uint32_t ev2[4];
-        xhci_wait_event(ev2, 500);
+        xhci_wait_event(ev2, 20);
     }
 
     /* IN: copy DMA buffer to caller */
@@ -1323,7 +2531,7 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
         int got = (int)(ev[2] & 0xFFFF); /* residue in low 17 bits of dword 2 */
         int actual = length - got;
         if (actual < 0) actual = 0;
-        memcpy(data, (void *)ep0_data, (size_t)actual);
+        dma_copy_from(data, ep0_data, (size_t)actual);
         return actual;
     }
     return (int)length;
@@ -1387,31 +2595,16 @@ static int evt_ring_poll(uint32_t ev[4]) {
 
     uint8_t slot_cycle = slot[3] & 1;
     if (slot_cycle != evt_cycle) {
-        /* Periodic empty-ring diagnostic: log every 500 calls so we can
-         * see whether the event ring ever receives anything without
-         * flooding the UART on every 1ms poll iteration.             */
-        static int _empty_count = 0;
-        if (++_empty_count >= 500) {
-            _empty_count = 0;
-            void *_ir0 = ir_base(0);
-            uint32_t _iman   = readl(_ir0 + IR_IMAN);
-            uint32_t _erdp_lo = readl(_ir0 + IR_ERDP_LO);
-            uart_puts("[xHCI] poll: ring empty x500  deq="); print_hex32(evt_dequeue);
-            uart_puts(" want_cycle="); print_hex32(evt_cycle);
-            uart_puts(" slot3="); print_hex32(slot[3]);
-            uart_puts(" IMAN="); print_hex32(_iman);
-            uart_puts(" ERDP_LO="); print_hex32(_erdp_lo);
-            uart_puts(" USBSTS="); print_hex32(readl(xhci_ctrl.op_regs + OP_USBSTS));
-            uart_puts("\n");
-        }
+        /* boot87: quiet polling mode — no periodic UART flood.
+         * Timeout diagnostic is printed by xhci_wait_event instead. */
         return 0;
     }
 
-    uart_puts("[xHCI] evt_ring_poll: GOT EVENT deq="); print_hex32(evt_dequeue);
-    uart_puts(" ["); print_hex32(slot[0]); uart_puts(",");
-    print_hex32(slot[1]); uart_puts(",");
-    print_hex32(slot[2]); uart_puts(",");
-    print_hex32(slot[3]); uart_puts("]\n");
+    /* Event consumed — log type for tracing, then advance consumer state */
+    uint32_t trb_type = (slot[3] >> 10) & 0x3FU;
+    uart_puts("[xHCI] event type="); print_hex32(trb_type);
+    uart_puts(" cc="); print_hex32((slot[2] >> 24) & 0xFF);
+    uart_puts(" deq="); print_hex32(evt_dequeue); uart_puts("\n");
 
     ev[0] = slot[0];
     ev[1] = slot[1];
@@ -1424,28 +2617,16 @@ static int evt_ring_poll(uint32_t ev[4]) {
         evt_cycle ^= 1;
     }
 
-    /* Advance ERDP so the controller knows we consumed this slot */
+    /* Advance ERDP with EHB=0 (boot107: never set EHB=1 in polling mode).
+     * Writing EHB=1 signals "host busy — hold new events", which in a poll
+     * loop means the MCU would defer every subsequent event indefinitely.
+     * In polling mode we just advance the pointer clean; the MCU can write
+     * the next event immediately.  Also W1C IMAN IP. */
     void *ir0 = ir_base(0);
     uint64_t new_erdp = evt_ring_dma + (uint64_t)evt_dequeue * 16;
-
-    /* Debug: log ERDP before and after the write so we can confirm
-     * the EHB bit is being set and the pointer is advancing.        */
-    uint32_t erdp_before = readl(ir0 + IR_ERDP_LO);
-    uint32_t iman_before = readl(ir0 + IR_IMAN);
-    uart_puts("[xHCI] ERDP before="); print_hex32(erdp_before);
-    uart_puts(" IMAN before="); print_hex32(iman_before); uart_puts("\n");
-
-    /* Set EHB (Event Handler Busy clear) bit 3 in ERDP lo */
-    reg_write64(ir0, IR_ERDP_LO, new_erdp | (1ULL << 3));
-    /* Clear IMAN IP (Interrupt Pending) W1C */
+    ERDP_REARM(ir0, new_erdp);
     writel(readl(ir0 + IR_IMAN) | 1U, ir0 + IR_IMAN);
-
     asm volatile("dsb sy; isb" ::: "memory");
-    uint32_t erdp_after = readl(ir0 + IR_ERDP_LO);
-    uint32_t iman_after = readl(ir0 + IR_IMAN);
-    uart_puts("[xHCI] ERDP after ="); print_hex32(erdp_after);
-    uart_puts(" IMAN after ="); print_hex32(iman_after);
-    uart_puts(" new_erdp="); print_hex32((uint32_t)new_erdp); uart_puts("\n");
 
     return 1;
 }
@@ -1453,111 +2634,82 @@ static int evt_ring_poll(uint32_t ev[4]) {
 /*
  * xhci_wait_event — wait for a command/transfer completion event.
  *
- * Primary path: WFI (Wait For Interrupt).
- *   CPU sleeps until the VL805 MSI fires → xhci_irq_handler stores
- *   the event in pending_event[] → WFI wakes → we return instantly.
- *   Zero cycles burned while waiting — CPU is fully idle between events.
+ * boot87: Pure tight-poll using CNTPCT_EL0 for real wall-clock timeouts.
  *
- * Fallback path: direct ring poll after each WFI wakeup.
- *   Handles the case where MSI delivery is unreliable (e.g. timing
- *   race between MCU write and MSI assert).  evt_ring_poll() is safe
- *   to call even if the irq handler already consumed the event — the
- *   cycle-bit check prevents double-consume.
+ * After 86 boots the VL805 MSI→GIC path on BCM2711 is confirmed broken:
+ * msi_fire_count stays 0 regardless of INTR2/MSI_INTR0 configuration.
+ * WFI-based waiting is gone.  We busy-poll the event ring cycle bit at
+ * full CPU speed (limited only by the DSB barrier per iteration).
  *
- * Timeout: each WFI wakeup counts as one iteration.  WFI wakes on
- *   ANY pending interrupt (MSI, timer tick, etc.), so in practice each
- *   iteration is ≤ one timer period (~1ms).  The iteration cap prevents
- *   a runaway wait if MSI never fires.
+ * BCM2711 system counter (CNTPCT_EL0) runs at 54 MHz → 54,000 ticks/ms.
+ * The 32-bit millisecond counter wraps every ~49.7 days — fine here.
+ *
+ * HSE keepalive: the VL805 MCU fires its watchdog every few ms if idle.
+ * We clear HSE and re-assert RS=1 on every HSE seen during the poll,
+ * just as the settle and retry loops do.
  */
 static int xhci_wait_event(uint32_t ev[4], int timeout_ms) {
-    /* Immediate check: event may have arrived before we got here */
-    if (pending_event_ready) {
-        ev[0] = pending_event[0]; ev[1] = pending_event[1];
-        ev[2] = pending_event[2]; ev[3] = pending_event[3];
-        pending_event_ready = 0;
-        return 0;
-    }
-    if (evt_ring_poll(ev))
-        return 0;
+    /* Immediate check — event may already be in the ring */
+    if (evt_ring_poll(ev)) return 0;
 
-    /* WFI loop: sleep until interrupt, then check.
-     * Each iteration = one WFI wakeup (≈ 1ms with normal timer tick).
-     * CPU is idle between wakeups — no busy-waiting.                   */
-    for (int t = 0; t < timeout_ms; t++) {
-        /* Sleep until MSI (or any other IRQ) fires */
-        asm volatile("dsb sy; isb; wfi" ::: "memory");
+    uint32_t t0 = get_time_ms();
+    void *_op   = xhci_ctrl.op_regs;
 
-        /* IRQ-staged fast path */
-        if (pending_event_ready) {
-            ev[0] = pending_event[0]; ev[1] = pending_event[1];
-            ev[2] = pending_event[2]; ev[3] = pending_event[3];
-            pending_event_ready = 0;
-            return 0;
+    while ((get_time_ms() - t0) < (uint32_t)timeout_ms) {
+        asm volatile("dsb sy; isb" ::: "memory");
+        if (evt_ring_poll(ev)) return 0;
+
+        /* VL805 HSE watchdog keepalive — full ring re-arm on HSE.
+         *
+         * FIX-89: previously only W1C HSE + RS=1, which left CRCR and
+         * ERSTBA at 0 (MCU resets all ring registers on every HSE).
+         * Now we re-arm everything — same as the retry and settle loops. */
+        if (readl(_op + OP_USBSTS) & STS_HSE) {
+            void *_ir0 = ir_base(0);
+            uint64_t _crcr  = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
+            writel(STS_HSE | STS_EINT | STS_PCD, _op + OP_USBSTS);
+            asm volatile("dsb sy; isb" ::: "memory");
+            reg_write64(_op, OP_DCBAAP_LO,
+                        phys_to_dma((uint64_t)virt_to_phys((void *)dcbaa)));
+            reg_write64(_op, OP_CRCR_LO, _crcr);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(0U, _ir0 + IR_ERSTSZ);
+            reg_write64(_ir0, IR_ERSTBA_LO, erst_dma_addr);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(1U, _ir0 + IR_ERSTSZ);
+            asm volatile("dsb sy; isb" ::: "memory");
+            ERDP_REARM(_ir0, evt_ring_dma + (uint64_t)evt_dequeue * 16); /* boot107 */
+            writel(0x00000002U, _ir0 + IR_IMAN);
+            asm volatile("dsb sy; isb" ::: "memory");
+            writel(CMD_RS | CMD_INTE | CMD_HSEE, _op + OP_USBCMD);
+            asm volatile("dsb sy; isb" ::: "memory");
         }
-        /* Ring poll fallback (MSI timing race or missed interrupt) */
-        if (evt_ring_poll(ev))
-            return 0;
     }
 
-    /* Timeout — dump event ring state so we can diagnose why no event arrived */
-    {
-        void *ir0 = ir_base(0);
-        volatile uint32_t *slot = (volatile uint32_t *)(evt_ring + evt_dequeue * 4);
-        uart_puts("[xHCI] wait_event TIMEOUT after ");
-        print_hex32(timeout_ms); uart_puts("ms\n");
-        uart_puts("[xHCI]   deq="); print_hex32(evt_dequeue);
-        uart_puts(" want_cycle="); print_hex32(evt_cycle); uart_puts("\n");
-        uart_puts("[xHCI]   slot[0]="); print_hex32(slot[0]);
-        uart_puts(" slot[1]="); print_hex32(slot[1]);
-        uart_puts(" slot[2]="); print_hex32(slot[2]);
-        uart_puts(" slot[3]="); print_hex32(slot[3]); uart_puts("\n");
-        uart_puts("[xHCI]   IMAN=");      print_hex32(readl(ir0 + IR_IMAN));
-        uart_puts(" ERDP_LO=");  print_hex32(readl(ir0 + IR_ERDP_LO));
-        uart_puts(" ERSTSZ=");   print_hex32(readl(ir0 + IR_ERSTSZ));
-        uart_puts(" ERSTBA_LO="); print_hex32(readl(ir0 + IR_ERSTBA_LO));
-        uart_puts(" USBSTS=");   print_hex32(readl(xhci_ctrl.op_regs + OP_USBSTS));
-        uart_puts("\n");
-        uart_puts("[xHCI]   CRCR_LO="); print_hex32(readl(xhci_ctrl.op_regs + OP_CRCR_LO));
-        uart_puts(" DCBAAP_LO="); print_hex32(readl(xhci_ctrl.op_regs + OP_DCBAAP_LO));
-        uart_puts("\n");
-
-        /* Scan first 8 TRBs of event ring for ANY non-zero content.
-         * This catches events written with wrong cycle bit (MCU PCS=0)
-         * or written to wrong position (e.g. not at deq).              */
-        uart_puts("[xHCI]   evt ring scan (first 8 TRBs):\n");
-        int found_any = 0;
-        for (int i = 0; i < 8; i++) {
-            volatile uint32_t *t = (volatile uint32_t *)(evt_ring + i * 4);
-            if (t[0] || t[1] || t[2] || t[3]) {
-                found_any = 1;
-                uart_puts("[xHCI]     TRB["); print_hex32((uint32_t)i);
-                uart_puts("] cycle="); print_hex32(t[3] & 1);
-                uart_puts(" type="); print_hex32((t[3] >> 10) & 63);
-                uart_puts("  ["); print_hex32(t[0]); uart_puts(",");
-                print_hex32(t[1]); uart_puts(",");
-                print_hex32(t[2]); uart_puts(",");
-                print_hex32(t[3]); uart_puts("]\n");
-            }
-        }
-        if (!found_any)
-            uart_puts("[xHCI]     all zeros — MCU has not written any event TRBs\n");
-    }
+    /* Timeout — single consolidated line to keep the log readable */
+    uart_puts("[xHCI] timeout("); print_hex32((uint32_t)timeout_ms);
+    uart_puts("ms) USBSTS="); print_hex32(readl(_op + OP_USBSTS));
+    uart_puts(" INTR2="); print_hex32(readl(pcie_base + 0x4300U));
+    uart_puts(" TRB0=["); print_hex32(((volatile uint32_t *)evt_ring)[0]);
+    uart_puts(","); print_hex32(((volatile uint32_t *)evt_ring)[3]);
+    uart_puts("]\n");
     return -1;
 }
 
+/*
+ * xhci_irq_handler — stub kept for linker symbol resolution.
+ *
+ * GIC registration was removed in boot87 (xHCI polling mode).
+ * This handler should never be called.  If it somehow fires,
+ * count it and clear the interrupt sources to prevent re-delivery.
+ */
 void xhci_irq_handler(int vector, void *data) {
     (void)vector; (void)data;
-    /* MSI fired — consume event and stage it for xhci_wait_event fast path.
-     * If xhci_wait_event already consumed it via polling, the slot's cycle
-     * bit will not match and evt_ring_poll returns 0 — no double-consume. */
-    uint32_t ev[4];
-    if (evt_ring_poll(ev)) {
-        pending_event[0] = ev[0];
-        pending_event[1] = ev[1];
-        pending_event[2] = ev[2];
-        pending_event[3] = ev[3];
-        pending_event_ready = 1;
-    }
+    msi_fire_count++;
+    /* Clear both PCIe interrupt levels defensively */
+    writel(0xFFFFFFFFU, pcie_base + 0x4508U);  /* PCIE_MSI_INTR0_CLR  W1C */
+    writel(0xFFFFFFFFU, pcie_base + 0x4308U);  /* PCIE_INTR2_CPU_CLEAR W1C */
+    asm volatile("dsb sy; isb" ::: "memory");
 }
 /* xhci_dma_phys — return physical base address of the xHCI DMA buffer.
  * Called by pci.c xhci_setup_msi() to compute the PCIe MSI target address. */

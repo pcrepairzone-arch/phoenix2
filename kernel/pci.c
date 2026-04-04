@@ -110,6 +110,13 @@ static void print_hex8(uint8_t val) {
         uart_putc(n < 10 ? '0' + n : 'a' + n - 10);
     }
 }
+/* fast_delay_ms — tiny busy-loop for PCIe init only
+ * (old style that was fast enough for VL805 watchdog) */
+static void fast_delay_ms(int ms) {
+    for (volatile int i = 0; i < ms * 15000; i++) {   // tuned for Pi 4 1.5 GHz
+        asm volatile("isb" ::: "memory");
+    }
+}
 
 static __attribute__((unused)) void print_hex64(uint64_t val) {
     uart_puts("0x");
@@ -119,8 +126,8 @@ static __attribute__((unused)) void print_hex64(uint64_t val) {
     }
 }
 
-/* ── Delay ──────────────────────────────────────────────────────── */
-
+/* ── Delay ────────────────────────────────────────────────────────
+ removed now in lib.c & kernel.h
 static void delay_ms(int ms) {
     for (volatile int i = 0; i < ms * 10000; i++) {}
     asm volatile("dsb sy; isb" ::: "memory");
@@ -134,12 +141,20 @@ static void delay_ms(int ms) {
 #define MISC_RC_BAR2_CFG_LO     0x4034   /* Inbound BAR2 (DMA from endpoint) */
 #define MISC_RC_BAR2_CFG_HI     0x4038
 /* UBUS_BAR2_CONFIG_REMAP: CPU-side target address for inbound BAR2 DMA.
- * Linux pcie-brcmstb.c: PCIE_MISC_UBUS_BAR2_CONFIG_REMAP / _REMAP_HI.
+ * Linux pcie-brcmstb.c: PCIE_MISC_UBUS_BAR2_CONFIG_REMAP = 0x00ac,
+ *                        PCIE_MISC_UBUS_BAR2_CONFIG_REMAP_HI = 0x00b0.
+ * Absolute: 0x4000 + 0xac = 0x40ac (LO), 0x4000 + 0xb0 = 0x40b0 (HI).
  * Bit 0 = ACCESS_ENABLE — MUST be set or UBUS bridge rejects all inbound
  * DMA even if RC_BAR2 is correctly configured.  Without this bit the
- * endpoint sees a UR/CA completion → VL805 MCU sets USBSTS.HSE. */
-#define MISC_UBUS_BAR2_CFG_REMAP_LO  0x408c
-#define MISC_UBUS_BAR2_CFG_REMAP_HI  0x4090
+ * endpoint sees a UR/CA completion → VL805 MCU sets USBSTS.HSE.
+ * BOOT96 FIX: previous values 0x408c/0x4090 were wrong by +0x20 — writes
+ * were landing on UBUS_BAR1_REMAP_HI (a don't-care register).  The actual
+ * UBUS_BAR2 at 0x40ac always read 0 (ACCESS_ENABLE=0), causing the UBUS
+ * bridge to silently discard every inbound Memory Write TLP from the VL805.
+ * MSI still fired (dedicated RC MSI path, bypasses UBUS) explaining why
+ * INTR2=0x100 appeared but the event ring canary was never overwritten. */
+#define MISC_UBUS_BAR2_CFG_REMAP_LO  0x40ac
+#define MISC_UBUS_BAR2_CFG_REMAP_HI  0x40b0
 #define UBUS_BAR2_ACCESS_ENABLE      (1U << 0)
 #define PCIE_EXT_CFG_INDEX_OFF  0x9000   /* selects target BDF + offset */
 #define PCIE_EXT_CFG_DATA_OFF   0x8000   /* 4KB config window — fixed base, NOT sliding */
@@ -308,7 +323,7 @@ static int pcie_bring_up_link(void) {
     rgr1 &= ~(1U << 1);
     writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
     asm volatile("dsb sy; isb" ::: "memory");
-    delay_ms(1);   /* RC needs ~1ms to come out of bridge reset */
+    fast_delay_ms(1);   /* RC needs ~1ms to come out of bridge reset */
 
     /*
      * Step B: open the SCB gate so PCIE_STATUS is readable.
@@ -366,7 +381,7 @@ static int pcie_bring_up_link(void) {
         rgr1 &= ~(1U << 1);   /* already done in Step A — no-op */
         writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
         asm volatile("dsb sy; isb" ::: "memory");
-        delay_ms(1);
+        fast_delay_ms(1);
 
         rgr1 &= ~(1U << 0);   /* clear PERST# — VL805 released, link trains */
         writel(rgr1, pcie_base + RGR1_SW_INIT_1_OFF);
@@ -378,7 +393,7 @@ static int pcie_bring_up_link(void) {
         uint32_t reg;
         int link_ms = 0;
         for (int t = 200; t > 0; t--) {
-            delay_ms(10);
+            fast_delay_ms(10);
             link_ms += 10;
             reg = readl(pcie_base + MISC_PCIE_STATUS_OFF);
             if ((reg & (1U << 4)) && (reg & (1U << 5))) {
@@ -395,7 +410,7 @@ static int pcie_bring_up_link(void) {
         /* Minimum wait after link-up — actual SPI-ready polling happens later
          * in pci_init_pi4() once EXT_CFG is armed and we can read VL805 Command. */
         uart_puts("[PCI]   Waiting 100ms minimum after link-up...\n");
-        delay_ms(100);
+        fast_delay_ms(100);
 
         uart_puts("[PCI] RGR1 post-link=");
         print_hex32(readl(pcie_base + RGR1_SW_INIT_1_OFF));
@@ -477,32 +492,86 @@ void xhci_setup_msi(void) {
     /*
      * Step 1: Program RC MSI BAR.
      *
-     * Physical address for MSI target: use the first word of the ERST
-     * scratch area (DMA buffer + 0x1000).  This is ordinary cached RAM;
-     * the RC only needs a valid PCIe-reachable address.  The RC converts
-     * the PCIe write TLP into a GIC interrupt — it never actually lands
-     * in RAM as far as the VL805 is concerned.
+     * Physical address for MSI target: use DMA buf + 0x1000 (ERST scratch area).
+     * The RC intercepts Memory Write TLPs to this PCIe address and fires GIC
+     * interrupt 180.  The TLP does NOT need to land in RAM (RC intercepts it).
      *
-     * MSI_BAR must be programmed in PCIe address space.  RC_BAR2 now maps
-     * PCIe 0x00000000 → CPU 0x00000000 (boot 22), so:
-     *   CPU phys 0x080b7000 → PCIe 0x080b7000  (DMA_OFFSET=0)
-     * We store the PCIe address in MSI_BAR_LO (32-bit, fits in low 4GB).
+     * MSI_BAR must be programmed as a PCIe address in the RC_BAR2 window so
+     * the VL805 can address it.  With DMA_OFFSET=0xC0000000:
+     *   PCIe MSI target = CPU phys + 0xC0000000
+     *   CPU phys = xhci_dma_phys() + 0x1000 = 0x10000 + 0x1000 = 0x11000
+     *   PCIe target = 0x11000 + 0xC0000000 = 0xC0011000
+     * This is within RC_BAR2 window [0xC0000000, 0xFFFFFFFF] ✓.
      */
     extern uint64_t xhci_dma_phys(void);   /* returns DMA buf physical base */
-    uint32_t msi_target_pcie = (uint32_t)(xhci_dma_phys() + 0x1000);
+    uint32_t msi_target_pcie = (uint32_t)(xhci_dma_phys() + 0x1000ULL + 0xC0000000ULL);
     writel(msi_target_pcie,  pcie_base + MISC_MSI_BAR_CONFIG_LO);
     writel(0x00000000U,      pcie_base + MISC_MSI_BAR_CONFIG_HI);
-    writel(0x0000FFE0U,      pcie_base + MISC_MSI_DATA_CONFIG);
+    /*
+     * DATA_CONFIG — Linux brcm_pcie formula (drivers/pci/controller/pcie-brcmstb.c):
+     *   data_value = 0xffff & ~(nr_vectors - 1)
+     * For nr=32 vectors: 0xffff & ~31 = 0xffe0
+     * The RC fires GIC interrupt when MSI write data matches:
+     *   (msi_data & DATA_CONFIG) == DATA_CONFIG
+     * The VL805 data register must be programmed to the SAME value (hwirq=0):
+     *   msg.data = DATA_CONFIG | hwirq = 0xffe0 | 0 = 0xffe0
+     * Boot 67 bug: DATA_CONFIG was set to (msi_target & ~3) = 0x11000 (wrong formula),
+     * and VL805 data was 0x0000 — neither matched. Reverting to correct 0xffe0 for both.
+     */
+    writel(0x0000FFE0U, pcie_base + MISC_MSI_DATA_CONFIG);
     asm volatile("dsb sy; isb" ::: "memory");
 
     uart_puts("[MSI] RC MSI BAR -> PCIe 0x");
     print_hex32(msi_target_pcie);
     uart_puts("\n");
 
-    /* Unmask the RC L2 MSI interrupt towards the GIC */
-    writel(0xFFFFFFFFU, pcie_base + MISC_INTR2_CPU_CLEAR);
-    writel(0x00000000U, pcie_base + MISC_INTR2_CPU_MASK_SET);  /* unmask all */
+    /* Verify readback: RC latches both LO and HI */
+    {
+        uint32_t rb_lo = readl(pcie_base + MISC_MSI_BAR_CONFIG_LO);
+        uint32_t rb_hi = readl(pcie_base + MISC_MSI_BAR_CONFIG_HI);
+        uint32_t rb_dat = readl(pcie_base + MISC_MSI_DATA_CONFIG);
+        uart_puts("[MSI] RC BAR readback LO=0x"); print_hex32(rb_lo);
+        uart_puts(" HI=0x"); print_hex32(rb_hi);
+        uart_puts(" DATA_CFG=0x"); print_hex32(rb_dat);
+        uart_puts("\n");
+        if (rb_lo != msi_target_pcie)
+            uart_puts("[MSI] WARNING: BAR_LO readback mismatch!\n");
+    }
+
+    /* Unmask the RC L2 MSI interrupt towards the GIC.
+     *
+     * BCM2711 PCIe has a two-level interrupt routing chain:
+     *
+     *   Level 1 — PCIE_INTR2_CPU (0x43xx):
+     *     STATUS (+0x00) bit 8 = set whenever RC receives ANY MSI TLP.
+     *     This is a raw hardware indicator — it does NOT gate GIC SPI 148.
+     *     CLR (+0x08) W1C, MASK_CLR (+0x14) = unmask towards level 2.
+     *
+     *   Level 2 — PCIE_MSI_INTR0 (0x45xx):
+     *     STATUS (+0x00) bit N = set when MSI TLP data matches vector N.
+     *     This IS the actual GIC gate: GIC SPI 148 stays asserted while
+     *     any MSI_INTR0 bit is both SET and UNMASKED.
+     *     CLR (+0x08) W1C, MASK_CLR (+0x14) = unmask towards GIC.
+     *
+     * boot85 root cause: only INTR2_CPU_MASK_CLR was written.  MSI_INTR0
+     * bits are masked by default after reset — the GIC never sees the
+     * interrupt even though INTR2_STATUS=0x100 was set.
+     * boot86 fix: also write MSI_INTR0_CLR and MSI_INTR0_MASK_CLR.      */
+    writel(0xFFFFFFFFU, pcie_base + MISC_INTR2_CPU_CLEAR);          /* 0x4308 CLR */
+    writel(0xFFFFFFFFU, pcie_base + MISC_INTR2_CPU_MASK_CLR);       /* 0x4314 unmask */
+    writel(0xFFFFFFFFU, pcie_base + 0x4508U);  /* PCIE_MSI_INTR0_CLR       — clear stale */
+    writel(0xFFFFFFFFU, pcie_base + 0x4514U);  /* PCIE_MSI_INTR0_MASK_CLR  — unmask all vectors */
     asm volatile("dsb sy; isb" ::: "memory");
+
+    /* Readback for confirmation */
+    {
+        uint32_t intr2_mask = readl(pcie_base + 0x430CU);  /* INTR2_CPU_MASK_STATUS */
+        uint32_t msi_mask   = readl(pcie_base + 0x450CU);  /* MSI_INTR0_MASK_STATUS  */
+        uart_puts("[MSI] INTR2_MASK_STATUS="); print_hex32(intr2_mask);
+        uart_puts("  MSI_INTR0_MASK_STATUS="); print_hex32(msi_mask);
+        uart_puts(msi_mask ? "  WARNING: MSI vectors still masked!\n"
+                           : "  OK: all MSI vectors unmasked.\n");
+    }
 
     /*
      * Step 2: Enable MSI in VL805 PCIe config space.
@@ -534,11 +603,18 @@ void xhci_setup_msi(void) {
             uint32_t ctrl_word = pci_read_config(&vl805_dev, cap_ptr + 0);
             int is64 = (ctrl_word >> 23) & 1;  /* bit 23 of dword = bit 7 of ctrl */
             if (is64) {
-                pci_write_config(&vl805_dev, cap_ptr + 8,  0x00000000U); /* AddrHi=0 */
-                pci_write_config(&vl805_dev, cap_ptr + 12, 0x00000000U); /* Data=0   */
+                pci_write_config(&vl805_dev, cap_ptr + 8,  0x00000000U); /* AddrHi=0       */
+                pci_write_config(&vl805_dev, cap_ptr + 12, 0x0000FFE0U); /* Data=0xFFE0    */
             } else {
-                pci_write_config(&vl805_dev, cap_ptr + 8,  0x00000000U); /* Data=0   */
+                pci_write_config(&vl805_dev, cap_ptr + 8,  0x0000FFE0U); /* Data=0xFFE0    */
             }
+            /*
+             * MSI Data = 0xFFE0 = DATA_CONFIG value for nr=32 vectors, hwirq=0.
+             * Formula: data = DATA_CONFIG | hwirq = 0xffff & ~(32-1) | 0 = 0xffe0.
+             * Boot 67 root cause: data was 0x0000, DATA_CONFIG was 0xFFE0 →
+             * RC checked (0x0000 & 0xFFE0) == 0xFFE0 → FALSE → MSI silently dropped.
+             * Now both sides agree on 0xFFE0 → RC will fire INTID 180 on every MSI.
+             */
             asm volatile("dsb sy; isb" ::: "memory");
 
             /* Enable MSI: set bit 0 of Message Control.
@@ -553,40 +629,62 @@ void xhci_setup_msi(void) {
             uint32_t verify = pci_read_config(&vl805_dev, cap_ptr + 0);
             uart_puts("[MSI] MSI ctrl after enable: "); print_hex32(verify);
             uart_puts(verify & (1U << 16) ? "  MSI ENABLED\n" : "  WARNING: enable bit not set\n");
+
+            /* ── VL805 MSI cap register readback ────────────────────────────
+             * Confirm the VL805 latched the address/data we programmed.
+             * Layout for 64-bit MSI cap (is64=1):
+             *   cap_ptr+4  = Addr Lo  (should be msi_target_pcie = 0xC0011000)
+             *   cap_ptr+8  = Addr Hi  (should be 0)
+             *   cap_ptr+12 = MSI Data (should be 0xFFE0 matching DATA_CONFIG)
+             */
+            {
+                uint32_t rb_addrlo = pci_read_config(&vl805_dev, cap_ptr + 4);
+                uint32_t rb_addrhi = pci_read_config(&vl805_dev, cap_ptr + (is64 ? 8 : 0));
+                uint32_t rb_data   = pci_read_config(&vl805_dev, cap_ptr + (is64 ? 12 : 8));
+                uint32_t dc        = readl(pcie_base + MISC_MSI_DATA_CONFIG) & 0xFFFF;
+                uint32_t msi_data  = rb_data & 0xFFFF;
+                uart_puts("[MSI] VL805 cap readback: AddrLo=0x"); print_hex32(rb_addrlo);
+                uart_puts(" AddrHi=0x"); print_hex32(rb_addrhi);
+                uart_puts(" Data=0x"); print_hex32(msi_data);
+                uart_puts("\n");
+                if (rb_addrlo != msi_target_pcie)
+                    uart_puts("[MSI] WARNING: VL805 AddrLo mismatch — MSI TLP won't hit RC window!\n");
+                if (msi_data != dc)
+                    uart_puts("[MSI] WARNING: MSI Data != DATA_CONFIG — RC won't fire GIC!\n");
+                else
+                    uart_puts("[MSI] MSI Data == DATA_CONFIG (0xFFE0) — RC match OK\n");
+            }
+
             msi_found = 1;
             break;
         }
         cap_ptr = (cap >> 8) & 0xFC;
     }
 
-    if (!msi_found) {
-        uart_puts("[MSI] WARNING: MSI cap not found — falling back to INTx\n");
-        /* Fall back: unmask INTx (PCIE_INTX_IRQ_VECTOR = 175) */
-        extern void irq_set_handler(int, void(*)(int, void*), void*);
-        extern void irq_unmask(int);
-        extern void xhci_irq_handler(int vector, void *data);
-        irq_set_handler(PCIE_INTX_IRQ_VECTOR, xhci_irq_handler, NULL);
-        irq_unmask(PCIE_INTX_IRQ_VECTOR);
-        uart_puts("[MSI] INTx fallback registered on INTID 175\n");
-        return;
-    }
+    if (!msi_found)
+        uart_puts("[MSI] WARNING: MSI cap not found in VL805 cap list\n");
 
     /*
-     * Step 3: Register handler and unmask at GIC.
+     * boot86 conclusion: xHCI uses pure polling — GIC registration skipped.
      *
-     * irq_set_handler registers the C function in the GIC dispatch table.
-     * irq_unmask writes GICD_ISENABLER for INTID 180 (SPI 148).
-     * irq_dispatch (called from exceptions.S) will call xhci_irq_handler
-     * on every MSI from the VL805.
+     * After 86 boots the VL805 MSI → GIC → CPU interrupt path on BCM2711
+     * is confirmed unreliable:
+     *   - PCIE_INTR2_STATUS bit 8 sets reliably (RC receives TLP from MCU).
+     *   - PCIE_MSI_INTR0_MASK_CLR written correctly (boot86: MASK_STATUS=0).
+     *   - GIC ISENABLER, ITARGETSR, ICFGR all verified correct.
+     *   - msi_fire_count stays 0x00000000 across every boot.
+     *
+     * Root cause is likely in the BCM2711 MSI_INTR0→GIC fan-out path or a
+     * firmware-owned GIC configuration that blocks SPI 148.  The UBUS DMA
+     * write path is also broken (event ring canary always unchanged).
+     *
+     * Decision: use tight CNTPCT_EL0-based polling in xhci_wait_event.
+     *   Interrupt transfers for USB 2 HID devices (bInterval polling) are
+     *   handled at the USB transfer layer, not via PCIe MSI.
+     * The MSI BAR/DATA_CONFIG/VL805 capability setup above is kept because
+     * the VL805 MCU requires MSI to be enabled in config space to operate.
      */
-    extern void irq_set_handler(int, void(*)(int, void*), void*);
-    extern void irq_unmask(int);
-    extern void xhci_irq_handler(int vector, void *data);
-
-    irq_set_handler(PCIE_MSI_IRQ_VECTOR, xhci_irq_handler, NULL);
-    irq_unmask(PCIE_MSI_IRQ_VECTOR);
-
-    uart_puts("[MSI] GIC INTID 180 unmasked — VL805 MSI armed\n");
+    uart_puts("[MSI] xHCI polling mode — GIC registration skipped (boot86)\n");
 }
 
 /* ── BCM2711 outbound ATU setup ─────────────────────────────────── */
@@ -808,51 +906,115 @@ static void pci_init_pi4(void) {
      *
      * Fix: make PCIe address 0 covered by an inbound DMA window.
      *   RC_BAR2 base = 0x00000000 maps PCIe [0, 1GB) → CPU [0, 1GB).
-     *   MCU DMA to PCIe 0 → CPU 0 → our ERST table (placed at phys 0).
-     *   ERST entry at phys 0 → event ring at phys evt_phys → correct DMA.
-     *   No UR, no HSE.
+     * boot77 fix: moved to PCIe 0xC0000000 (BCM2711 native DMA_OFFSET).
      *
-     * All DMA addresses in usb_xhci.c become physical addresses (DMA_OFFSET=0).
+     * Root cause of all boots 49–76 having no events:
+     *   DMA_OFFSET=0 placed VL805 DMA write targets (event ring 0x10C00,
+     *   MSI 0x11000, scratchpad 0x12000-0x30FFF) in PCIe 0x00000000–0x1FFFFF,
+     *   the SAME address range used by the outbound ATU for VL805 BAR0 MMIO
+     *   (CPU→PCIe 0x00000000).  The BCM2711 RC could not route inbound Memory
+     *   Write TLPs from the VL805 in this range; they were silently misrouted
+     *   instead of landing in CPU DRAM.  Memory Read Completions (different
+     *   path) were unaffected, so TRUE RUNNING was reached but NO event TRBs
+     *   were ever written.  HSE firing every 4 ms was the VL805 firmware
+     *   watchdog timing out waiting for event-ring acknowledgement that never
+     *   came because its write TLPs never reached RAM.
      *
-     * RC_BAR2_CONFIG_LO encoding (BCM2711 / brcmstb Linux driver):
-     *   bits[4:0]  = (ilog2(window_bytes) - 12) | 1
-     *                The | 1 is MANDATORY — bit[0] is the BAR enable flag.
-     *                Without it (even value) the window is DISABLED and the
-     *                VL805 gets UR/CA on every DMA → immediate HSE.
-     *                Linux function brcm_pcie_encode_ibar_size() always ORs 1.
-     *   bits[31:5] = PCIe base address >> 5
+     * Fix: DMA_OFFSET = 0xC0000000 (Linux BCM2711 convention):
+     *   VL805 DMA writes to PCIe 0xC0010C00 (event ring), PCIe 0xC0011000
+     *   (MSI), etc. — far from the outbound window (PCIe 0x00000000–0x3FFF).
+     *   RC_BAR2 window starts at PCIe 0xC0000000 to match.
      *
-     *   For PCIe base 0x00000000, size 1GB:
-     *     size_field = (ilog2(0x40000000) - 12) | 1 = (30 - 12) | 1 = 18 | 1 = 19 = 0x13
-     *     base_field = 0x00000000 >> 5 = 0
-     *     Combined:   0x00000000 | 0x13 = 0x00000013
+     * RC_BAR2_CONFIG_LO encoding (BCM2711 hardware — confirmed by readback):
+     *   value = lower_32_bits(pcie_base) | encode(size)
+     *   where encode(size) = ((ilog2(size) - 12) << 1) | 1
+     *     bit 0      = window enable
+     *     bits[4:1]  = (ilog2(size) - 12)   ← hardware ONLY implements bits[4:0]
+     *     bit 5+     = NOT implemented — hardware silently clears on write!
+     *     bits[31:5] = PCIe base address bits [31:5]
      *
-     * Maps PCIe 0x00000000..0x3FFFFFFF → CPU 0x00000000..0x3FFFFFFF (1GB).
-     * DMA_OFFSET=0 in usb_xhci.c: phys addr == PCIe/DMA addr (identity).
-     *   phys 0x080b8c00 → DMA addr 0x080b8c00 → lands at CPU 0x080b8c00 ✓
-     *   phys 0x080b9040 → DMA addr 0x080b9040 → MCU reads ERST from there ✓
+     * boot77 BUG (root cause of boot77 failure):
+     *   We used encode(1GB) = ((30-12)<<1)|1 = 0x25.  Bit[5] = 1.
+     *   Hardware clipped bit[5] → register read back 0xC0000005.
+     *   0x05 decodes as: log2 = (5>>1)+12 = 14 → 2^14 = 16 KB window.
+     *   Every DMA target (DCBAA 0xC0010000, event ring 0xC0010C00, ERST
+     *   0xC0011040, scratchpad 0xC0012000–0xC0033FFF) is ABOVE the 16 KB
+     *   boundary (0xC0000000–0xC0003FFF).  The VL805 couldn't even read the
+     *   DCBAA back — RC returned UR for every inbound TLP.  Complete blackout.
      *
-     * BOOT 49 FIX: was 0x00000012 (bit[0]=0 = window DISABLED).
-     *   With 0x12 the VL805 received UR on every inbound DMA (ERST read +
-     *   CCE write) → HSE fired 13-15ms after Enable Slot → no CCE ever.
-     *   Fix: use 0x00000013 — same 1GB window, bit[0]=1 = window ENABLED.
+     * boot78 fix: use maximum value that fits in bits[4:0] without setting bit5.
+     *   max = 0x1F = ((27-12)<<1)|1 → 2^27 = 128 MB window.
+     *   PCIe 0xC0000000–0xC7FFFFFF → CPU 0x00000000–0x07FFFFFF.
+     *   All DMA targets are in the first 256 KB of this range — well covered.
+     *     phys 0x10000 → PCIe 0xC0010000 → CPU 0x10000  ✓ (DCBAA)
+     *     phys 0x10C00 → PCIe 0xC0010C00 → CPU 0x10C00  ✓ (event ring)
+     *     phys 0x11040 → PCIe 0xC0011040 → CPU 0x11040  ✓ (ERST)
+     *     phys 0x11000 → PCIe 0xC0011000 → MSI_BAR      ✓ (MSI)
+     *     phys 0x30000 → PCIe 0xC0030000 → CPU 0x30000  ✓ (scratch[30])
+     *   Expected readback: 0xC000001F.
+     *
+     * BOOT102 FIX: corrected size encoding from 0x1F to 0x0F.
+     *
+     * Linux brcm_pcie_encode_ibar_size() and Circle both confirm:
+     *   sizes 4KB–32KB  (log2 12–15): encode = (log2-12) + 0x1C  →  0x1C–0x1F
+     *   sizes 64KB–64GB (log2 16–36): encode = log2 - 15          →  0x01–0x15
+     *
+     * 0x1F = encode(32KB): (15-12)+0x1C = 0x1F  →  32KB window!
+     * 0x0F = encode(1GB):  30-15 = 15 = 0x0F    →  1GB window  ✓
+     *
+     * 0xC000001F had size field 0x1F = 32KB at base 0xC0000000.
+     * Window: PCIe [0xC0000000, 0xC0007FFF].
+     * DMA starts at PCIe 0xC0010000 (64KB offset) — OUTSIDE that window.
+     * Every VL805 DMA read/write returned UR → immediate HSE.
+     *
+     * boot84 "proof" was invalid: MSI uses a dedicated RC capture register,
+     * not the RC_BAR2 inbound window. MSI receipt proves nothing about BAR2.
+     *
+     * Correct: 0xC000000F = base 0xC0000000, size 0x0F = 1GB.
+     * Window: PCIe [0xC0000000, 0xFFFFFFFF]. DMA at 0xC0010000 is inside ✓
      */
-    uart_puts("[PCI] RC_BAR2 setup (1GB DMA: PCIe 0x00000000 -> CPU 0x0)...\n");
-    writel(0x00000013U, pcie_base + MISC_RC_BAR2_CFG_LO);
+    uart_puts("[PCI] RC_BAR2 setup (boot102: 1GB window 0xC000000F)...\n");
+    writel(0xC000000FU, pcie_base + MISC_RC_BAR2_CFG_LO);
     writel(0x00000000U, pcie_base + MISC_RC_BAR2_CFG_HI);
     asm volatile("dsb sy; isb" ::: "memory");
     uart_puts("[PCI] RC_BAR2 LO="); print_hex32(readl(pcie_base + MISC_RC_BAR2_CFG_LO));
     uart_puts(" HI="); print_hex32(readl(pcie_base + MISC_RC_BAR2_CFG_HI)); uart_puts("\n");
 
-    /* UBUS_BAR2_CONFIG_REMAP: tell the UBUS bridge to forward inbound DMA
-     * to CPU physical address 0x00000000.  Bit 0 (ACCESS_ENABLE) is the
-     * gate that actually enables the window — without it RC_BAR2_CONFIG has
-     * no effect and the VL805 gets UR/CA on every DMA → immediate HSE.
+    /* UBUS_BAR1_CONFIG_REMAP (offset 0x4088): immediately before BAR2 REMAP.
+     * Diagnostic: read and print its value.  If ACCESS_ENABLE (bit 0) is set
+     * with a base that overlaps our DMA range, it could intercept BAR2 traffic.
+     * Linux pcie-brcmstb.c: PCIE_MISC_UBUS_BAR1_CONFIG_REMAP = 0x0088 (= 0x4088). */
+    uart_puts("[PCI] UBUS_BAR1_REMAP LO=");
+    print_hex32(readl(pcie_base + 0x4088U));
+    uart_puts(" (0x4088 — BAR1 remap, should be 0 or disabled)\n");
+
+    /* UBUS_BAR2_CONFIG_REMAP: CPU-side target address for inbound DMA.
+     * PCIe 0xC0000000 + offset → CPU 0x00000000 + offset.
+     * Bit 0 (ACCESS_ENABLE) is the gate — without it RC_BAR2 has no effect.
      *
-     * Linux: PCIE_MISC_UBUS_BAR2_CONFIG_REMAP = cpu_addr | ACCESS_ENABLE
-     *        PCIE_MISC_UBUS_BAR2_CONFIG_REMAP_HI = upper_32_bits(cpu_addr)
-     * Our cpu_addr = 0x00000000 → REMAP_LO = 0x00000001, REMAP_HI = 0x0 */
-    writel(0x00000000U | UBUS_BAR2_ACCESS_ENABLE,
+     * boot82: Theory B (REMAP=0x40000001) — address bits bounced, reads 0x1.
+     * boot83: CONFIRMED bits[31:1] do not appear in readback (write-only or RO=0).
+     * boot84: Theory C (REMAP=0xC0000001) — USBSTS=0x0 at settle done!  ← best result.
+     *         MCU no longer firing continuous HSE.  UBUS write path NOT confirmed
+     *         (canary not yet added) but settle behaviour strongly improved.
+     *
+     * boot85: REVERTED to Theory A (0x00000001) — REGRESSION.
+     *   USBSTS=0x5 at settle done (hse=100), back to continuous HSE.
+     *   Boot 84 was empirically better.  Theory C formula:
+     *     cpu_addr = 0xC0000000 → REMAP = 0xC0000001
+     *     Hardware: CPU = PCIe_addr - 0xC0000000 + 0xC0000000 = PCIe_addr
+     *   This means the UBUS bridge maps PCIe addresses 1:1 to CPU addresses.
+     *   DMA at phys 0x30000000 → PCIe 0xF0000000 → CPU 0xF0000000?  Hmm.
+     *   Alternative reading: bits[31:1] are write-only (hardware uses them but
+     *   does not reflect in readback); hardware subtracts PCIe base first, then
+     *   adds REMAP cpu_addr.  Theory C net result = PCIe_offset = phys.  Correct.
+     *
+     * BOOT102 FIX: cpu_base = 0x00000000 (Linux/Circle confirmed).
+     *   Translation: phys = PCIe_addr - RC_BAR2_base + cpu_base
+     *              = PCIe_addr - 0xC0000000 + 0x00000000 = PCIe_addr - 0xC0000000
+     *   PCIe 0xC0010000 → phys 0x00010000 ✓ (our DMA buffer)
+     *   0xC0000001 routed DMA to CPU phys 0xCC000000 (PCIe MMIO space) — wrong. */
+    writel(UBUS_BAR2_ACCESS_ENABLE,
            pcie_base + MISC_UBUS_BAR2_CFG_REMAP_LO);
     writel(0x00000000U, pcie_base + MISC_UBUS_BAR2_CFG_REMAP_HI);
     asm volatile("dsb sy; isb" ::: "memory");
@@ -860,6 +1022,22 @@ static void pci_init_pi4(void) {
     print_hex32(readl(pcie_base + MISC_UBUS_BAR2_CFG_REMAP_LO));
     uart_puts(" HI=");
     print_hex32(readl(pcie_base + MISC_UBUS_BAR2_CFG_REMAP_HI));
+    uart_puts("\n");
+
+    /* boot85 MISC register scan: dump the full BAR/REMAP register block.
+     * Offsets 0x4030–0x40B0 cover all RC_BARx config and UBUS remap regs.
+     * Comparing against known-good Linux values helps spot any mismatch.
+     * Key offsets (relative to pcie_base):
+     *   0x4030: RC_BAR1 LO   0x4034: RC_BAR2 LO   0x4038: RC_BAR2 HI
+     *   0x403C: RC_BAR3 LO   0x4040: RC_BAR3 HI
+     *   0x4088: UBUS_BAR1_REMAP_LO  0x408C: UBUS_BAR1_REMAP_HI
+     *   0x40AC: UBUS_BAR2_REMAP_LO  0x40B0: UBUS_BAR2_REMAP_HI  ← boot96 fix */
+    uart_puts("[PCI] MISC scan 0x4030-0x40B0:\n");
+    for (uint32_t off = 0x4030U; off <= 0x40B0U; off += 4U) {
+        uart_puts("  [0x"); print_hex32(off); uart_puts("]=");
+        print_hex32(readl(pcie_base + off));
+        uart_puts((off & 0xCU) == 0xCU ? "\n" : "  ");
+    }
     uart_puts("\n");
 
     /* Step 2: Configure RC root port (needed on both paths) */
@@ -886,7 +1064,7 @@ static void pci_init_pi4(void) {
 
     writel(0x00010100U, pcie_base + 0x18);
     asm volatile("dsb sy; isb" ::: "memory");
-    delay_ms(5);
+    fast_delay_ms(5);
     uart_puts("[PCI] RC buses: "); print_hex32(readl(pcie_base + 0x18)); uart_puts("\n");
 
     vl805_dev.bus = 1; vl805_dev.dev = 0; vl805_dev.func = 0;
@@ -964,7 +1142,7 @@ static void pci_init_pi4(void) {
             uart_puts("[VL805] WARNING: USB power-on mailbox failed — continuing\n");
         else
             uart_puts("[VL805] USB HCD powered on OK\n");
-        delay_ms(50);   /* give VC time to establish USB power rails */
+        fast_delay_ms(50);   /* give VC time to establish USB power rails */
         vl805_init();
 
         /* Poll until VL805 firmware signals ready (Command bit 20) */
@@ -982,7 +1160,7 @@ static void pci_init_pi4(void) {
                 uart_puts("ms  Command="); print_hex32(cmd_poll); uart_puts("\n");
                 break;
             }
-            delay_ms(10);
+            fast_delay_ms(10);
             spi_ms += 10;
         }
         if (!spi_ready)
@@ -996,7 +1174,7 @@ static void pci_init_pi4(void) {
         id = pci_read_config(&vl805_dev, 0x00);
         if ((id & 0xFFFF) == 0x1106 && (id >> 16) == 0x3483) break;
         uart_puts("[PCI] Bus 1 not ready: "); print_hex32(id); uart_puts("\n");
-        delay_ms(10);
+        fast_delay_ms(10);
     }
     uart_puts("[PCI] VL805 ID: "); print_hex32(id); uart_puts("\n");
     if ((id & 0xFFFF) != 0x1106 || (id >> 16) != 0x3483) {
@@ -1020,7 +1198,7 @@ static void pci_init_pi4(void) {
         cmd |= (1U << 1) | (1U << 2);   /* Memory Space | Bus Master */
         pci_write_config(&vl805_dev, 0x04, cmd);
         asm volatile("dsb sy; isb" ::: "memory");
-        delay_ms(5);
+        fast_delay_ms(5);
         cmd = pci_read_config(&vl805_dev, 0x04);
         uart_puts("[PCI] VL805 Command after:  "); print_hex32(cmd); uart_puts("\n");
     }
@@ -1067,25 +1245,25 @@ static void pci_init_pi4(void) {
      * we write them (observed: CRCR_LO=0 after doorbell).
      */
     uart_puts("[VL805] Waiting for MCU cold-boot (CNR=0, up to ~5s)...\n");
-    int cnr_cleared_fast = 0;
-    {
-        uint8_t caplength = readb(xhci_base);
-        volatile uint32_t *usbsts_reg =
-            (volatile uint32_t *)((uint8_t *)xhci_base + caplength + 0x04);
-        int cnr_cleared = 0;
-        for (int w = 0; w < 10000; w++) {
-            delay_ms(1);
-            if (!(*usbsts_reg & (1U << 11))) {
-                uart_puts("[VL805] MCU ready after ");
-                print_hex32(w + 1);
-                uart_puts(" ticks  USBSTS=");
-                print_hex32(*usbsts_reg);
-                uart_puts("\n");
-                cnr_cleared = 1;
-                cnr_cleared_fast = 1;
-                break;
+        int cnr_cleared_fast = 0;
+        {
+            uint8_t caplength = readb(xhci_base);
+            volatile uint32_t *usbsts_reg =
+                (volatile uint32_t *)((uint8_t *)xhci_base + caplength + 0x04);
+            int cnr_cleared = 0;
+            for (int w = 0; w < 3000; w++) {          // reduced + use fast delay
+                fast_delay_ms(1);
+                if (!(*usbsts_reg & (1U << 11))) {
+                    uart_puts("[VL805] MCU ready after ");
+                    print_hex32(w + 1);
+                    uart_puts(" ticks  USBSTS=");
+                    print_hex32(*usbsts_reg);
+                    uart_puts("\n");
+                    cnr_cleared = 1;
+                    cnr_cleared_fast = 1;
+                    break;
+                }
             }
-        }
         /* CNR not clearing after full timeout (old firmware warm-boot path).
          *
          * OLD FIRMWARE + warm boot (d03114): VL805 was configured by a previous
@@ -1111,7 +1289,7 @@ static void pci_init_pi4(void) {
             asm volatile("dsb sy; isb" ::: "memory");
             /* Wait for HCRST self-clear then CNR=0 (up to 3s total) */
             for (int w = 0; w < 600; w++) {
-                delay_ms(5);
+                fast_delay_ms(5);
                 uint32_t cmd_fb = readl(op_fb + 0x00);
                 uint32_t sts_fb = readl(op_fb + 0x04);
                 if (!(cmd_fb & (1U << 1)) && !(sts_fb & (1U << 11))) {
@@ -1179,7 +1357,7 @@ static void pci_init_pi4(void) {
 
         int hcrst_done = 0;
         for (int w = 0; w < 200; w++) {
-            delay_ms(1);
+            fast_delay_ms(1);
             if (!(readl(op2 + 0x00) & (1U << 1))) {
                 uart_puts("[VL805] HCRST complete after ");
                 print_hex32((uint32_t)(w + 1));
@@ -1196,7 +1374,7 @@ static void pci_init_pi4(void) {
 
         /* Wait for CNR=0 again after HCRST (MCU re-inits, up to 2s) */
         for (int w = 0; w < 400; w++) {
-            delay_ms(5);
+            fast_delay_ms(5);
             if (!(readl(op2 + 0x04) & (1U << 11))) {
                 uart_puts("[VL805] Post-HCRST MCU ready (");
                 print_hex32((uint32_t)((w + 1) * 5));

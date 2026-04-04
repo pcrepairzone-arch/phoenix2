@@ -45,14 +45,15 @@ SECTIONS
      * from reset.  BSS zero-clearing in boot.S uses __bss_start/__bss_end
      * which are in the kernel body above 0x80000 — xhci_dma is excluded.
      */
-    . = 0x00010000;
-    __xhci_dma_start = .;
-    .xhci_dma : {
-        . = ALIGN(64);
-        *(.xhci_dma)          /* catch any explicit section()-attributed vars */
-        . += 0x42000;         /* DCBAA+rings+ERST+scratch_arr+ctx+ep0+scratch_pages(64×4KB) */
-    }
-    __xhci_dma_end = .;
+    /* Place xhci_dma at 16MB (0x1000000) - well above the kernel but still in the first 1GB */
+. = 0x00010000;  /* 16MB, not 1MB */
+__xhci_dma_start = .;
+.xhci_dma : {
+    . = ALIGN(64);
+    *(.xhci_dma)
+    . = . + 0x42000;  /* Reserve full size */
+}
+__xhci_dma_end = .;
 
     /*
      * Pi 4 firmware loads kernel8.img to 0x200000 then relocates it to

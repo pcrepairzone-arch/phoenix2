@@ -20,8 +20,9 @@ typedef struct {
     int8_t  wheel;
 } mouse_event_t;
 
-int mouse_init(void);
-int mouse_poll(mouse_event_t *event);
+int  mouse_init(void);
+int  mouse_poll(mouse_event_t *event);
 void mouse_set_bounds(int16_t width, int16_t height);
+void mouse_event(const mouse_event_t *event);  /* post from HID driver */
 
 #endif

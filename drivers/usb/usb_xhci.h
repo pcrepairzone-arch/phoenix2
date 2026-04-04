@@ -87,6 +87,7 @@ typedef struct xhci_controller {
     uint8_t   scratchpad_count; /**< Scratchpad buffer count */
     uint8_t   ac64;          /**< 64-bit addressing capable */
     uint8_t   csz;           /**< Context size: 0=32B, 1=64B */
+    uint16_t  xecp;          /**< xECP: HCCPARAMS1[31:16], xHCI Ext Cap Ptr (DWORDs from cap_regs) */
 
     uint32_t *dcbaa;         /**< Device Context Base Address Array */
     uint64_t  dcbaa_phys;    /**< Physical address of DCBAA */

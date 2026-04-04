@@ -33,7 +33,8 @@ typedef struct {
     uint8_t modifiers;
 } keyboard_event_t;
 
-int keyboard_init(void);
-int keyboard_poll(keyboard_event_t *event);
+int  keyboard_init(void);
+int  keyboard_poll(keyboard_event_t *event);
+void keyboard_event(const keyboard_event_t *event);  /* post from HID driver */
 
 #endif
