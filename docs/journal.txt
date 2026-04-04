@@ -1955,3 +1955,111 @@ KEY RULES ADDED THIS SESSION:
   35. DWC2 at 0xFE980000 is fully independent of VL805. Initialise
       after xHCI completes. No shared resources.
 ═══════════════════════════════════════════════════════════════
+
+
+═══════════════════════════════════════════════════════════════
+REFACTOR PLAN — usb_xhci.c (post-DWC2 milestone)
+═══════════════════════════════════════════════════════════════
+
+TRIGGER: Complete when DWC2 HID keyboard input is working end-to-end.
+TARGET: Reduce usb_xhci.c from ~2,718 lines to ~1,400. Cut boot log
+        xHCI section from ~120 lines to ~25 lines.
+
+────────────────────────────────────────────────────────────────
+REMOVE ENTIRELY (settled science, no longer diagnostic value)
+────────────────────────────────────────────────────────────────
+
+1. mem_hexdump() of pre-zero DMA region
+   - 16 lines of random garbage printed every boot
+   - Normal-NC confirmed since boot93, no longer needed
+
+2. BOOT92-B scratchpad canary write
+   - Writes 0xABCD1234/0xDEAD5678 to all 31 pages before RS=1
+   - Scratchpad write pattern confirmed deterministic since boot105
+   - Safe to remove entirely
+
+3. BOOT92-C scratchpad canary readback (post-HSE)
+   - Prints all 31 page values after settle
+   - MCU writes pages 8-27 every boot, identical data every time
+   - ~35 lines of log output with zero new information
+
+4. BOOT93-A MMU type check (AT S1E1R / PAR_EL1 probe)
+   - Normal-NC locked in since boot93, will not change
+   - Remove the AT instruction and PAR_EL1 readback entirely
+
+5. BOOT94 DMA top-nibble check
+   - All addresses 0xC0010000+ confirmed every boot since boot94
+   - Linker script is fixed, this cannot regress without a linker change
+
+6. [DEBUG] MSI landing pad test write / msi_fire_count
+   - MSI confirmed non-functional on BCM2711 since boot86
+   - msi_fire_count always 0, this adds noise with no value
+
+7. [CANARY] evt_ring TRB0 write (0xDEADBEEF etc.)
+   - Removed in boot116, but the comment block referencing it remains
+   - Clean up the "[xHCI] Canary will be written..." uart_puts too
+
+8. BOOT91-A Pre-Noop snapshot (USBSTS/DCBAAP/ERSTBA dump)
+   - Redundant with Final: dump printed after No-op timeout
+   - Remove the pre-Noop snapshot, keep the Final: summary
+
+9. BOOT91-B Pre-Noop full re-arm
+   - Ring re-arm before No-op was needed when ERSTBA was unstable
+   - ERSTBA has been stable for 20+ boots, re-arm is now redundant
+
+10. BOOT91-C timestamped No-op poll (1ms,2ms,5ms,10ms,20ms,50ms,100ms,200ms)
+    - Always shows identical zeros, MCU never responds
+    - Replace with a single 200ms timeout poll, no intermediate prints
+
+11. BOOT92-A scratchpad array full dump (all 31 entries)
+    - Keep a one-liner: "[xHCI] Scratchpad: 31 pages at 0xC0012000"
+    - Remove the per-entry loop entirely
+
+────────────────────────────────────────────────────────────────
+KEEP (still diagnostic or operationally necessary)
+────────────────────────────────────────────────────────────────
+
+- BOOT91-D RC_BAR2 coverage check (one line, cheap sanity)
+- MFINDEX running check (confirms MCU health each boot)
+- BOOT116 tight event ring poll (active investigation path)
+- All HSE retry logic and comments (critical, hard-won)
+- TRUE RUNNING confirmation line
+- Final: USBSTS/USBCMD/CRCR/ERSTBA/ERSTSZ summary
+- Full event ring dump on timeout (useful when event ring is fixed)
+- All the core ring setup, ERST, DCBAA, scratchpad alloc logic
+- All comments explaining WHY things work (don't remove those)
+
+────────────────────────────────────────────────────────────────
+ADDITIONAL CLEANUP (while we're in there)
+────────────────────────────────────────────────────────────────
+
+- Remove delay_us() and delay_ms() — replaced by xhci_delay_ms()
+- Remove dma_copy_to/dma_copy_from — not used in current code path
+- Remove the phys-0 fallback ERST write in setup_event_ring
+  (belt-and-suspenders from boot47, ERSTBA is now correct)
+- Consolidate the long file header comment — keep the key rules,
+  remove the blow-by-blow boot analysis history (that's in journal.txt)
+- Remove extern pcie_base / vl805_dev that are no longer referenced
+
+────────────────────────────────────────────────────────────────
+EXPECTED RESULT
+────────────────────────────────────────────────────────────────
+
+Boot log xHCI section (current ~120 lines → target ~25 lines):
+  [xHCI] init base=0x600000000  DMA=0xC0010000
+  [xHCI] Scratchpad: 31 pages at 0xC0012000
+  [xHCI] ERST: evt=0xC0010C00  erst=0xC0011040  [COVERED OK]
+  [xHCI] TRUE RUNNING at 5ms  hse_retries=0
+  [xHCI] MFINDEX t0=0x117 t5ms=0x13f  (running OK)
+  [BOOT116] Tight poll 50ms: no events
+  [xHCI] No-op timeout 200ms — event ring silent
+  [xHCI] USBSTS=0 USBCMD=0xd CRCR=0x8 ERSTBA=0xC0011040
+
+Source file: ~2,718 lines → ~1,400 lines.
+Easier to hand off, easier to read, cleaner for community help requests.
+
+NOTE: Do NOT remove any of the hard-won rules (Rules 1-35) from the
+      file header or journal. They document non-obvious VL805 behaviour
+      that future developers will need. Only remove the boot-time
+      diagnostic output that's no longer informative.
+═══════════════════════════════════════════════════════════════
