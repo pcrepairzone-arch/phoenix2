@@ -140,7 +140,7 @@ static int evt_ring_poll(uint32_t ev[4]);
 #define CMD_RS          (1U << 0)
 #define CMD_HCRST       (1U << 1)
 #define CMD_INTE        (1U << 2)
-#define CMD_HSEE        (1U << 3)   /* Host System Error Enable — boot109: set alongside RS */
+#define CMD_HSEE        (1U << 3)   /* Host System Error Enable — boot141: NOT set (Circle never sets HSEE) */
 
 #define STS_HCH         (1U << 0)
 #define STS_HSE         (1U << 2)
@@ -933,8 +933,15 @@ static int run_controller(void) {
         reg_write64(op, OP_CRCR_LO, crcr_val);
         asm volatile("dsb sy; isb" ::: "memory");
 
-        /* First RS=1 attempt. */
-        writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+        /* boot141: Circle sets INTE in a separate write BEFORE RS=1,
+         * matching the xHCI spec sequencing requirement.  Do NOT set
+         * HSEE — Circle never sets it and the VL805 may behave
+         * differently (HSE flood suppression) when it is absent.     */
+        writel(CMD_INTE, op + OP_USBCMD);
+        asm volatile("dsb sy; isb" ::: "memory");
+
+        /* First RS=1 attempt (INTE already set above). */
+        writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
         asm volatile("dsb sy; isb" ::: "memory");
 
         uart_puts("[xHCI] RS=1 (HSE-retry, no CRCR rewrites)\n");
@@ -988,7 +995,7 @@ static int run_controller(void) {
                     evt_cycle   = 1;
                     writel(0x00000002U, ir0 + IR_IMAN);
                     asm volatile("dsb sy; isb" ::: "memory");
-                    writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+                    writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
                     asm volatile("dsb sy; isb" ::: "memory");
                     continue;
                 }
@@ -1129,7 +1136,7 @@ static int run_controller(void) {
             writel(0x00000002U, ir0 + IR_IMAN);
             asm volatile("dsb sy; isb" ::: "memory");
 
-            writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+            writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
             asm volatile("dsb sy; isb" ::: "memory");
 
             if (hse_retries <= 5 || (hse_retries % 20) == 0) {
@@ -1330,7 +1337,7 @@ static int run_controller(void) {
         evt_cycle   = 1;
         writel(0x00000002U, ir0 + IR_IMAN);
         asm volatile("dsb sy; isb" ::: "memory");
-        writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+        writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
         asm volatile("dsb sy; isb" ::: "memory");
 
         /* Wait up to 200ms for clean RS=1, HCH=0, HSE=0 */
@@ -1362,7 +1369,7 @@ static int run_controller(void) {
                 evt_dequeue = 0; evt_cycle = 1;
                 writel(0x00000002U, ir0 + IR_IMAN);
                 asm volatile("dsb sy; isb" ::: "memory");
-                writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+                writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
                 asm volatile("dsb sy; isb" ::: "memory");
             }
             fast_delay_ms(1);
@@ -1480,7 +1487,7 @@ static int run_controller(void) {
                 evt_dequeue = 0; evt_cycle = 1;
                 writel(0x00000002U, _ir0 + IR_IMAN);
                 asm volatile("dsb sy; isb" ::: "memory");
-                writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+                writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
                 asm volatile("dsb sy; isb" ::: "memory");
             }
             /* Continue anyway — best-effort enumeration */
@@ -1556,7 +1563,7 @@ static int run_controller(void) {
             evt_cycle   = 1;
             writel(0x00000002U, ir0 + IR_IMAN);
             asm volatile("dsb sy; isb" ::: "memory");
-            writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+            writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
             asm volatile("dsb sy; isb" ::: "memory");
         }
     }
@@ -1600,7 +1607,7 @@ static int run_controller(void) {
         writel(0x00000002U, ir0 + IR_IMAN);
         asm volatile("dsb sy; isb" ::: "memory");
         if (sts_pre & STS_HSE)
-            writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);
+            writel(CMD_RS | CMD_INTE, op + OP_USBCMD);
         asm volatile("dsb sy; isb" ::: "memory");
     }
 
@@ -1892,11 +1899,19 @@ int xhci_init(void *base_addr) {
     if (run_controller() != 0) return -1;
 
     /* Register HC ops BEFORE port scan so xhci_control_transfer is
-     * available during enumeration. port_scan itself is deferred —
-     * it is called by xhci_scan_ports() which usb_init() calls AFTER
-     * registering class drivers, so usb_enumerate_device() finds them. */
+     * available during enumeration.                                    */
     usb_register_hc(&g_xhci_hc_ops);
     xhci_ctrl.initialized = 1;
+
+    /* boot141: call port_scan() directly here — usb_init.c stubs the
+     * VL805 probe (prints "SKIPPED") so xhci_scan_ports() is NEVER
+     * called on the desktop build otherwise.  Circle mirrors this by
+     * calling RootHub::Initialize() immediately after RS=1, which
+     * resets each port and triggers EnableSlot / AddressDevice.
+     * We must do the same: enumerate_port → PORTSC PR reset →
+     * issue Enable Slot TRB → etc.                                     */
+    port_scan();
+
     return 0;
 }
 
@@ -2018,7 +2033,7 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32
     reg_write64(op, OP_CRCR_LO, crcr);      /* write while RS may be 0 */
     asm volatile("dsb sy; isb" ::: "memory");
 
-    writel(CMD_RS | CMD_INTE | CMD_HSEE, op + OP_USBCMD);   /* RS=1: MCU captures CRCR */
+    writel(CMD_RS | CMD_INTE, op + OP_USBCMD);   /* RS=1: MCU captures CRCR */
     asm volatile("dsb sy; isb" ::: "memory");
 
     volatile uint32_t *db = (volatile uint32_t *)xhci_ctrl.doorbell_regs;
@@ -2681,7 +2696,7 @@ static int xhci_wait_event(uint32_t ev[4], int timeout_ms) {
             ERDP_REARM(_ir0, evt_ring_dma + (uint64_t)evt_dequeue * 16); /* boot107 */
             writel(0x00000002U, _ir0 + IR_IMAN);
             asm volatile("dsb sy; isb" ::: "memory");
-            writel(CMD_RS | CMD_INTE | CMD_HSEE, _op + OP_USBCMD);
+            writel(CMD_RS | CMD_INTE, _op + OP_USBCMD);
             asm volatile("dsb sy; isb" ::: "memory");
         }
     }
