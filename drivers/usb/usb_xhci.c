@@ -842,21 +842,27 @@ static int run_controller(void) {
     asm volatile("dsb sy; isb" ::: "memory");
 
     /* Step 3: Program interrupter 0.
-     * FIX-89: erstba_dma is now the real DMA address of the ERST buffer
-     * (boot89 fix — was incorrectly forced to 0 since the DMA region moved
-     * to 0x30000000, making the old phys-0 fallback point the MCU at the
-     * wrong event ring).  ERSTSZ=1 enables event generation.
-     * ERDP points to evt_dma (ring base, dequeue starts at TRB 0).       */
-    writel(0U, ir0 + IR_ERSTSZ);                      /* clear first      */
-    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);        /* 0 = MCU target   */
+     * boot142: Write order matches Circle (xhcieventmanager.cpp) and Linux
+     * (xhci-mem.c): ERSTSZ=1 FIRST, then ERSTBA, then ERDP.
+     *
+     * Previous order (ERSTSZ=0 → ERSTBA → ERSTSZ=1) is wrong: the VL805 MCU
+     * may latch ERSTBA at write-time with ERSTSZ still 0, treating it as
+     * "zero segments" and never consulting the event ring at all.  Circle
+     * and Linux both set ERSTSZ before writing ERSTBA so the MCU always
+     * sees a valid segment count when it reads the base address.           */
+    writel(1U, ir0 + IR_ERSTSZ);                       /* boot142: ERSTSZ first */
     asm volatile("dsb sy; isb" ::: "memory");
-    writel(1U, ir0 + IR_ERSTSZ);                       /* enable: 1 segment */
+    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);         /* then ERSTBA          */
     asm volatile("dsb sy; isb" ::: "memory");
-    /* boot107: write ERDP with EHB=0 — arm the interrupter so the MCU can
-     * write events immediately after RS=1.  Do NOT OR in 0x8 here; that
-     * would set EHB=1 and permanently block event writes (proved boot105/106:
-     * CRCR advanced but CCE never arrived because MCU saw EHB=1). */
-    ERDP_REARM(ir0, evt_dma);
+    /* boot142: Write ERDP with EHB=1 on init — matches Circle exactly.
+     * Circle always ORs EHB into every ERDP write including the first one.
+     * Per xHCI spec EHB is W1C so writing EHB=1 when EHB=0 is harmless on
+     * compliant hardware, but the VL805 firmware may use the EHB=1 write as
+     * a "host ready" handshake before it starts posting events.
+     * NOTE: the poll loop still uses ERDP_REARM (EHB=0) to advance the
+     * dequeue pointer — EHB=1 is ONLY written here at init.               */
+    reg_write64(ir0, IR_ERDP_LO, evt_dma | 0x8ULL);   /* EHB=1 on init       */
+    asm volatile("dsb sy; isb" ::: "memory");
     writel(0x00000002U, ir0 + IR_IMAN);   /* IE=1, W1C IP */
     /* boot108: IMOD=0 — disable interrupt moderation entirely.
      * Previous value 0x0FA00FA0 set IMODI=4000 (1ms min between events)
@@ -985,12 +991,11 @@ static int run_controller(void) {
                     writel(cfg_val, op + OP_CONFIG);
                     reg_write64(op, OP_CRCR_LO, crcr_val);
                     asm volatile("dsb sy; isb" ::: "memory");
-                    writel(0U, ir0 + IR_ERSTSZ);
-                    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+                    writel(1U, ir0 + IR_ERSTSZ);               /* boot142: ERSTSZ first */
                     asm volatile("dsb sy; isb" ::: "memory");
-                    writel(1U, ir0 + IR_ERSTSZ);
+                    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); /* then ERSTBA */
                     asm volatile("dsb sy; isb" ::: "memory");
-                    ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+                    ERDP_REARM(ir0, evt_dma); /* EHB=0 to advance dequeue */
                     evt_dequeue = 0;
                     evt_cycle   = 1;
                     writel(0x00000002U, ir0 + IR_IMAN);
@@ -1006,15 +1011,11 @@ static int run_controller(void) {
                 uart_puts("ms  hse_retries=");
                 print_hex32((uint32_t)hse_retries); uart_puts("\n");
 
-                /* boot109-A: Ring doorbell 0 immediately after TRUE RUNNING. */
-                {
-                    volatile uint32_t *db0 =
-                        (volatile uint32_t *)xhci_ctrl.doorbell_regs;
-                    asm volatile("dsb sy; isb" ::: "memory");
-                    *db0 = 0U;
-                    asm volatile("dsb sy; isb" ::: "memory");
-                    uart_puts("[BOOT109-A] DB[0]=0 rung after TRUE RUNNING\n");
-                }
+                /* boot109-A REMOVED (boot142): ringing DB[0] immediately after
+                 * TRUE RUNNING with an empty command ring confuses the VL805
+                 * MCU — it fetches the ring, finds nothing, and may not restart
+                 * the ring scanner when the real No-op TRB arrives later.
+                 * Circle never rings DB[0] until it has a real command to submit.*/
 
                 /* boot109-B REMOVED (boot117): writing IMAN=0x3 post-TRUE-RUNNING
                  * caused MFINDEX to go static in boot116 — suspected to reset MCU
@@ -1122,12 +1123,11 @@ static int run_controller(void) {
             writel(cfg_val, op + OP_CONFIG);
             reg_write64(op, OP_CRCR_LO, crcr_val);
             asm volatile("dsb sy; isb" ::: "memory");
-            writel(0U, ir0 + IR_ERSTSZ);
-            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+            writel(1U, ir0 + IR_ERSTSZ);               /* boot142: ERSTSZ first */
             asm volatile("dsb sy; isb" ::: "memory");
-            writel(1U, ir0 + IR_ERSTSZ);
+            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); /* then ERSTBA */
             asm volatile("dsb sy; isb" ::: "memory");
-            ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+            ERDP_REARM(ir0, evt_dma); /* EHB=0 to advance dequeue */
             /* boot86: reset software dequeue ptr to match ERDP reset to ring base.
              * After HSE the MCU resets its producer; we must reset our consumer.
              * Without this, evt_dequeue stays > 0 so poll reads the wrong slot. */
@@ -1327,12 +1327,11 @@ static int run_controller(void) {
         writel(cfg_val, op + OP_CONFIG);
         reg_write64(op, OP_CRCR_LO, crcr_val);
         asm volatile("dsb sy; isb" ::: "memory");
-        writel(0U, ir0 + IR_ERSTSZ);
-        reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+        writel(1U, ir0 + IR_ERSTSZ);               /* boot142: ERSTSZ first */
         asm volatile("dsb sy; isb" ::: "memory");
-        writel(1U, ir0 + IR_ERSTSZ);
+        reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); /* then ERSTBA */
         asm volatile("dsb sy; isb" ::: "memory");
-        ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+        ERDP_REARM(ir0, evt_dma); /* EHB=0 to advance dequeue */
         evt_dequeue = 0;
         evt_cycle   = 1;
         writel(0x00000002U, ir0 + IR_IMAN);
@@ -1360,12 +1359,11 @@ static int run_controller(void) {
                 reg_write64(op, OP_DCBAAP_LO, dcbaa_dma);
                 reg_write64(op, OP_CRCR_LO, crcr_val);
                 asm volatile("dsb sy; isb" ::: "memory");
-                writel(0U, ir0 + IR_ERSTSZ);
-                reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+                writel(1U, ir0 + IR_ERSTSZ);               /* boot142: ERSTSZ first */
                 asm volatile("dsb sy; isb" ::: "memory");
-                writel(1U, ir0 + IR_ERSTSZ);
+                reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); /* then ERSTBA */
                 asm volatile("dsb sy; isb" ::: "memory");
-                ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+                ERDP_REARM(ir0, evt_dma); /* EHB=0 to advance dequeue */
                 evt_dequeue = 0; evt_cycle = 1;
                 writel(0x00000002U, ir0 + IR_IMAN);
                 asm volatile("dsb sy; isb" ::: "memory");
@@ -1549,12 +1547,11 @@ static int run_controller(void) {
             writel(cfg_val, op + OP_CONFIG);
             reg_write64(op, OP_CRCR_LO, crcr_val);
             asm volatile("dsb sy; isb" ::: "memory");
-            writel(0U, ir0 + IR_ERSTSZ);
-            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+            writel(1U, ir0 + IR_ERSTSZ);               /* boot142: ERSTSZ first */
             asm volatile("dsb sy; isb" ::: "memory");
-            writel(1U, ir0 + IR_ERSTSZ);
+            reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); /* then ERSTBA */
             asm volatile("dsb sy; isb" ::: "memory");
-            ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+            ERDP_REARM(ir0, evt_dma); /* EHB=0 to advance dequeue */
             /* boot86: reset software consumer index to match ERDP = ring_base.
              * If a false canary event was consumed (boot85 bug), evt_dequeue was
              * left at 1 while ERDP is re-armed to base → next poll reads slot 1
@@ -1598,12 +1595,11 @@ static int run_controller(void) {
         writel(cfg_val, op + OP_CONFIG);
         reg_write64(op, OP_CRCR_LO, crcr_val);
         asm volatile("dsb sy; isb" ::: "memory");
-        writel(0U, ir0 + IR_ERSTSZ);
-        reg_write64(ir0, IR_ERSTBA_LO, erstba_dma);
+        writel(1U, ir0 + IR_ERSTSZ);               /* boot142: ERSTSZ first */
         asm volatile("dsb sy; isb" ::: "memory");
-        writel(1U, ir0 + IR_ERSTSZ);
+        reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); /* then ERSTBA */
         asm volatile("dsb sy; isb" ::: "memory");
-        ERDP_REARM(ir0, evt_dma); /* boot107: EHB=0 arms interrupter */
+        ERDP_REARM(ir0, evt_dma); /* EHB=0 to advance dequeue */
         writel(0x00000002U, ir0 + IR_IMAN);
         asm volatile("dsb sy; isb" ::: "memory");
         if (sts_pre & STS_HSE)
@@ -1911,6 +1907,26 @@ int xhci_init(void *base_addr) {
      * We must do the same: enumerate_port → PORTSC PR reset →
      * issue Enable Slot TRB → etc.                                     */
     port_scan();
+
+    /* boot142: read MFINDEX after port scan — see if SOF frames started
+     * once a port was reset and a device is at U0.  MFINDEX was 0 before
+     * port scan in boot141; it should now be non-zero if the VL805 ties
+     * the frame timer to USB SOF generation rather than RS=1.            */
+    {
+        volatile uint32_t *mf = (volatile uint32_t *)xhci_ctrl.runtime_regs;
+        asm volatile("dsb sy; isb" ::: "memory");
+        uint32_t mf_post = *mf;
+        fast_delay_ms(5);
+        uint32_t mf_post5 = *mf;
+        uart_puts("[boot142] MFINDEX post-portscan: t0=");
+        print_hex32(mf_post);
+        uart_puts("  t5ms=");
+        print_hex32(mf_post5);
+        if (mf_post5 == mf_post)
+            uart_puts("  (STATIC — frame timer still not running)\n");
+        else
+            uart_puts("  (RUNNING — SOF started after port reset!)\n");
+    }
 
     return 0;
 }
@@ -2264,6 +2280,11 @@ static void enumerate_port(int port) {
     uint32_t speed = (ps >> 10) & 0xF;
     uart_puts("[xHCI] Port reset done. PORTSC="); print_hex32(ps);
     uart_puts("  speed="); print_hex32(speed); uart_puts("\n");
+
+    /* boot142: USB 2.0 reset recovery = 10ms minimum (spec) / 100ms (Circle).
+     * Wait here before issuing Enable Slot so the device has time to become
+     * ready and so the MCU has time to post any pending PSCEv TRBs.       */
+    for (int t = 0; t < 100; t++) fast_delay_ms(1);
 
     /* ── Step 1: Enable Slot ─────────────────────────────────────────── */
     /* VL805 quirk: MCU never writes CCEs to the event ring.
