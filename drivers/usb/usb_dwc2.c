@@ -114,8 +114,16 @@ extern void debug_print(const char *fmt, ...);
 #define HCINT_BBERR     (1U <<  8)  /* Babble Error                    */
 #define HCINT_FRMOR     (1U <<  9)  /* Frame Overrun                   */
 #define HCINT_DTERR     (1U << 10)  /* Data Toggle Error               */
+#define HCINT_NYET      (1U <<  6)  /* NYET Response (hub buffer full)  */
 #define HCINT_ALL_ERR   (HCINT_STALL | HCINT_TXERR | HCINT_BBERR | \
                          HCINT_DTERR | HCINT_AHBERR | HCINT_FRMOR)
+
+/* HCSPLT register bits (offset already defined as HCSPLT(n) above)    */
+#define HCSPLT_SPLTENA   (1U << 31)  /* Split Enable                    */
+#define HCSPLT_COMPSPLT  (1U << 16)  /* 0=Start Split, 1=Complete Split */
+/* HUBADDR [13:7], PRTADDR [6:0] */
+#define HCSPLT_MAKE(hub, port) \
+    (HCSPLT_SPLTENA | (((uint32_t)(hub) & 0x7F) << 7) | ((uint32_t)(port) & 0x7F))
 
 /* GRSTCTL */
 #define GRSTCTL_CSRST   (1U << 0)   /* Core Soft Reset                */
@@ -646,7 +654,10 @@ int dwc2_start(void) {
      * Runs completely independently — does not touch xHCI state.           */
     uart_puts("[DWC2] Starting SoC USB 2.0 OTG subsystem\n");
 
-    if (dwc2_init() < 0) {
+    /* Guard against double-init: usb_init.c calls dwc2_init() before
+     * dwc2_scan_ports() → dwc2_start(), so dwc2_initialised is already
+     * set.  Skip the redundant reset/power-on sequence.               */
+    if (!dwc2_initialised && dwc2_init() < 0) {
         uart_puts("[DWC2] Init failed — OTG port unavailable\n");
         return -1;
     }
