@@ -2303,14 +2303,27 @@ static void enumerate_port(int port) {
     for (int t = 0; t < 100; t++) fast_delay_ms(1);
 
     /* ── Step 1: Enable Slot ─────────────────────────────────────────── */
-    /* VL805 quirk: MCU never writes CCEs to the event ring.
-     * Submit Enable Slot, assume slot_id=1, and drive forward.          */
+    /* boot144: event ring now works — wait for Enable Slot CCE to get the
+     * real slot_id assigned by the MCU.  Previously we assumed slot_id=1
+     * which caused cmd_address_device() to consume the Enable Slot CCE
+     * as if it were the Address Device CCE, then GET_DESCRIPTOR consumed
+     * the real Address Device CCE (CC=11 Context State Error) and failed.*/
     uint32_t ev[4];
     uint8_t slot_id;
     cmd_ring_submit(0, 0, 0, TRB_TYPE_ENABLE_SLOT);
-    slot_id = 1;
+    uart_puts("[xHCI] Enable Slot submitted — waiting for CCE...\n");
+    if (xhci_wait_event(ev, 100) == 0) {
+        uint8_t es_cc   = (ev[2] >> 24) & 0xFF;
+        uint8_t es_slot = (ev[3] >>  8) & 0xFF;
+        uart_puts("[xHCI] Enable Slot CCE: cc="); print_hex32(es_cc);
+        uart_puts("  slot="); print_hex32(es_slot); uart_puts("\n");
+        slot_id = (es_cc == CC_SUCCESS && es_slot > 0) ? es_slot : 1U;
+    } else {
+        uart_puts("[xHCI] Enable Slot CCE timeout — assuming slot_id=1\n");
+        slot_id = 1;
+    }
     g_slot_id = slot_id;
-    uart_puts("[xHCI] Enable Slot submitted (slot_id=1 assumed)\n");
+    uart_puts("[xHCI] Using slot_id="); print_hex32(slot_id); uart_puts("\n");
 
     /* ── Step 2: Address Device ──────────────────────────────────────── */
     if (cmd_address_device(slot_id, (uint8_t)port, 0, speed) == 0) {
