@@ -2077,7 +2077,15 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uint32_t spd = (speed > 0 && speed <= 6) ? speed : 3U;
     volatile uint32_t *slot_ctx = (volatile uint32_t *)(input_ctx + CTX_SIZE);
     slot_ctx[0] = (route & 0xFFFFF) | (spd << 20) | (1U << 27);
-    slot_ctx[1] = (uint32_t)(port + 1) << 16;
+    /* boot146: xHCI spec Table 60, Slot Context DW1:
+     *   bits[7:0]  = Max Exit Latency (0)
+     *   bits[15:8] = Root Hub Port Number (1-based)  ← THIS was << 16 (bug!)
+     *   bits[23:16]= Number of Ports (0 = not a hub)
+     *   bits[31:24]= TT Hub Slot ID (0)
+     * Shifting by 16 put port number in Number-of-Ports field, leaving
+     * Root Hub Port Number = 0 (invalid).  VL805 MCU immediately rejected
+     * Address Device with CC=11 (Context State Error) on EVERY boot.    */
+    slot_ctx[1] = (uint32_t)(port + 1) << 8;   /* Root Hub Port Number bits[15:8] */
 
     /* EP0 max packet size depends on speed (xHCI spec §6.2.3.1):
      *   LS  (speed=2): 8 bytes
@@ -2105,6 +2113,14 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
 
     uint64_t out_dma = phys_to_dma((uint64_t)virt_to_phys((void *)out_ctx));
     dcbaa[slot_id] = out_dma;
+
+    /* boot146: log slot and EP0 context raw DWs to confirm field encoding */
+    uart_puts("[xHCI] SlotCtx: DW0="); print_hex32(slot_ctx[0]);
+    uart_puts(" DW1="); print_hex32(slot_ctx[1]);
+    uart_puts("  RH_PORT="); print_hex32((slot_ctx[1] >> 8) & 0xFF);
+    uart_puts("\n");
+    uart_puts("[xHCI] EP0Ctx:  DW1="); print_hex32(ep0_ctx[1]);
+    uart_puts(" DW2(TRDq+DCS)="); print_hex32(ep0_ctx[2]); uart_puts("\n");
 
     uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)input_ctx));
     cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV);
