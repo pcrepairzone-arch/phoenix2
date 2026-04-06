@@ -240,7 +240,7 @@ static uint8_t  cmd_cycle   = 1;  /* CRCR.RCS=1 required by VL805 MCU firmware.
                                     * Linux xhci-ring.c always writes RCS=1. MCU interprets RCS=0
                                     * as "command ring not initialised" → firmware watchdog fires. */
 static uint32_t cmd_enqueue = 0;
-static uint8_t  g_slot_id   = 0;  /* set after successful Enable Slot CCE */
+/* boot147: g_slot_id scalar replaced by g_slot_ids[port] array (below) */
 
 /* boot87: pending_event / pending_event_ready removed.
  * xhci_wait_event now uses pure CNTPCT_EL0 tight-poll — no WFI,
@@ -749,14 +749,14 @@ static int run_controller(void) {
     uint64_t erstba_dma = erst_dma_addr;
     uint64_t evt_dma    = evt_ring_dma;
     uint64_t crcr_val   = (cmd_ring_dma & ~0x3FULL) | (uint64_t)cmd_cycle;
-    /* boot108: use CONFIG=1 (MaxSlots=1) instead of MaxSlots=32.
-     * Some VL805 firmware rejects CONFIG>1 at startup and silently refuses
-     * to generate events until a valid slot count it accepts is set.
-     * Boot 105-107 showed CRCR advancing (MCU alive) but zero events even
-     * with a connected device — consistent with the MCU treating CONFIG=32
-     * as invalid and suppressing all event output.
-     * We will increment CONFIG to match actual slot allocations later.     */
-    uint32_t cfg_val    = 1U;
+    /* boot147: increase CONFIG from 1 to max_ports so Enable Slot can
+     * allocate slots 2..N.  boot108 used CONFIG=1 to work around a suspected
+     * VL805 event-suppression bug at CONFIG=32; that bug was caused by wrong
+     * ERST/DCBAA setup (fixed boot141-143), not by CONFIG>1.  With a valid
+     * event ring, CONFIG=max_ports works and removes CC=9 on all ports after
+     * the first.  Cap at 16 as a sanity bound.                             */
+    uint32_t max_p   = xhci_ctrl.max_ports;
+    uint32_t cfg_val = (max_p >= 1U && max_p <= 16U) ? max_p : 4U;
 
     /* BOOT91-D: RC_BAR2 inbound window coverage check.
      *
@@ -1932,10 +1932,21 @@ int xhci_init(void *base_addr) {
 }
 
 /* ── DMA extension + full enumeration functions (from your original) ─────── */
-#define DMA_INPUT_CTX_OFF   0x21000
-#define DMA_OUT_CTX_OFF     0x21500
-#define DMA_EP0_RING_OFF    0x21900
-#define DMA_EP0_DATA_OFF    0x21D00
+/* boot147: per-slot DMA memory layout — SLOT_STRIDE bytes per slot, slots 1..MAX_SLOTS_ALLOC.
+ * Base: 0x22000; top: 0x22000 + 4×0x1000 = 0x26000 < 0x42000 DMA budget.
+ * Within each SLOT_STRIDE block:
+ *   +SLOT_INPUT_CTX_OFF  input context  (34 × CTX_SIZE = 1088 bytes)
+ *   +SLOT_OUT_CTX_OFF    output context (32 × CTX_SIZE = 1024 bytes)
+ *   +SLOT_EP0_RING_OFF   EP0 xfer ring  (EP0_RING_TRBS × 16 = 1024 bytes)
+ *   +SLOT_EP0_DATA_OFF   EP0 data buf   (512 bytes)
+ * Old single-slot DMA_INPUT/OUT/EP0_RING/EP0_DATA_OFF constants removed.   */
+#define DMA_SLOTS_BASE_OFF   0x22000
+#define SLOT_STRIDE          0x1000
+#define MAX_SLOTS_ALLOC      4
+#define SLOT_INPUT_CTX_OFF   0x000
+#define SLOT_OUT_CTX_OFF     0x500
+#define SLOT_EP0_RING_OFF    0x900
+#define SLOT_EP0_DATA_OFF    0xD00
 
 #define EP0_RING_TRBS  64
 #define CTX_SIZE  32
@@ -1962,43 +1973,73 @@ int xhci_init(void *base_addr) {
 #define USB_REQ_SET_ADDRESS     5
 #define USB_REQ_SET_CONFIG      9
 
-static volatile uint8_t  *input_ctx;
-static volatile uint8_t  *out_ctx;
-static volatile uint32_t *ep0_ring;
-static uint8_t  ep0_cycle   = 1;  /* ICS=1 in input context; matches VL805 MCU CCS=1 expectation */
-static uint32_t ep0_enqueue = 0;
-/* g_slot_id declared above (line ~134) so run_controller() can set it */
+/* boot147: per-slot EP0 ring state, indexed 1..MAX_SLOTS_ALLOC.
+ * active_slot tracks which slot is currently driving ep0_enq().
+ * g_slot_ids[port] holds the MCU-assigned slot_id for each root-hub port.
+ * g_devs[slot_id] holds the usb_device_t for each enumerated slot.         */
+static uint8_t  ep0_cycle_s[MAX_SLOTS_ALLOC + 1]   = {0};
+static uint32_t ep0_enqueue_s[MAX_SLOTS_ALLOC + 1] = {0};
+static uint8_t  active_slot = 0;
+static uint8_t  g_slot_ids[16] = {0};   /* indexed by port (0-based)        */
+static usb_device_t g_devs[MAX_SLOTS_ALLOC + 1];  /* indexed by slot_id     */
 
-static void ep0_ring_init(void) {
-    ep0_ring    = (volatile uint32_t *)(xhci_dma_buf + DMA_EP0_RING_OFF);
-    ep0_cycle   = 1;  /* ICS=1; matches VL805 MCU CCS=1 expectation */
-    ep0_enqueue = 0;
-    dma_zero(ep0_ring, EP0_RING_TRBS * 16);
+/* Slot DMA region helpers (slot_id is 1-based, 1..MAX_SLOTS_ALLOC)         */
+static inline volatile uint8_t *slot_input_ctx(uint8_t s) {
+    return (volatile uint8_t *)(xhci_dma_buf + DMA_SLOTS_BASE_OFF
+                                + (uint32_t)(s - 1) * SLOT_STRIDE
+                                + SLOT_INPUT_CTX_OFF);
+}
+static inline volatile uint8_t *slot_out_ctx(uint8_t s) {
+    return (volatile uint8_t *)(xhci_dma_buf + DMA_SLOTS_BASE_OFF
+                                + (uint32_t)(s - 1) * SLOT_STRIDE
+                                + SLOT_OUT_CTX_OFF);
+}
+static inline volatile uint32_t *slot_ep0_ring(uint8_t s) {
+    return (volatile uint32_t *)(xhci_dma_buf + DMA_SLOTS_BASE_OFF
+                                 + (uint32_t)(s - 1) * SLOT_STRIDE
+                                 + SLOT_EP0_RING_OFF);
+}
+static inline volatile uint8_t *slot_ep0_data(uint8_t s) {
+    return (volatile uint8_t *)(xhci_dma_buf + DMA_SLOTS_BASE_OFF
+                                + (uint32_t)(s - 1) * SLOT_STRIDE
+                                + SLOT_EP0_DATA_OFF);
+}
 
-    uint64_t ring_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_ring));
+/* boot147: ep0_ring_init now takes slot_id (1-based) so each slot gets its
+ * own EP0 transfer ring in per-slot DMA memory.                             */
+static void ep0_ring_init(uint8_t sid) {
+    volatile uint32_t *ring = slot_ep0_ring(sid);
+    ep0_cycle_s[sid]   = 1;   /* ICS=1; matches VL805 MCU CCS=1 expectation */
+    ep0_enqueue_s[sid] = 0;
+    dma_zero(ring, EP0_RING_TRBS * 16);
+
+    uint64_t ring_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ring));
     uint32_t li = (EP0_RING_TRBS - 1) * 4;
-    ep0_ring[li + 0] = (uint32_t)(ring_dma);
-    ep0_ring[li + 1] = (uint32_t)(ring_dma >> 32);
-    ep0_ring[li + 2] = 0;
-    ep0_ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | ep0_cycle;
+    ring[li + 0] = (uint32_t)(ring_dma);
+    ring[li + 1] = (uint32_t)(ring_dma >> 32);
+    ring[li + 2] = 0;
+    ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | ep0_cycle_s[sid];
     asm volatile("dsb sy" ::: "memory");
 }
 
+/* boot147: ep0_enq uses active_slot to index the correct per-slot EP0 ring.
+ * Caller must set active_slot = slot_id before the first ep0_enq() call.   */
 static void ep0_enq(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32_t type, uint32_t flags) {
-    uint32_t b = ep0_enqueue * 4;
-    ep0_ring[b + 0] = dw0;
-    ep0_ring[b + 1] = dw1;
-    ep0_ring[b + 2] = dw2;
-    ep0_ring[b + 3] = (type << TRB_TYPE_SHIFT) | flags | ep0_cycle;
+    volatile uint32_t *ring = slot_ep0_ring(active_slot);
+    uint32_t b = ep0_enqueue_s[active_slot] * 4;
+    ring[b + 0] = dw0;
+    ring[b + 1] = dw1;
+    ring[b + 2] = dw2;
+    ring[b + 3] = (type << TRB_TYPE_SHIFT) | flags | ep0_cycle_s[active_slot];
     asm volatile("dsb sy" ::: "memory");
 
-    ep0_enqueue++;
-    if (ep0_enqueue >= EP0_RING_TRBS - 1) {
+    ep0_enqueue_s[active_slot]++;
+    if (ep0_enqueue_s[active_slot] >= EP0_RING_TRBS - 1) {
         uint32_t li = (EP0_RING_TRBS - 1) * 4;
-        ep0_ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | ep0_cycle;
+        ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | ep0_cycle_s[active_slot];
         asm volatile("dsb sy" ::: "memory");
-        ep0_cycle ^= 1;
-        ep0_enqueue = 0;
+        ep0_cycle_s[active_slot] ^= 1;
+        ep0_enqueue_s[active_slot] = 0;
     }
 }
 
@@ -2060,12 +2101,15 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32
 }
 
 static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uint32_t speed) {
-    input_ctx = (volatile uint8_t *)(xhci_dma_buf + DMA_INPUT_CTX_OFF);
-    out_ctx   = (volatile uint8_t *)(xhci_dma_buf + DMA_OUT_CTX_OFF);
-    dma_zero(input_ctx, 34 * CTX_SIZE);
-    dma_zero(out_ctx, 32 * CTX_SIZE);
+    /* boot147: use per-slot context memory so each slot has its own
+     * Input Context and Output Context in distinct DMA regions.             */
+    volatile uint8_t *in_ctx = slot_input_ctx(slot_id);
+    volatile uint8_t *oc     = slot_out_ctx(slot_id);
+    active_slot = slot_id;   /* set before any ep0_enq() calls below        */
+    dma_zero(in_ctx, 34 * CTX_SIZE);
+    dma_zero(oc,     32 * CTX_SIZE);
 
-    volatile uint32_t *icc = (volatile uint32_t *)input_ctx;
+    volatile uint32_t *icc = (volatile uint32_t *)in_ctx;
     icc[1] = 0x00000003;
 
     /* Speed field in Slot Context DWord 0 bits[23:20] (xHCI §6.2.2):
@@ -2075,7 +2119,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
      * HS (3) not SS (4). SS fallback was causing BABBLE on HS devices
      * because MPS=512 was used for a 64-byte HS endpoint.            */
     uint32_t spd = (speed > 0 && speed <= 6) ? speed : 3U;
-    volatile uint32_t *slot_ctx = (volatile uint32_t *)(input_ctx + CTX_SIZE);
+    volatile uint32_t *slot_ctx = (volatile uint32_t *)(in_ctx + CTX_SIZE);
     slot_ctx[0] = (route & 0xFFFFF) | (spd << 20) | (1U << 27);
     /* boot146: xHCI spec Table 60, Slot Context DW1:
      *   bits[7:0]  = Max Exit Latency (0)
@@ -2101,17 +2145,17 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
         case 3:  ep0_mps = 64;  break;  /* HighSpeed  */
         default: ep0_mps = 64;  break;  /* FullSpeed/LowSpeed — 64 safe default */
     }
-    volatile uint32_t *ep0_ctx = (volatile uint32_t *)(input_ctx + 2 * CTX_SIZE);
+    volatile uint32_t *ep0_ctx = (volatile uint32_t *)(in_ctx + 2 * CTX_SIZE);
     ep0_ctx[1] = (3U << 1) | (4U << 3) | (ep0_mps << 16);
 
-    ep0_ring_init();
-    uint64_t ep0_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_ring));
-    /* bit 0 = ICS (Initial Cycle State): must match ep0_cycle (=1). */
-    ep0_ctx[2] = (uint32_t)(ep0_dma) | ep0_cycle;
+    ep0_ring_init(slot_id);
+    uint64_t ep0_dma = phys_to_dma((uint64_t)virt_to_phys((void *)slot_ep0_ring(slot_id)));
+    /* bit 0 = ICS (Initial Cycle State): must match ep0_cycle_s[slot_id] (=1). */
+    ep0_ctx[2] = (uint32_t)(ep0_dma) | ep0_cycle_s[slot_id];
     ep0_ctx[3] = (uint32_t)(ep0_dma >> 32);
     ep0_ctx[4] = 8;
 
-    uint64_t out_dma = phys_to_dma((uint64_t)virt_to_phys((void *)out_ctx));
+    uint64_t out_dma = phys_to_dma((uint64_t)virt_to_phys((void *)oc));
     dcbaa[slot_id] = out_dma;
 
     /* boot146: log slot and EP0 context raw DWs to confirm field encoding */
@@ -2122,7 +2166,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uart_puts("[xHCI] EP0Ctx:  DW1="); print_hex32(ep0_ctx[1]);
     uart_puts(" DW2(TRDq+DCS)="); print_hex32(ep0_ctx[2]); uart_puts("\n");
 
-    uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)input_ctx));
+    uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)in_ctx));
     cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV);
 
     /* boot145: drain-loop until we get the Address Device CCE (type=0x21).
@@ -2145,14 +2189,15 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     }
     if (!got_cce || cc != CC_SUCCESS) return -1;
 
-    volatile uint32_t *out_slot = (volatile uint32_t *)out_ctx;
+    volatile uint32_t *out_slot = (volatile uint32_t *)oc;
     uint8_t usb_addr = out_slot[3] & 0xFF;
     debug_print("[xHCI] Address Device OK  slot=%u  usb_addr=%u\n", slot_id, usb_addr);
     return 0;
 }
 
 static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len) {
-    volatile uint8_t *ep0_data = (volatile uint8_t *)(xhci_dma_buf + DMA_EP0_DATA_OFF);
+    /* boot147: per-slot ep0_data; active_slot already set by caller */
+    volatile uint8_t *ep0_data = slot_ep0_data(slot_id);
     dma_zero(ep0_data, 512);
 
     uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
@@ -2369,7 +2414,9 @@ static void enumerate_port(int port) {
             uart_puts("[xHCI] Enable Slot: no CCE or bad cc — assuming slot_id=1\n");
         }
     }
-    g_slot_id = slot_id;
+    /* boot147: track per-port slot_id; set active_slot for ep0_enq() */
+    g_slot_ids[(uint8_t)port] = slot_id;
+    active_slot = slot_id;
     uart_puts("[xHCI] Using slot_id="); print_hex32(slot_id); uart_puts("\n");
 
     /* ── Step 2: Address Device ──────────────────────────────────────── */
@@ -2380,13 +2427,14 @@ static void enumerate_port(int port) {
     }
 
     /* Build a minimal usb_device_t so control transfers work via g_hc_ops.
+     * boot147: use g_devs[slot_id] (per-slot) instead of a single g_dev.
      * Store slot_id in hcd_private so xhci_control_transfer can find the ring. */
     extern int usb_enumerate_device(usb_device_t *dev, int port);
-    static usb_device_t g_dev; /* one device for now — extend to array later */
-    memset(&g_dev, 0, sizeof(g_dev));
-    g_dev.speed       = (uint8_t)speed;
-    g_dev.address     = 1; /* xHCI assigns USB address via Address Device */
-    g_dev.hcd_private = (void *)(uintptr_t)slot_id;
+    usb_device_t *dev = &g_devs[slot_id];
+    memset(dev, 0, sizeof(*dev));
+    dev->speed       = (uint8_t)speed;
+    dev->address     = slot_id; /* xHCI assigns USB address via Address Device */
+    dev->hcd_private = (void *)(uintptr_t)slot_id;
 
     /* ── Step 3: GET_DESCRIPTOR (Device, 18 bytes) ───────────────────── */
     /* VL805 quirk: MCU never writes transfer completion events.
@@ -2398,8 +2446,7 @@ static void enumerate_port(int port) {
     if (got < 8) {
         /* Check DMA buffer for real data — MCU may have written the payload
          * even without posting a transfer completion event.               */
-        volatile uint8_t *_ep0_buf =
-            (volatile uint8_t *)(xhci_dma_buf + DMA_EP0_DATA_OFF);
+        volatile uint8_t *_ep0_buf = slot_ep0_data(slot_id);
         asm volatile("dsb sy" ::: "memory"); /* ensure PCIe DMA is visible */
         if (_ep0_buf[0] != 0 || _ep0_buf[1] != 0) {
             /* Real descriptor arrived via DMA despite missing event */
@@ -2425,17 +2472,17 @@ static void enumerate_port(int port) {
         }
     }
 
-    g_dev.bMaxPacketSize0  = ddesc[7];
-    g_dev.idVendor         = (uint16_t)(ddesc[8]  | (ddesc[9]  << 8));
-    g_dev.idProduct        = (uint16_t)(ddesc[10] | (ddesc[11] << 8));
-    g_dev.bcdUSB           = (uint16_t)(ddesc[2]  | (ddesc[3]  << 8));
-    g_dev.bDeviceClass     = ddesc[4];
-    g_dev.bDeviceSubClass  = ddesc[5];
-    g_dev.bDeviceProtocol  = ddesc[6];
+    dev->bMaxPacketSize0  = ddesc[7];
+    dev->idVendor         = (uint16_t)(ddesc[8]  | (ddesc[9]  << 8));
+    dev->idProduct        = (uint16_t)(ddesc[10] | (ddesc[11] << 8));
+    dev->bcdUSB           = (uint16_t)(ddesc[2]  | (ddesc[3]  << 8));
+    dev->bDeviceClass     = ddesc[4];
+    dev->bDeviceSubClass  = ddesc[5];
+    dev->bDeviceProtocol  = ddesc[6];
 
-    uart_puts("[xHCI] Device: VID="); print_hex32(g_dev.idVendor);
-    uart_puts(" PID="); print_hex32(g_dev.idProduct);
-    uart_puts(" class="); print_hex32(g_dev.bDeviceClass); uart_puts("\n");
+    uart_puts("[xHCI] Device: VID="); print_hex32(dev->idVendor);
+    uart_puts(" PID="); print_hex32(dev->idProduct);
+    uart_puts(" class="); print_hex32(dev->bDeviceClass); uart_puts("\n");
 
     /* ── Step 4: GET_DESCRIPTOR (Configuration, parse interfaces) ────── */
     uint8_t cfgbuf[256];
@@ -2461,7 +2508,7 @@ static void enumerate_port(int port) {
                           | ((uint32_t)USB_REQ_GET_DESCRIPTOR << 8)
                           | ((uint32_t)USB_DESC_CONFIG << 24);
         uint32_t setup_hi = (uint32_t)9 << 16;
-        volatile uint8_t *ep0_data = (volatile uint8_t *)(xhci_dma_buf + DMA_EP0_DATA_OFF);
+        volatile uint8_t *ep0_data = slot_ep0_data(slot_id);
         dma_zero(ep0_data, 256);
         uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
 
@@ -2505,16 +2552,16 @@ static void enumerate_port(int port) {
             if (bLen < 2 || pos + bLen > total_len) break;
 
             if (bType == USB_DESC_INTERFACE && bLen >= 9) {
-                int ni = g_dev.num_interfaces;
+                int ni = dev->num_interfaces;
                 if (ni < USB_MAX_INTERFACES) {
-                    cur_intf = &g_dev.interfaces[ni];
+                    cur_intf = &dev->interfaces[ni];
                     cur_intf->bInterfaceNumber  = cfgbuf[pos + 2];
                     cur_intf->bAlternateSetting = cfgbuf[pos + 3];
                     cur_intf->bNumEndpoints     = cfgbuf[pos + 4];
                     cur_intf->bInterfaceClass   = cfgbuf[pos + 5];
                     cur_intf->bInterfaceSubClass= cfgbuf[pos + 6];
                     cur_intf->bInterfaceProtocol= cfgbuf[pos + 7];
-                    g_dev.num_interfaces++;
+                    dev->num_interfaces++;
                     uart_puts("[xHCI] Interface "); print_hex32(cur_intf->bInterfaceNumber);
                     uart_puts(" class="); print_hex32(cur_intf->bInterfaceClass);
                     uart_puts(" sub="); print_hex32(cur_intf->bInterfaceSubClass);
@@ -2536,12 +2583,12 @@ static void enumerate_port(int port) {
         }
     }
 
-    uart_puts("[xHCI] Config parsed: "); print_hex32(g_dev.num_interfaces);
+    uart_puts("[xHCI] Config parsed: "); print_hex32(dev->num_interfaces);
     uart_puts(" interface(s)\n");
 
 probe:
     /* ── Step 5: Hand off to USB core for class driver probe ─────────── */
-    usb_enumerate_device(&g_dev, port);
+    usb_enumerate_device(dev, port);
 }
 
 static void port_scan(void) {
@@ -2589,7 +2636,9 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
     uint8_t slot_id = (uint8_t)(uintptr_t)dev->hcd_private;
     if (slot_id == 0) return -1;
 
-    volatile uint8_t *ep0_data = (volatile uint8_t *)(xhci_dma_buf + DMA_EP0_DATA_OFF);
+    /* boot147: set active_slot so ep0_enq() uses the correct per-slot ring */
+    active_slot = slot_id;
+    volatile uint8_t *ep0_data = slot_ep0_data(slot_id);
     int dir_in = (req_type & 0x80) != 0;
 
     /* OUT: copy caller's data into DMA buffer */
