@@ -2109,11 +2109,25 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)input_ctx));
     cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV);
 
-    /* Short timeout — VL805 MCU does not yet write CCEs; caller continues */
+    /* boot145: drain-loop until we get the Address Device CCE (type=0x21).
+     * The event ring may still have PSCEs (type=0x22) or Transfer Events
+     * (type=0x20) ahead of the CCE — discard those and keep waiting.
+     * Matches laptop/Circle pattern; fixes the bug where a PSCE with cc=1
+     * was being accepted as the Address Device CCE (CC=11 followed).      */
     uint32_t ev[4];
-    if (xhci_wait_event(ev, 50) != 0) return -1;
-    uint8_t cc = (ev[2] >> 24) & 0xFF;
-    if (cc != CC_SUCCESS) return -1;
+    uint32_t cc = 0;
+    int got_cce = 0;
+    uint32_t deadline = get_time_ms() + 200U;
+    while (get_time_ms() < deadline) {
+        if (xhci_wait_event(ev, 20) != 0) break;       /* no more events */
+        uint32_t trb_type = (ev[3] >> 10) & 0x3FU;
+        cc = (ev[2] >> 24) & 0xFF;
+        uart_puts("[xHCI] AddrDev drain: type="); print_hex32(trb_type);
+        uart_puts(" cc="); print_hex32(cc); uart_puts("\n");
+        if (trb_type == 0x21U) { got_cce = 1; break; } /* CCE — done */
+        /* type=0x22 PSCE or type=0x20 Transfer Event — drain and retry */
+    }
+    if (!got_cce || cc != CC_SUCCESS) return -1;
 
     volatile uint32_t *out_slot = (volatile uint32_t *)out_ctx;
     uint8_t usb_addr = out_slot[3] & 0xFF;
@@ -2303,24 +2317,41 @@ static void enumerate_port(int port) {
     for (int t = 0; t < 100; t++) fast_delay_ms(1);
 
     /* ── Step 1: Enable Slot ─────────────────────────────────────────── */
-    /* boot144: event ring now works — wait for Enable Slot CCE to get the
-     * real slot_id assigned by the MCU.  Previously we assumed slot_id=1
-     * which caused cmd_address_device() to consume the Enable Slot CCE
-     * as if it were the Address Device CCE, then GET_DESCRIPTOR consumed
-     * the real Address Device CCE (CC=11 Context State Error) and failed.*/
+    /* boot144: wait for Enable Slot CCE so we get the real MCU-assigned slot_id.
+     * boot145 fixes:
+     *   a) slot_id lives in CCE DW3 bits[31:24] → use ev[3]>>24, not ev[3]>>8.
+     *   b) Event ring may still have stale PSCEs from the port reset.
+     *      Drain non-CCE events; CCE has TRB type = 0x21 (33 decimal).
+     *      PSCE = 0x22, Transfer Event = 0x20 — discard those and keep waiting.
+     * Circle xhcieventmanager.cpp: XHCI_TRB_TYPE_EVENT_CMD_COMPLETION = 33 = 0x21 */
     uint32_t ev[4];
     uint8_t slot_id;
     cmd_ring_submit(0, 0, 0, TRB_TYPE_ENABLE_SLOT);
-    uart_puts("[xHCI] Enable Slot submitted — waiting for CCE...\n");
-    if (xhci_wait_event(ev, 100) == 0) {
-        uint8_t es_cc   = (ev[2] >> 24) & 0xFF;
-        uint8_t es_slot = (ev[3] >>  8) & 0xFF;
-        uart_puts("[xHCI] Enable Slot CCE: cc="); print_hex32(es_cc);
-        uart_puts("  slot="); print_hex32(es_slot); uart_puts("\n");
-        slot_id = (es_cc == CC_SUCCESS && es_slot > 0) ? es_slot : 1U;
-    } else {
-        uart_puts("[xHCI] Enable Slot CCE timeout — assuming slot_id=1\n");
-        slot_id = 1;
+    uart_puts("[xHCI] Enable Slot submitted — draining to CCE...\n");
+    {
+        uint8_t es_cc = 0, es_slot = 0;
+        int got_cce = 0;
+        uint32_t deadline = get_time_ms() + 200U;
+        while (get_time_ms() < deadline) {
+            if (xhci_wait_event(ev, 20) != 0) break;   /* no more events */
+            uint32_t trb_type = (ev[3] >> 10) & 0x3FU;
+            es_cc  = (ev[2] >> 24) & 0xFF;
+            uart_puts("[xHCI] ES drain: type="); print_hex32(trb_type);
+            uart_puts(" cc="); print_hex32(es_cc); uart_puts("\n");
+            if (trb_type == 0x21U) {                    /* CCE — done */
+                es_slot = (ev[3] >> 24) & 0xFF;
+                got_cce = 1;
+                break;
+            }
+            /* type=0x22 PSCE or type=0x20 Transfer Event — drain and retry */
+        }
+        if (got_cce && es_cc == CC_SUCCESS && es_slot > 0) {
+            slot_id = es_slot;
+            uart_puts("[xHCI] Enable Slot CCE: cc=1 slot="); print_hex32(slot_id); uart_puts("\n");
+        } else {
+            slot_id = 1;
+            uart_puts("[xHCI] Enable Slot: no CCE or bad cc — assuming slot_id=1\n");
+        }
     }
     g_slot_id = slot_id;
     uart_puts("[xHCI] Using slot_id="); print_hex32(slot_id); uart_puts("\n");
