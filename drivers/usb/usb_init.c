@@ -1,5 +1,13 @@
 /*
- * usb_init.c - USB Subsystem Initialization — DWC2 ONLY MODE
+ * usb_init.c - USB Subsystem Initialization
+ *
+ * Pi 4 has two completely independent USB controllers:
+ *
+ *   1. VL805 xHCI (PCIe) -- 4x USB-A ports  -- usb_xhci.c
+ *   2. DWC2 OTG  (SoC)   -- USB-C OTG port  -- usb_dwc2.c
+ *
+ * xHCI registers itself via pci.c/vl805_probe -- no g_xhci_hc_ops needed here.
+ * DWC2 registers via g_dwc2_hc_ops from usb_dwc2.c.
  */
 
 #include "kernel.h"
@@ -7,20 +15,19 @@
 #include "usb_xhci.h"
 #include "usb_dwc2.h"
 
-/* VL805 IDs (kept for future use) */
 #define VL805_VENDOR_ID  0x1106
 #define VL805_DEVICE_ID  0x3483
 
-/* Explicit declarations */
 extern usb_hc_ops_t g_dwc2_hc_ops;
-extern int  dwc2_scan_ports(void);
 extern void uart_puts(const char *s);
 
-/* PCI probe for VL805 (stub — does nothing) */
+/* PCI probe for VL805 xHCI */
 static int vl805_probe(pci_dev_t *pdev)
 {
-    debug_print("[USB] VL805 xHCI found but SKIPPED (DWC2-only mode)\n");
-    return 0;
+    void *xhci_base = (void *)0x600000000ULL;
+    (void)pdev;
+    debug_print("[USB] VL805 xHCI probed\n");
+    return xhci_init(xhci_base);
 }
 
 static pci_driver_t vl805_driver = {
@@ -31,29 +38,20 @@ static pci_driver_t vl805_driver = {
     .probe      = vl805_probe
 };
 
-/* Main USB init — DWC2 runs FIRST and ALWAYS */
 int usb_init(void)
 {
-    uart_puts("\n");
-    uart_puts("=== DWC2 TEST STRING 2026-04-02 21:20 ===\n");
-    uart_puts("================================================\n");
-    uart_puts("=== usb_init() CALLED — DWC2 ONLY MODE ===\n");
-    uart_puts("=== STARTING DWC2 USB 2.0 DRIVER NOW ===\n");
-    uart_puts("=== xHCI / VL805 PATH SKIPPED (watchdog freeze) ===\n");
-    uart_puts("================================================\n\n");
+    debug_print("[USB] Initializing USB subsystem\n");
 
-    debug_print("[USB] Initializing USB subsystem (DWC2 first)\n");
-
-    /* Register VL805 driver (harmless stub) */
+    /* Track 1: VL805 xHCI (USB-A ports via PCIe) */
     pci_register_driver(&vl805_driver);
 
-    /* DWC2 USB 2.0 SoC controller — runs unconditionally */
+    /* Track 2: DWC2 OTG (USB-C port, SoC internal) */
     if (dwc2_init() == 0) {
         usb_register_hc(&g_dwc2_hc_ops);
         dwc2_scan_ports();
-        debug_print("[USB] DWC2 USB 2.0 fallback ready\n");
+        debug_print("[USB] DWC2 USB 2.0 OTG ready\n");
     } else {
-        uart_puts("[USB] DWC2 initialization failed — OTG port unavailable\n");
+        uart_puts("[USB] DWC2 initialization failed\n");
     }
 
     return 0;

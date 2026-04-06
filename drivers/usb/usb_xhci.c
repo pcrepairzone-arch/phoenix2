@@ -2070,15 +2070,31 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
 
     /* Speed field in Slot Context DWord 0 bits[23:20] (xHCI §6.2.2):
      *   1=FS 12Mb/s  2=LS 1.5Mb/s  3=HS 480Mb/s  4=SS 5Gb/s
-     * Use the actual port speed — do NOT hardcode SS (4).
-     * If speed=0 (unknown/companion) fall back to SS as safe default. */
-    uint32_t spd = (speed > 0 && speed <= 6) ? speed : 4U;
+     * Use the actual port speed. If speed=0 (unknown — typically a
+     * USB2 companion port that completed reset at HS) fall back to
+     * HS (3) not SS (4). SS fallback was causing BABBLE on HS devices
+     * because MPS=512 was used for a 64-byte HS endpoint.            */
+    uint32_t spd = (speed > 0 && speed <= 6) ? speed : 3U;
     volatile uint32_t *slot_ctx = (volatile uint32_t *)(input_ctx + CTX_SIZE);
     slot_ctx[0] = (route & 0xFFFFF) | (spd << 20) | (1U << 27);
     slot_ctx[1] = (uint32_t)(port + 1) << 16;
 
+    /* EP0 max packet size depends on speed (xHCI spec §6.2.3.1):
+     *   LS  (speed=2): 8 bytes
+     *   FS  (speed=1): 8, 16, 32, or 64 — use 64 as safe default
+     *   HS  (speed=3): 64 bytes  (fixed by USB 2.0 spec)
+     *   SS  (speed=4): 512 bytes (fixed by USB 3.0 spec)
+     * Using 512 for HS was causing GET_DESCRIPTOR STALLs — the device
+     * receives a control endpoint configured for SS and STALLs the
+     * data phase because it cannot match that packet size.            */
+    uint32_t ep0_mps;
+    switch (spd) {
+        case 4:  ep0_mps = 512; break;  /* SuperSpeed */
+        case 3:  ep0_mps = 64;  break;  /* HighSpeed  */
+        default: ep0_mps = 64;  break;  /* FullSpeed/LowSpeed — 64 safe default */
+    }
     volatile uint32_t *ep0_ctx = (volatile uint32_t *)(input_ctx + 2 * CTX_SIZE);
-    ep0_ctx[1] = (3U << 1) | (4U << 3) | (512U << 16);
+    ep0_ctx[1] = (3U << 1) | (4U << 3) | (ep0_mps << 16);
 
     ep0_ring_init();
     uint64_t ep0_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_ring));
