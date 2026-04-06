@@ -2166,9 +2166,76 @@ Rule 41: MFINDEX does not start at RS=1 on VL805. It starts
          MFINDEX after xhci_scan_ports(), not after TRUE RUNNING.
 
 Rule 42: Circle .o files from a failed link are still useful.
-         Compiled object files contain the machine code and can
-         be disassembled to reveal exact register write sequences
-         even when the final link fails.
+         Compiled object files contain the sources files &machine 
+	 code and can be disassembled to reveal exact register 
+         write sequences even when the final link fails.
+
+
+── BOOT144–146 SUMMARY ────────────────────────────────────────
+
+  boot144: Fix Enable Slot CCE ordering — wait for real slot_id
+           before issuing Address Device.
+  boot145: Fix CCE drain-loops — filter by type=0x21, extract
+           slot_id from DW3>>24, handle interleaved PSCEs (0x22)
+           and Transfer Events (0x20).
+  boot146: Fix Address Device CC=11 — Root Hub Port Number field
+           is Slot Context DW1 bits[15:8]; was incorrectly placed
+           at bits[23:16] (Number-of-Ports field). Fixed to
+           (port+1)<<8. Confirmed: DW1=0x100/0x200/0x300 in log.
+
+── BOOT147 — MULTI-SLOT SUPPORT ──────────────────────────────
+
+  Problem 1: CONFIG register MaxSlotsEn was left at 1 (reset
+  default). Enable Slot for slots 2 and 3 returned CC=9 (No
+  Slots Available) because the MCU had only enabled 1 slot.
+  Fix: set CONFIG = max_ports (5 for VL805) during init.
+
+  Problem 2: All slots shared a single input_ctx / out_ctx /
+  ep0_ring / ep0_data. Address Device for slot 2 overwrote
+  slot 1's context memory. Fix: per-slot DMA layout with a
+  0x1000-byte stride, supporting up to MAX_SLOTS_ALLOC=4 slots.
+
+  Per-slot DMA layout (base 0x22000, stride 0x1000):
+    slot N-1:  +0x000 input_ctx (512B)
+               +0x500 out_ctx   (512B)
+               +0x900 ep0_ring  (1KB, 64 TRBs)
+               +0xD00 ep0_data  (512B)
+
+  Globals added: ep0_cycle_s[], ep0_enqueue_s[], active_slot,
+  g_slot_ids[], g_devs[]. Helper inlines: slot_input_ctx(),
+  slot_out_ctx(), slot_ep0_ring(), slot_ep0_data().
+
+  Confirmed via bootlog146: CONFIG=5, slots 1-3 all get
+  Enable Slot cc=1, EP0 rings at 0xC0032901/0xC0033901/0xC0034901.
+
+── BOOT148 — ADDRESS DEVICE SLOT ID IN TRB DW3 ───────────────
+
+  Problem: Address Device returned CC=11 ("Slot Not Enabled
+  Error") for ALL slots including slot 1 after boot147 changes.
+
+  Root cause: xHCI spec §6.4.3.4 — Address Device Command TRB
+  DW3 bits[31:24] must contain the Slot ID. Our cmd_ring_submit
+  built DW3 as (type<<10)|cycle with no slot_id field. The MCU
+  received slot_id=0 in DW3, which is never enabled → CC=11.
+
+  Fix: added dw3_extra parameter to cmd_ring_submit(). Address
+  Device caller passes (uint32_t)slot_id<<24. All other command
+  callers pass dw3_extra=0. Forward declaration and function
+  definition updated to match.
+
+  Also fixed: misleading "Address Device timeout" error message
+  renamed to "Address Device failed" (it was a CC check failure,
+  not a real timeout).
+
+Rule 43: Address Device Command TRB DW3 bits[31:24] = Slot ID.
+         Without this the MCU sees slot_id=0 (always invalid)
+         and returns CC=11 "Slot Not Enabled Error". The xHCI
+         spec §6.4.3.4 is explicit; the field must be set.
+
+Rule 44: cmd_ring_submit must propagate caller-supplied DW3 bits.
+         Use a dw3_extra parameter ORed into the final DW3 word
+         so each command type can supply its own upper fields
+         without needing a separate submission path.
 
 
 ═══════════════════════════════════════════════════════════════

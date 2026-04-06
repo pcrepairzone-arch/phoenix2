@@ -116,7 +116,7 @@ static void port_scan(void);
 static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uint32_t speed);
 static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len);
 static void enumerate_port(int port);
-static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32_t type);
+static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32_t type, uint32_t dw3_extra);
 static int xhci_wait_event(uint32_t ev[4], int timeout_ms);
 static int evt_ring_poll(uint32_t ev[4]);
 
@@ -1379,7 +1379,7 @@ static int run_controller(void) {
         }
 
         uart_puts("[xHCI] Sending No-op keepalive to MCU...\n");
-        cmd_ring_submit(0, 0, 0, TRB_TYPE_NOOP_CMD);
+        cmd_ring_submit(0, 0, 0, TRB_TYPE_NOOP_CMD, 0);
 
         /* Verify No-op TRB landed at the expected physical location.
          * cmd_enqueue was incremented by cmd_ring_submit; the TRB we just
@@ -2050,14 +2050,16 @@ static void ep0_doorbell(uint8_t slot) {
     asm volatile("dsb sy" ::: "memory");
 }
 
-static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32_t type) {
+/* boot148: dw3_extra allows callers to OR additional fields into DW3.
+ * Address Device requires slot_id in bits[31:24] of DW3 (xHCI §6.4.3.4).
+ * All other commands pass dw3_extra=0.                                      */
+static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32_t type, uint32_t dw3_extra) {
     uint32_t b = cmd_enqueue * 4;
     cmd_ring[b + 0] = dw0;
     cmd_ring[b + 1] = dw1;
     cmd_ring[b + 2] = dw2;
-    /* Command TRBs: type + cycle bit only. TRB_TC is Toggle Cycle and
-     * belongs only on the Link TRB at the end of the ring. */
-    cmd_ring[b + 3] = (type << TRB_TYPE_SHIFT) | cmd_cycle;
+    /* DW3: TRB type + cycle bit + any caller-supplied extra bits (e.g. Slot ID). */
+    cmd_ring[b + 3] = (type << TRB_TYPE_SHIFT) | dw3_extra | cmd_cycle;
     asm volatile("dsb sy" ::: "memory");
 
     cmd_enqueue++;
@@ -2167,7 +2169,10 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uart_puts(" DW2(TRDq+DCS)="); print_hex32(ep0_ctx[2]); uart_puts("\n");
 
     uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)in_ctx));
-    cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV);
+    /* boot148: DW3 bits[31:24] = Slot ID (xHCI §6.4.3.4). Without this the
+     * MCU sees slot_id=0 (never enabled) and returns CC=11 "Slot Not Enabled". */
+    cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV,
+                    (uint32_t)slot_id << 24);
 
     /* boot145: drain-loop until we get the Address Device CCE (type=0x21).
      * The event ring may still have PSCEs (type=0x22) or Transfer Events
@@ -2387,7 +2392,7 @@ static void enumerate_port(int port) {
      * Circle xhcieventmanager.cpp: XHCI_TRB_TYPE_EVENT_CMD_COMPLETION = 33 = 0x21 */
     uint32_t ev[4];
     uint8_t slot_id;
-    cmd_ring_submit(0, 0, 0, TRB_TYPE_ENABLE_SLOT);
+    cmd_ring_submit(0, 0, 0, TRB_TYPE_ENABLE_SLOT, 0);
     uart_puts("[xHCI] Enable Slot submitted — draining to CCE...\n");
     {
         uint8_t es_cc = 0, es_slot = 0;
@@ -2423,7 +2428,7 @@ static void enumerate_port(int port) {
     if (cmd_address_device(slot_id, (uint8_t)port, 0, speed) == 0) {
         uart_puts("[xHCI] Address Device OK slot="); print_hex32(slot_id); uart_puts("\n");
     } else {
-        uart_puts("[xHCI] Address Device timeout — continuing\n");
+        uart_puts("[xHCI] Address Device failed — continuing\n");
     }
 
     /* Build a minimal usb_device_t so control transfers work via g_hc_ops.
