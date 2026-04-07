@@ -33,4 +33,11 @@ int  dwc2_device_present(void);
  * from xHCI.  Does its own port detection and device enumeration.   */
 int  dwc2_start(void);
 
+/* Legacy API used by usb_init.c — delegates to dwc2_start()        */
+int  dwc2_scan_ports(void);
+
+/* Legacy ops struct used by usb_init.c via usb_register_hc()        */
+#include "usb.h"   /* usb_hc_ops_t */
+extern usb_hc_ops_t g_dwc2_hc_ops;
+
 #endif /* USB_DWC2_H */
