@@ -2127,7 +2127,14 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     volatile uint8_t *oc     = slot_out_ctx(slot_id);
     active_slot = slot_id;   /* set before any ep0_enq() calls below        */
     dma_zero(in_ctx, 34 * CTX_SIZE);
-    dma_zero(oc,     32 * CTX_SIZE);
+    /* boot151: do NOT zero the output context here.
+     * port_scan() pre-allocated DCBAA[slot_id] and zeroed the output context
+     * before Enable Slot was submitted.  The VL805 MCU wrote the initial Slot
+     * State to the output context during Enable Slot processing.  Zeroing the
+     * output context here (after Enable Slot) would destroy the MCU's Slot
+     * State write and cause Address Device to see Slot State=Disabled →
+     * CC=17 Parameter Error.  The output context must remain intact between
+     * Enable Slot and Address Device.                                         */
 
     volatile uint32_t *icc = (volatile uint32_t *)in_ctx;
     icc[1] = 0x00000003;
@@ -2208,6 +2215,23 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uart_puts("  out_dma="); print_hex32((uint32_t)out_dma);
     uart_puts("  DCBAA[slot]=");
     print_hex32((uint32_t)(dcbaa[slot_id] & 0xFFFFFFFFU)); uart_puts("\n");
+
+    /* boot151: dump the OUTPUT context before Address Device to see what the
+     * MCU wrote during Enable Slot.  If DCBAA pre-allocation is working, the
+     * MCU should have written Slot State to out_slot[3] bits[26:24].
+     * Expected: Slot State=0 (Enabled) written by MCU, or all-zeros if MCU
+     * didn't write anything.  Either way, non-NULL DCBAA is the key fix.     */
+    {
+        volatile uint32_t *out_slot_pre = (volatile uint32_t *)oc;
+        asm volatile("dsb sy" ::: "memory");
+        uart_puts("[boot151] OutCtx (MCU wrote during EnSlot): DW0=");
+        print_hex32(out_slot_pre[0]);
+        uart_puts(" DW1="); print_hex32(out_slot_pre[1]);
+        uart_puts(" DW2="); print_hex32(out_slot_pre[2]);
+        uart_puts(" DW3="); print_hex32(out_slot_pre[3]);
+        uart_puts("  SlotState="); print_hex32((out_slot_pre[3] >> 24) & 0x1FU);
+        uart_puts("\n");
+    }
 
     /* Record cmd_enqueue before submission to log the exact TRB written. */
     uint32_t trb_idx = cmd_enqueue;
@@ -2651,6 +2675,40 @@ probe:
 
 static void port_scan(void) {
     int n = (int)xhci_ctrl.max_ports;
+
+    /* boot151: Pre-allocate output contexts for all slots in DCBAA BEFORE any
+     * Enable Slot command is issued.
+     *
+     * Root cause of CC=17 (Parameter Error) on every Address Device:
+     *   When Enable Slot runs, DCBAA[slot_id] was still 0 (we only set it
+     *   inside cmd_address_device, which runs after Enable Slot).  The VL805
+     *   MCU writes the initial Slot State to the output Device Context during
+     *   Enable Slot processing.  With DCBAA[slot_id]=0 the write goes to PCIe
+     *   address 0 (= physical 0), not to our output context buffer.  Then
+     *   cmd_address_device zeroed the output context, so when Address Device
+     *   ran the MCU found Slot State=Disabled in the output context and
+     *   returned CC=17 Parameter Error.
+     *
+     * Fix (matches Circle's CXHCIDevice::Initialize() pattern):
+     *   Set DCBAA[1..MAX_SLOTS_ALLOC] to point at the correct per-slot output
+     *   context buffers before any Enable Slot is submitted.  The output
+     *   contexts are already zeroed (the entire xhci_dma_buf was dma_zero'd
+     *   at init).  The MCU can then write Slot State to the right address
+     *   during Enable Slot.  cmd_address_device no longer zeroes the output
+     *   context (see below), preserving the MCU's Slot State write.          */
+    uart_puts("[boot151] Pre-allocating DCBAA[1..");
+    print_hex32(MAX_SLOTS_ALLOC);
+    uart_puts("] before port scan...\n");
+    for (uint8_t s = 1; s <= MAX_SLOTS_ALLOC; s++) {
+        volatile uint8_t *oc_pre = slot_out_ctx(s);
+        uint64_t oc_dma = phys_to_dma((uint64_t)virt_to_phys((void *)oc_pre));
+        dcbaa[s] = oc_dma;
+        uart_puts("[boot151]   DCBAA["); print_hex32(s); uart_puts("]=");
+        print_hex32((uint32_t)oc_dma); uart_puts("\n");
+    }
+    asm volatile("dsb sy" ::: "memory");
+    uart_puts("[boot151] DCBAA pre-allocation done.\n");
+
     uart_puts("[xHCI] Port scan ("); print_hex32(n); uart_puts(" port(s)):\n");
     for (int p = 0; p < n; p++)
         enumerate_port(p);
