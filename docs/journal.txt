@@ -2063,3 +2063,216 @@ NOTE: Do NOT remove any of the hard-won rules (Rules 1-35) from the
       that future developers will need. Only remove the boot-time
       diagnostic output that's no longer informative.
 ═══════════════════════════════════════════════════════════════
+
+
+═══════════════════════════════════════════════════════════════
+BOOT 143 — VL805 EVENT RING WORKING  (Apr 6 2026)
+═══════════════════════════════════════════════════════════════
+
+*** HISTORIC MILESTONE ***
+After 143 boots, the VL805 xHCI event ring is finally working.
+No-op CCE received. MCU DMA write-back confirmed. Enable Slot
+returned slot=1. Address Device completed CC=0x01 (success).
+MFINDEX started after first port reset (t0=0x062a running).
+
+── HOW IT WAS SOLVED ──────────────────────────────────────────
+
+Circle sample/08-usbkeyboard was built on the Linux build machine
+(aarch64-linux-gnu- toolchain, STDLIB_SUPPORT=0). The link step
+failed due to GCC 14 libgcc __getauxval issue, but the COMPILE
+step succeeded — producing .o object files for Circle's xHCI
+driver (xhcieventmanager.o, xhcidevice.o etc.).
+
+Rob analysed the compiled Circle .o files directly, reading the
+machine code / disassembly to understand the exact register write
+sequence Circle uses for VL805 init. This revealed three critical
+differences from Phoenix's sequence:
+
+FIX 1 — INTE before RS=1 (separate write):
+  Circle writes CMD_INTE alone FIRST, then CMD_RS | CMD_INTE.
+  Phoenix was writing CMD_RS | CMD_INTE in a single write.
+  The VL805 MCU needs to see INTE set before the run bit to
+  know where to deliver events.
+  Code:
+    writel(CMD_INTE, op + OP_USBCMD);          // INTE first
+    dsb sy; isb
+    writel(CMD_RS | CMD_INTE, op + OP_USBCMD); // then RS=1
+
+FIX 2 — ERSTSZ=1 BEFORE ERSTBA (reversed segment init order):
+  Circle and Linux both write ERSTSZ=1 first, then ERSTBA.
+  Phoenix always wrote ERSTBA first, then ERSTSZ=1.
+  The VL805 MCU latches the segment count at ERSTBA write time.
+  With ERSTSZ=0 when ERSTBA arrives, the MCU treats it as
+  "zero valid segments" and never consults the event ring.
+  Code:
+    writel(1U, ir0 + IR_ERSTSZ);               // count FIRST
+    reg_write64(ir0, IR_ERSTBA_LO, erstba_dma); // then base
+
+FIX 3 — ERDP written with EHB=1 on init:
+  Circle always ORs 0x8 (EHB bit) into the first ERDP write.
+  Phoenix was writing ERDP with EHB=0 throughout.
+  The VL805 MCU uses an EHB=1 write as a "host ready"
+  handshake signal before it starts posting events to the ring.
+  Per xHCI spec EHB is W1C so writing EHB=1 when EHB=0 is
+  harmless on compliant hardware.
+  Code:
+    reg_write64(ir0, IR_ERDP_LO, evt_dma | 0x8ULL); // EHB=1
+
+── ADDITIONAL DISCOVERY ───────────────────────────────────────
+
+MFINDEX starts after port reset, not after RS=1:
+  Boot143 revealed MFINDEX is static at RS=1 but starts
+  ticking after the first USB port reset in xhci_scan_ports().
+  MFINDEX t0=0x062a t5ms=0x0652 (running) — confirmed after PR.
+  This explains every "MFINDEX static" boot since boot116.
+  The VL805 MCU ties SOF frame generation to PHY activity,
+  not to RS=1. MFINDEX check moved to after port scan.
+
+── BOOT143 KEY LOG LINES ──────────────────────────────────────
+
+  [BOOT116] *** 1 event(s) received — event ring WORKING! ***
+  [xHCI] No-op CCE received! CC=0x00000001
+  [xHCI] *** EVENT RING WORKING ***
+  [xHCI] TRB[0]: MCU WROTE TRB[0]! type=CCE
+  [xHCI] Address Device OK slot=1
+  [boot142] MFINDEX post-portscan: t0=0x062a (RUNNING)
+
+  CONFIG=0x00000001, IMOD=0x00000000 — these were NOT the cause.
+  The three ERST/INTE/ERDP fixes are what made the difference.
+
+── REMAINING WORK ─────────────────────────────────────────────
+
+  Address Device returned CC=0x0000000b (STALL_ERROR) on
+  GET_DESCRIPTOR — keyboard is present but control transfer
+  stalled. Next: fix GET_DESCRIPTOR EP0 transfer for xHCI.
+  DWC2 EP0 already working (boot118). Apply same pattern.
+
+── NEW RULES ──────────────────────────────────────────────────
+
+Rule 38: Write CMD_INTE alone BEFORE CMD_RS | CMD_INTE.
+         Single combined write does not work on VL805.
+
+Rule 39: Write ERSTSZ=1 BEFORE ERSTBA. The MCU latches segment
+         count at ERSTBA write time. ERSTSZ=0 at that moment
+         means "zero segments" — MCU ignores the ring forever.
+
+Rule 40: Write ERDP with EHB=1 (OR 0x8) on init only.
+         This is the MCU's "host ready" handshake. Without it
+         the MCU will not begin posting events even if the ring
+         is otherwise correctly configured.
+
+Rule 41: MFINDEX does not start at RS=1 on VL805. It starts
+         after the first USB port reset (PHY activity). Check
+         MFINDEX after xhci_scan_ports(), not after TRUE RUNNING.
+
+Rule 42: Circle .o files from a failed link are still useful.
+         Compiled object files contain the sources files &machine 
+	 code and can be disassembled to reveal exact register 
+         write sequences even when the final link fails.
+
+
+── BOOT144–146 SUMMARY ────────────────────────────────────────
+
+  boot144: Fix Enable Slot CCE ordering — wait for real slot_id
+           before issuing Address Device.
+  boot145: Fix CCE drain-loops — filter by type=0x21, extract
+           slot_id from DW3>>24, handle interleaved PSCEs (0x22)
+           and Transfer Events (0x20).
+  boot146: Fix Address Device CC=11 — Root Hub Port Number field
+           is Slot Context DW1 bits[15:8]; was incorrectly placed
+           at bits[23:16] (Number-of-Ports field). Fixed to
+           (port+1)<<8. Confirmed: DW1=0x100/0x200/0x300 in log.
+
+── BOOT147 — MULTI-SLOT SUPPORT ──────────────────────────────
+
+  Problem 1: CONFIG register MaxSlotsEn was left at 1 (reset
+  default). Enable Slot for slots 2 and 3 returned CC=9 (No
+  Slots Available) because the MCU had only enabled 1 slot.
+  Fix: set CONFIG = max_ports (5 for VL805) during init.
+
+  Problem 2: All slots shared a single input_ctx / out_ctx /
+  ep0_ring / ep0_data. Address Device for slot 2 overwrote
+  slot 1's context memory. Fix: per-slot DMA layout with a
+  0x1000-byte stride, supporting up to MAX_SLOTS_ALLOC=4 slots.
+
+  Per-slot DMA layout (base 0x22000, stride 0x1000):
+    slot N-1:  +0x000 input_ctx (512B)
+               +0x500 out_ctx   (512B)
+               +0x900 ep0_ring  (1KB, 64 TRBs)
+               +0xD00 ep0_data  (512B)
+
+  Globals added: ep0_cycle_s[], ep0_enqueue_s[], active_slot,
+  g_slot_ids[], g_devs[]. Helper inlines: slot_input_ctx(),
+  slot_out_ctx(), slot_ep0_ring(), slot_ep0_data().
+
+  Confirmed via bootlog146: CONFIG=5, slots 1-3 all get
+  Enable Slot cc=1, EP0 rings at 0xC0032901/0xC0033901/0xC0034901.
+
+── BOOT148 — ADDRESS DEVICE SLOT ID IN TRB DW3 ───────────────
+
+  Problem: Address Device returned CC=11 ("Slot Not Enabled
+  Error") for ALL slots including slot 1 after boot147 changes.
+
+  Root cause: xHCI spec §6.4.3.4 — Address Device Command TRB
+  DW3 bits[31:24] must contain the Slot ID. Our cmd_ring_submit
+  built DW3 as (type<<10)|cycle with no slot_id field. The MCU
+  received slot_id=0 in DW3, which is never enabled → CC=11.
+
+  Fix: added dw3_extra parameter to cmd_ring_submit(). Address
+  Device caller passes (uint32_t)slot_id<<24. All other command
+  callers pass dw3_extra=0. Forward declaration and function
+  definition updated to match.
+
+  Also fixed: misleading "Address Device timeout" error message
+  renamed to "Address Device failed" (it was a CC check failure,
+  not a real timeout).
+
+Rule 43: Address Device Command TRB DW3 bits[31:24] = Slot ID.
+         Without this the MCU sees slot_id=0 (always invalid)
+         and returns CC=11 "Slot Not Enabled Error". The xHCI
+         spec §6.4.3.4 is explicit; the field must be set.
+
+Rule 44: cmd_ring_submit must propagate caller-supplied DW3 bits.
+         Use a dw3_extra parameter ORed into the final DW3 word
+         so each command type can supply its own upper fields
+         without needing a separate submission path.
+
+
+═══════════════════════════════════════════════════════════════
+ACKNOWLEDGMENT — CIRCLE PROJECT
+═══════════════════════════════════════════════════════════════
+
+The VL805 xHCI event ring breakthrough at Boot 143 was made
+possible entirely by the Circle project by R. Stange:
+
+  https://github.com/rsta2/circle
+
+Circle is a C++ bare-metal framework for the Raspberry Pi that
+includes a fully working xHCI driver for the Pi 4 / VL805.
+
+We had been debugging the VL805 event ring for 143 boots across
+many sessions, exhausting every approach suggested by the xHCI
+specification and every hypothesis we could derive from register
+state analysis. The MCU was silently ignoring our event ring
+configuration in a way that no amount of spec reading could explain.
+
+The solution came from building Circle's sample/08-usbkeyboard.
+The link step failed due to GCC 14 / libgcc incompatibility, but
+the COMPILE step succeeded. Rob analysed the source files & 
+compiled .o object files directly — 
+reading the source code produced from Circle's
+xhcieventmanager.cpp and xhcidevice.cpp — and identified three
+undocumented VL805-specific register write requirements that are
+absent from the xHCI specification entirely.
+
+Without Circle's working implementation to compare against, these
+requirements would have remained invisible indefinitely. The project
+quite simply could not have reached Boot 143 without it.
+
+R. Stange has maintained Circle since 2014 and continues to update
+it for new Pi hardware. It is an extraordinary resource for anyone
+working on bare-metal Pi development. If you are reading this journal
+and working on similar problems, start with Circle.
+
+Thank you, Circle. Thank you, R. Stange.
+
