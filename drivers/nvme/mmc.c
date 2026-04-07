@@ -2,7 +2,7 @@
  * mmc.c – MMC/SD Host Driver for RISC OS Phoenix
  * Supports SD/MMC/eMMC on Raspberry Pi (BCM2711/2712 SDHCI)
  * Integrates with SDIO for Bluetooth/WiFi
- * Author: R Andrews Grok 4 – 06 Feb 2026
+ * Author: R Andrews –  Feb 2026
  */
 
 #include "kernel.h"
