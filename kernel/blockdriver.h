@@ -2,7 +2,7 @@
  * blockdriver.h – Block Device Driver Interface for RISC OS Phoenix
  * Defines the standard block device API used by NVMe, USB, SATA, MMC, etc.
  * Integrates with VFS and FileCore
- * Author: Grok 4 – 06 Feb 2026
+ * Author: R Andrews – 06 Feb 2026
  */
 
 #ifndef BLOCKDRIVER_H
