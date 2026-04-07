@@ -484,6 +484,16 @@ static int read_caps(void) {
     uint32_t spb_hi = (hcs2 >> 21) & 0x1F;
     xhci_ctrl.scratchpad_count = (spb_hi << 5) | spb_lo;
 
+    /* boot149: read HCCPARAMS1 to get AC64, CSZ, and XECP.
+     * CSZ (bit[2]): 0 = 32-byte context entries, 1 = 64-byte context entries.
+     * We previously hardcoded CTX_SIZE=32.  If VL805 has CSZ=1, Slot Context
+     * lands at offset 32 instead of 64 and EP0 Context at 64 instead of 128,
+     * causing the MCU to read garbage fields → CC=17 "Context State Error".   */
+    uint32_t hcc1 = readl(base + CAP_HCCPARAMS1);
+    xhci_ctrl.ac64 = (hcc1 >> 0) & 1;
+    xhci_ctrl.csz  = (hcc1 >> 2) & 1;
+    xhci_ctrl.xecp = (uint16_t)((hcc1 >> 16) & 0xFFFF);
+
     uint32_t rtsoff = readl(base + CAP_RTSOFF) & ~0x1FU;
     uint32_t dboff  = readl(base + CAP_DBOFF)  & ~0x03U;
 
@@ -493,6 +503,11 @@ static int read_caps(void) {
 
     debug_print("[xHCI] MaxSlots=%u  MaxPorts=%u  Scratchpads=%u\n",
                 xhci_ctrl.max_slots, xhci_ctrl.max_ports, xhci_ctrl.scratchpad_count);
+    uart_puts("[xHCI] HCCPARAMS1="); print_hex32(hcc1);
+    uart_puts("  AC64="); print_hex32(xhci_ctrl.ac64);
+    uart_puts("  CSZ="); print_hex32(xhci_ctrl.csz);
+    uart_puts(xhci_ctrl.csz ? "  → 64-byte context entries\n"
+                             : "  → 32-byte context entries\n");
     return 0;
 }
 
@@ -1949,7 +1964,10 @@ int xhci_init(void *base_addr) {
 #define SLOT_EP0_DATA_OFF    0xD00
 
 #define EP0_RING_TRBS  64
-#define CTX_SIZE  32
+/* boot149: CTX_SIZE is no longer a compile-time constant.
+ * CSZ bit in HCCPARAMS1 determines whether entries are 32 or 64 bytes.
+ * read_caps() populates xhci_ctrl.csz; this macro reads it at runtime.  */
+#define CTX_SIZE  (xhci_ctrl.csz ? 64U : 32U)
 
 #define TRB_TYPE_SETUP     2
 #define TRB_TYPE_DATA      3
