@@ -2178,19 +2178,54 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uint64_t out_dma = phys_to_dma((uint64_t)virt_to_phys((void *)oc));
     dcbaa[slot_id] = out_dma;
 
-    /* boot146: log slot and EP0 context raw DWs to confirm field encoding */
+    uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)in_ctx));
+
+    /* boot150: full input context dump + TRB dump so we can verify exactly
+     * what the MCU reads.  CC=17 "Parameter Error" persists despite correct-
+     * looking field values — this dump will confirm whether the data is
+     * actually in memory or stuck in cache.                                   */
+    uart_puts("[xHCI] --- AddrDev context dump (slot=");
+    print_hex32(slot_id); uart_puts(") ---\n");
+
+    uart_puts("[xHCI] ICC:      D="); print_hex32(icc[0]);
+    uart_puts("  A="); print_hex32(icc[1]); uart_puts("\n");
+
     uart_puts("[xHCI] SlotCtx: DW0="); print_hex32(slot_ctx[0]);
     uart_puts(" DW1="); print_hex32(slot_ctx[1]);
+    uart_puts(" DW2="); print_hex32(slot_ctx[2]);
+    uart_puts(" DW3="); print_hex32(slot_ctx[3]);
     uart_puts("  RH_PORT="); print_hex32((slot_ctx[1] >> 8) & 0xFF);
     uart_puts("\n");
-    uart_puts("[xHCI] EP0Ctx:  DW1="); print_hex32(ep0_ctx[1]);
-    uart_puts(" DW2(TRDq+DCS)="); print_hex32(ep0_ctx[2]); uart_puts("\n");
 
-    uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)in_ctx));
-    /* boot148: DW3 bits[31:24] = Slot ID (xHCI §6.4.3.4). Without this the
-     * MCU sees slot_id=0 (never enabled) and returns CC=11 "Slot Not Enabled". */
+    uart_puts("[xHCI] EP0Ctx:  DW0="); print_hex32(ep0_ctx[0]);
+    uart_puts(" DW1="); print_hex32(ep0_ctx[1]);
+    uart_puts(" DW2="); print_hex32(ep0_ctx[2]);
+    uart_puts(" DW3="); print_hex32(ep0_ctx[3]);
+    uart_puts(" DW4="); print_hex32(ep0_ctx[4]);
+    uart_puts("\n");
+
+    uart_puts("[xHCI] in_dma="); print_hex32((uint32_t)in_dma);
+    uart_puts("  out_dma="); print_hex32((uint32_t)out_dma);
+    uart_puts("  DCBAA[slot]=");
+    print_hex32((uint32_t)(dcbaa[slot_id] & 0xFFFFFFFFU)); uart_puts("\n");
+
+    /* Record cmd_enqueue before submission to log the exact TRB written. */
+    uint32_t trb_idx = cmd_enqueue;
+
+    /* boot148: DW3 bits[31:24] = Slot ID (xHCI §6.4.3.4). */
     cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV,
                     (uint32_t)slot_id << 24);
+
+    /* boot150: read back the TRB from cmd_ring to confirm what was written. */
+    {
+        uint32_t b = trb_idx * 4;
+        uart_puts("[xHCI] AddrDev TRB["); print_hex32(trb_idx); uart_puts("]: ");
+        uart_puts("dw0="); print_hex32(cmd_ring[b+0]);
+        uart_puts(" dw1="); print_hex32(cmd_ring[b+1]);
+        uart_puts(" dw2="); print_hex32(cmd_ring[b+2]);
+        uart_puts(" dw3="); print_hex32(cmd_ring[b+3]);
+        uart_puts("\n");
+    }
 
     /* boot145: drain-loop until we get the Address Device CCE (type=0x21).
      * The event ring may still have PSCEs (type=0x22) or Transfer Events
