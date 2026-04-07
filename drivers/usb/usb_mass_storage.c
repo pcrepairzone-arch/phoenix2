@@ -2,7 +2,7 @@
  * usb_mass_storage.c – Full 64-bit USB Mass Storage Driver for RISC OS Phoenix
  * Supports USB 3.2 Gen 2x2 (20 Gbps) + UASP
  * Integrates with BlockDevice → FileCore
- * Author: R Andrews Grok 4 – 4 Feb 2026
+ * Author: R Andrews – 4 Feb 2026
  */
 
 #include "kernel.h"

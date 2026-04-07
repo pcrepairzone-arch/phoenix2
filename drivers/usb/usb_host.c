@@ -2,7 +2,7 @@
  * usb_host.c – USB Host Controller Driver for RISC OS Phoenix
  * Full xHCI 1.2 support for USB 3.2 Gen 2x2 (20 Gbps)
  * Handles enumeration, control/bulk/interrupt/isoc transfers, hubs, class drivers
- * Author:R Andrews Grok 4 – 06 Feb 2026
+ * Author:R Andrews – 06 Feb 2026
  */
 
 #include "kernel.h"
