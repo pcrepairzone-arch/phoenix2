@@ -2237,6 +2237,57 @@ Rule 44: cmd_ring_submit must propagate caller-supplied DW3 bits.
          so each command type can supply its own upper fields
          without needing a separate submission path.
 
+── BOOT148 POSTMORTEM — CC=0x11 IS HEX, NOT DECIMAL ──────────
+
+  Bootlog147 (from boot148 binary) showed:
+    cc=0x00000011 — we logged "CC=17 decimal = Context State Error"
+
+  Previous session had diagnosed CC=11 decimal (= Slot Not Enabled)
+  and concluded the slot_id fix was the cure.  Bootlog147 proved:
+  boot148 DID fix the slot_id in DW3, but CC=17 (Context State Error)
+  remained — it was already present in boot143+ and the boot143 "OK"
+  was a false positive (old drain loop checked type=0x22 instead of
+  type=0x21, accepting a PSCE as a successful CCE).
+
+  CC=17 = 0x11 hex = "Context State Error" — xHCI spec Table 130.
+  CC=11 = 0x0b hex = "Slot Not Enabled Error".
+  These are completely different errors. Always read hex carefully.
+
+── BOOT149 — READ HCCPARAMS1 CSZ BIT ─────────────────────────
+
+  Root cause of CC=17: read_caps() read CAPLENGTH, HCSPARAMS1,
+  HCSPARAMS2, RTSOFF, and DBOFF — but NEVER read HCCPARAMS1.
+  The CSZ bit (HCCPARAMS1[2]) determines context entry size:
+    CSZ=0: 32-byte entries  (our hardcoded assumption)
+    CSZ=1: 64-byte entries  (possible VL805 setting)
+
+  If VL805 has CSZ=1 and we write 32-byte-spaced contexts:
+    ICC at offset 0   — correct (32B wide, MCU skips upper 32B)
+    Slot Context at offset 32  — WRONG (should be 64)
+    EP0 Context at offset 64   — WRONG (should be 128)
+  The MCU reads garbage Slot/EP0 fields and returns CC=17.
+
+  Fixes applied:
+    read_caps(): add readl(base + CAP_HCCPARAMS1), extract
+      AC64=(bit 0), CSZ=(bit 2), XECP=(bits[31:16]),
+      store in xhci_ctrl, log HCCPARAMS1 value and context size.
+    CTX_SIZE macro: changed from compile-time 32 to runtime
+      (xhci_ctrl.csz ? 64U : 32U) so all context pointer
+      arithmetic and dma_zero() calls use the correct stride.
+
+  xhci_ctrl.csz is zero-initialised (static struct) so CTX_SIZE
+  safely defaults to 32 if evaluated before read_caps().
+
+Rule 45: ALWAYS read HCCPARAMS1 in read_caps(). The CSZ bit
+         determines context entry size (32 vs 64 bytes). Blindly
+         assuming CTX_SIZE=32 causes CC=17 on controllers with
+         CSZ=1 because Slot/EP0 contexts land at the wrong offsets.
+
+Rule 46: CC=0x11 (hex) = 17 decimal = "Context State Error".
+         CC=11 decimal = 0x0B hex = "Slot Not Enabled Error".
+         Print hex and verify which error code you actually have
+         before diagnosing root cause.
+
 
 ═══════════════════════════════════════════════════════════════
 ACKNOWLEDGMENT — CIRCLE PROJECT
