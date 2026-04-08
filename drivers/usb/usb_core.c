@@ -304,9 +304,13 @@ int usb_core_init(void) {
      * succeeds whether or not their object files are linked in.
      * Add drivers/usb/usb_mass_storage.o and drivers/usb/usb_hid.o
      * to the Makefile to activate them. */
-    extern int hid_init(void)            __attribute__((weak));
+    extern int hid_init(void)              __attribute__((weak));
     extern int usb_mass_storage_init(void) __attribute__((weak));
+    extern int usb_hub_init(void)          __attribute__((weak));
 
+    /* Register hub driver FIRST so it can enumerate downstream devices
+     * before the mass storage driver tries to bind to them.            */
+    if (usb_hub_init)          usb_hub_init();
     if (hid_init)              hid_init();
     if (usb_mass_storage_init) usb_mass_storage_init();
 

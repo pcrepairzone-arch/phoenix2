@@ -113,7 +113,9 @@ extern pci_dev_t vl805_dev;
 
 /* Forward declarations */
 static void port_scan(void);
-static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uint32_t speed);
+static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
+                               uint32_t route, uint32_t speed,
+                               uint8_t tt_hub_slot, uint8_t tt_port);
 static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len);
 static void enumerate_port(int port);
 static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32_t type, uint32_t dw3_extra);
@@ -2120,7 +2122,13 @@ static uint64_t cmd_ring_submit(uint32_t dw0, uint32_t dw1, uint32_t dw2, uint32
     return 0;
 }
 
-static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uint32_t speed) {
+/* boot155: rh_port_1based: 1-based Root Hub Port Number (used directly in Slot
+ * Context DW1[21:16]).  For root-hub devices pass (port+1); for downstream
+ * devices pass the hub's root-hub port.
+ * tt_hub_slot / tt_port: TT info for FS/LS devices behind a HS hub (0=none). */
+static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
+                               uint32_t route, uint32_t speed,
+                               uint8_t tt_hub_slot, uint8_t tt_port) {
     /* boot147: use per-slot context memory so each slot has its own
      * Input Context and Output Context in distinct DMA regions.             */
     volatile uint8_t *in_ctx = slot_input_ctx(slot_id);
@@ -2157,7 +2165,12 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
      * leaving Root Hub Port Number = 0 — INVALID).  VL805 MCU rejected every
      * Address Device command with CC=17 Parameter Error since boot146.
      * The ORIGINAL << 16 was correct all along.                               */
-    slot_ctx[1] = (uint32_t)(port + 1) << 16;  /* Root Hub Port Number bits[21:16] */
+    slot_ctx[1] = (uint32_t)rh_port_1based << 16;  /* Root Hub Port Number bits[21:16] */
+    /* Slot Context DW2 (xHCI §6.2.2 Table 57):
+     *   bits[7:0]  = TT Hub Slot ID (0 = not behind a TT hub)
+     *   bits[15:8] = TT Port Number
+     * Non-zero only for FS/LS devices behind a HS hub Transaction Translator.  */
+    slot_ctx[2] = (uint32_t)tt_hub_slot | ((uint32_t)tt_port << 8);
 
     /* EP0 max packet size depends on speed (xHCI spec §6.2.3.1):
      *   LS  (speed=2): 8 bytes
@@ -2525,7 +2538,7 @@ static void enumerate_port(int port) {
     uart_puts("[xHCI] Using slot_id="); print_hex32(slot_id); uart_puts("\n");
 
     /* ── Step 2: Address Device ──────────────────────────────────────── */
-    if (cmd_address_device(slot_id, (uint8_t)port, 0, speed) == 0) {
+    if (cmd_address_device(slot_id, (uint8_t)(port + 1), 0, speed, 0, 0) == 0) {
         uart_puts("[xHCI] Address Device OK slot="); print_hex32(slot_id); uart_puts("\n");
     } else {
         uart_puts("[xHCI] Address Device failed — continuing\n");
@@ -2748,6 +2761,139 @@ int xhci_is_ready(void) { return xhci_ctrl.initialized; }
 int xhci_scan_ports(void) {
     if (!xhci_ctrl.initialized) return 0;
     port_scan();
+    return 0;
+}
+
+/*
+ * xhci_enumerate_hub_port — enumerate a device on a downstream hub port.
+ *
+ * Called by the hub class driver (usb_hub.c) after it has powered and reset
+ * a downstream port and determined the device speed from GET_STATUS.
+ *
+ * @hub_dev      usb_device_t of the hub (hcd_private = hub slot_id)
+ * @hub_port     1-based hub downstream port number
+ * @dev_speed    xHCI speed code: 1=FS 2=LS 3=HS 4=SS (from hub port status)
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
+                             uint32_t dev_speed) {
+    uint8_t hub_slot = (uint8_t)(uintptr_t)hub_dev->hcd_private;
+    /* Root Hub Port of the new device = same as the hub's root hub port.
+     * The hub's slot context DW1[21:16] holds the hub's root-hub port number. */
+    volatile uint32_t *hub_out = (volatile uint32_t *)slot_out_ctx(hub_slot);
+    uint8_t rh_port = (uint8_t)((hub_out[1] >> 16) & 0x3F);
+    if (rh_port == 0) {
+        /* Fallback: read from in_ctx if out_ctx not yet updated */
+        volatile uint32_t *hub_in = (volatile uint32_t *)(slot_input_ctx(hub_slot) + CTX_SIZE);
+        rh_port = (uint8_t)((hub_in[1] >> 16) & 0x3F);
+    }
+    /* Route String: hub port in bits[3:0] (one level of hub topology) */
+    uint32_t route = hub_port & 0xF;
+
+    /* TT fields: only for FS/LS device behind a HS hub.
+     * VIA Labs VL812 is USB3 (HS in USB2 mode) — use TT for FS/LS devices. */
+    uint8_t tt_slot = (dev_speed <= 2) ? hub_slot : 0;  /* LS/FS need TT */
+    uint8_t tt_port = (dev_speed <= 2) ? hub_port  : 0;
+
+    uart_puts("[xHCI] HubPort enum: hub_slot="); print_hex32(hub_slot);
+    uart_puts(" hub_port="); print_hex32(hub_port);
+    uart_puts(" rh_port="); print_hex32(rh_port);
+    uart_puts(" speed="); print_hex32(dev_speed);
+    uart_puts(" route="); print_hex32(route); uart_puts("\n");
+
+    /* ── Enable Slot ────────────────────────────────────────────────── */
+    uint32_t ev[4];
+    uint8_t slot_id = 0;
+    cmd_ring_submit(0, 0, 0, TRB_TYPE_ENABLE_SLOT, 0);
+    {
+        uint32_t dl = get_time_ms() + 200U;
+        while (get_time_ms() < dl) {
+            if (xhci_wait_event(ev, 20) != 0) break;
+            if (((ev[3] >> 10) & 0x3FU) == 0x21U) {
+                if (((ev[2] >> 24) & 0xFF) == CC_SUCCESS)
+                    slot_id = (ev[3] >> 24) & 0xFF;
+                break;
+            }
+        }
+    }
+    if (slot_id == 0) { uart_puts("[xHCI] HubPort: Enable Slot failed\n"); return -1; }
+    uart_puts("[xHCI] HubPort: slot="); print_hex32(slot_id); uart_puts("\n");
+
+    g_slot_ids[hub_port] = slot_id;   /* reuse g_slot_ids for downstream slots */
+    active_slot = slot_id;
+
+    /* ── Address Device ─────────────────────────────────────────────── */
+    if (cmd_address_device(slot_id, rh_port, route, dev_speed,
+                           tt_slot, tt_port) != 0) {
+        uart_puts("[xHCI] HubPort: Address Device failed\n");
+        return -1;
+    }
+    uart_puts("[xHCI] HubPort: Address Device OK\n");
+
+    /* ── Build usb_device_t and GET_DESCRIPTOR ──────────────────────── */
+    usb_device_t *dev = &g_devs[slot_id];
+    memset(dev, 0, sizeof(*dev));
+    dev->speed       = (uint8_t)dev_speed;
+    dev->address     = slot_id;
+    dev->hcd_private = (void *)(uintptr_t)slot_id;
+
+    uint8_t ddesc[18];
+    int got = ep0_get_device_descriptor(slot_id, ddesc, 18);
+    if (got < 8) {
+        volatile uint8_t *buf = slot_ep0_data(slot_id);
+        asm volatile("dsb sy" ::: "memory");
+        if (buf[0] != 0) {
+            for (int i = 0; i < 18; i++) ddesc[i] = buf[i];
+            got = 18;
+        } else {
+            uart_puts("[xHCI] HubPort: DevDesc DMA empty\n");
+            return -1;
+        }
+    }
+
+    dev->idVendor        = (uint16_t)(ddesc[8]  | (ddesc[9]  << 8));
+    dev->idProduct       = (uint16_t)(ddesc[10] | (ddesc[11] << 8));
+    dev->bcdUSB          = (uint16_t)(ddesc[2]  | (ddesc[3]  << 8));
+    dev->bDeviceClass    = ddesc[4];
+    dev->bDeviceSubClass = ddesc[5];
+    dev->bDeviceProtocol = ddesc[6];
+    dev->bMaxPacketSize0 = ddesc[7];
+
+    uart_puts("[xHCI] HubPort dev: VID="); print_hex32(dev->idVendor);
+    uart_puts(" PID="); print_hex32(dev->idProduct);
+    uart_puts(" class="); print_hex32(dev->bDeviceClass); uart_puts("\n");
+
+    /* ── Parse Configuration Descriptor ─────────────────────────────── */
+    uint8_t cfgbuf[256];
+    memset(cfgbuf, 0, sizeof(cfgbuf));
+    active_slot = slot_id;
+    usb_control_transfer(dev, 0x80, 0x06, (0x02 << 8) | 0, 0,
+                         cfgbuf, sizeof(cfgbuf), 200);
+    asm volatile("dsb sy" ::: "memory");
+    /* Parse interfaces from config descriptor */
+    {
+        volatile uint8_t *rd = slot_ep0_data(slot_id);
+        int tlen = (int)(rd[2] | ((int)rd[3] << 8));
+        if (tlen > 256) tlen = 256;
+        for (int i = 0; i < tlen; i++) cfgbuf[i] = rd[i];
+        int off = 0;
+        dev->num_interfaces = 0;
+        while (off < tlen && dev->num_interfaces < USB_MAX_INTERFACES) {
+            int blen = cfgbuf[off]; if (blen < 2) break;
+            if (cfgbuf[off+1] == 0x04) {   /* Interface descriptor */
+                usb_interface_t *intf = &dev->interfaces[dev->num_interfaces++];
+                intf->bInterfaceNumber   = cfgbuf[off+2];
+                intf->bInterfaceClass    = cfgbuf[off+5];
+                intf->bInterfaceSubClass = cfgbuf[off+6];
+                intf->bInterfaceProtocol = cfgbuf[off+7];
+            }
+            off += blen;
+        }
+    }
+
+    extern int usb_enumerate_device(usb_device_t *dev, int port);
+    usb_enumerate_device(dev, (int)hub_port);
     return 0;
 }
 

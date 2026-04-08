@@ -210,4 +210,15 @@ int xhci_interrupt_transfer(usb_endpoint_t *ep, void *data, size_t len, int time
  */
 int xhci_enumerate_device(usb_device_t *dev, int port);
 
+/*
+ * xhci_enumerate_hub_port — enumerate a device on a downstream hub port.
+ * Called by the hub class driver after powering and resetting the port.
+ *
+ * @hub_dev   usb_device_t of the parent hub
+ * @hub_port  1-based downstream port number
+ * @dev_speed xHCI speed: 1=FS 2=LS 3=HS 4=SS
+ */
+int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
+                             uint32_t dev_speed);
+
 #endif /* USB_XHCI_H */
