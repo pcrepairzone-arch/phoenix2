@@ -2148,15 +2148,16 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uint32_t spd = (speed > 0 && speed <= 6) ? speed : 3U;
     volatile uint32_t *slot_ctx = (volatile uint32_t *)(in_ctx + CTX_SIZE);
     slot_ctx[0] = (route & 0xFFFFF) | (spd << 20) | (1U << 27);
-    /* boot146: xHCI spec Table 60, Slot Context DW1:
-     *   bits[7:0]  = Max Exit Latency (0)
-     *   bits[15:8] = Root Hub Port Number (1-based)  ← THIS was << 16 (bug!)
-     *   bits[23:16]= Number of Ports (0 = not a hub)
-     *   bits[31:24]= TT Hub Slot ID (0)
-     * Shifting by 16 put port number in Number-of-Ports field, leaving
-     * Root Hub Port Number = 0 (invalid).  VL805 MCU immediately rejected
-     * Address Device with CC=11 (Context State Error) on EVERY boot.    */
-    slot_ctx[1] = (uint32_t)(port + 1) << 8;   /* Root Hub Port Number bits[15:8] */
+    /* xHCI spec §6.2.2 Table 57, Slot Context DW1 (confirmed against spec):
+     *   bits[31:22] = Max Exit Latency (0 for USB2)
+     *   bits[21:16] = Root Hub Port Number (6-bit, 1-based)  ← shift LEFT 16
+     *   bits[15:8]  = Number of Ports (0 = not a hub)
+     *   bits[7:0]   = TT Hub Slot ID (0)
+     * boot153: boot146 mistakenly used << 8 (putting port# into Number-of-Ports,
+     * leaving Root Hub Port Number = 0 — INVALID).  VL805 MCU rejected every
+     * Address Device command with CC=17 Parameter Error since boot146.
+     * The ORIGINAL << 16 was correct all along.                               */
+    slot_ctx[1] = (uint32_t)(port + 1) << 16;  /* Root Hub Port Number bits[21:16] */
 
     /* EP0 max packet size depends on speed (xHCI spec §6.2.3.1):
      *   LS  (speed=2): 8 bytes
@@ -2201,7 +2202,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
     uart_puts(" DW1="); print_hex32(slot_ctx[1]);
     uart_puts(" DW2="); print_hex32(slot_ctx[2]);
     uart_puts(" DW3="); print_hex32(slot_ctx[3]);
-    uart_puts("  RH_PORT="); print_hex32((slot_ctx[1] >> 8) & 0xFF);
+    uart_puts("  RH_PORT="); print_hex32((slot_ctx[1] >> 16) & 0x3F);
     uart_puts("\n");
 
     uart_puts("[xHCI] EP0Ctx:  DW0="); print_hex32(ep0_ctx[0]);
