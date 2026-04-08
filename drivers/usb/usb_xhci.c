@@ -2233,10 +2233,45 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
         uart_puts("\n");
     }
 
+    /* boot152: BSR=1 experiment — try Address Device with BSR bit set (DW3[9]=1).
+     * BSR=1 skips USB SET_ADDRESS; slot → Addressed with device still at addr 0.
+     * Diagnostic: if BSR=1 → CC=1 but BSR=0 → CC=17, the failure is a USB-level
+     * SET_ADDRESS transaction problem (device not responding / bad handshake).
+     * If BSR=1 also → CC=17, the issue is pure firmware input-context validation. */
+    {
+        uint32_t bsr_trb_idx = cmd_enqueue;
+        cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV,
+                        ((uint32_t)slot_id << 24) | (1U << 9));   /* BSR=1 */
+        uint32_t bsr_ev[4];
+        uint32_t bsr_cc = 0;
+        int bsr_got = 0;
+        uint32_t bsr_dl = get_time_ms() + 200U;
+        while (get_time_ms() < bsr_dl) {
+            if (xhci_wait_event(bsr_ev, 20) != 0) break;
+            uint32_t bsr_type = (bsr_ev[3] >> 10) & 0x3FU;
+            bsr_cc = (bsr_ev[2] >> 24) & 0xFF;
+            if (bsr_type == 0x21U) { bsr_got = 1; break; }
+        }
+        uart_puts("[boot152] BSR=1 result: got_cce="); uart_puts(bsr_got ? "1" : "0");
+        uart_puts("  cc="); print_hex32(bsr_cc);
+        uart_puts(bsr_cc == CC_SUCCESS ? "  (SUCCESS)\n" : "  (FAIL)\n");
+        if (bsr_got) {
+            uint32_t exp_bsr = (uint32_t)(cmd_ring_dma + (uint64_t)bsr_trb_idx * 16U);
+            uart_puts("[boot152]   BSR=1 CCE dw0="); print_hex32(bsr_ev[0]);
+            uart_puts(" expected="); print_hex32(exp_bsr);
+            uart_puts(" match="); uart_puts(bsr_ev[0] == exp_bsr ? "YES" : "NO!");
+            uart_puts("\n");
+        }
+        /* Regardless of BSR=1 result, re-zero output ctx and fall through to BSR=0.
+         * (BSR=1 may have partially updated the slot — re-zero and retry cleanly.) */
+        dma_zero(oc, CTX_SIZE);
+        asm volatile("dsb sy" ::: "memory");
+    }
+
     /* Record cmd_enqueue before submission to log the exact TRB written. */
     uint32_t trb_idx = cmd_enqueue;
 
-    /* boot148: DW3 bits[31:24] = Slot ID (xHCI §6.4.3.4). */
+    /* boot148: DW3 bits[31:24] = Slot ID (xHCI §6.4.3.4). BSR=0 = normal path. */
     cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV,
                     (uint32_t)slot_id << 24);
 
@@ -2266,7 +2301,23 @@ static int cmd_address_device(uint8_t slot_id, uint8_t port, uint32_t route, uin
         cc = (ev[2] >> 24) & 0xFF;
         uart_puts("[xHCI] AddrDev drain: type="); print_hex32(trb_type);
         uart_puts(" cc="); print_hex32(cc); uart_puts("\n");
-        if (trb_type == 0x21U) { got_cce = 1; break; } /* CCE — done */
+        if (trb_type == 0x21U) {
+            /* boot152: dump full CCE to verify MCU ACK'd the right TRB.
+             * CCE DW0-DW1 = physical addr of the command TRB that was completed.
+             * expected_dw0 = (uint32_t)(cmd_ring_dma + trb_idx*16).
+             * If dw0 != expected_dw0, MCU is completing a DIFFERENT command!
+             * DW3 bits[31:24] = Slot ID echoed by MCU.                        */
+            uint32_t expected_dw0 = (uint32_t)(cmd_ring_dma + (uint64_t)trb_idx * 16U);
+            uart_puts("[boot152] CCE: dw0="); print_hex32(ev[0]);
+            uart_puts(" dw1="); print_hex32(ev[1]);
+            uart_puts(" dw2="); print_hex32(ev[2]);
+            uart_puts(" dw3="); print_hex32(ev[3]);
+            uart_puts("\n[boot152]   expected_dw0="); print_hex32(expected_dw0);
+            uart_puts("  match="); uart_puts(ev[0] == expected_dw0 ? "YES" : "NO!");
+            uart_puts("  SlotID_from_CCE="); print_hex32((ev[3] >> 24) & 0xFF);
+            uart_puts("\n");
+            got_cce = 1; break;
+        } /* CCE — done */
         /* type=0x22 PSCE or type=0x20 Transfer Event — drain and retry */
     }
     if (!got_cce || cc != CC_SUCCESS) return -1;
