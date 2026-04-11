@@ -1916,14 +1916,12 @@ int xhci_init(void *base_addr) {
     usb_register_hc(&g_xhci_hc_ops);
     xhci_ctrl.initialized = 1;
 
-    /* boot141: call port_scan() directly here — usb_init.c stubs the
-     * VL805 probe (prints "SKIPPED") so xhci_scan_ports() is NEVER
-     * called on the desktop build otherwise.  Circle mirrors this by
-     * calling RootHub::Initialize() immediately after RS=1, which
-     * resets each port and triggers EnableSlot / AddressDevice.
-     * We must do the same: enumerate_port → PORTSC PR reset →
-     * issue Enable Slot TRB → etc.                                     */
-    port_scan();
+    /* boot157: port_scan() removed from xhci_init().
+     * pci_init() calls xhci_init() directly (step 7) before usb_init()
+     * registers class drivers (step 8).  Calling port_scan() here means
+     * 0 class drivers are bound at enumeration time.
+     * xhci_scan_ports() is now called from usb_init() AFTER
+     * hub/hid/mass-storage drivers are registered — see usb_init.c.    */
 
     /* boot142: read MFINDEX after port scan — see if SOF frames started
      * once a port was reset and a device is at U0.  MFINDEX was 0 before
@@ -1966,6 +1964,21 @@ int xhci_init(void *base_addr) {
 #define SLOT_EP0_DATA_OFF    0xD00
 
 #define EP0_RING_TRBS  64
+
+/* boot159: per-slot bulk endpoint transfer rings.
+ * Layout from 0x26000 (just above the 4 per-slot blocks ending at 0x26000).
+ * Each slot gets BULK_STRIDE = 0x2000 (8KB):
+ *   +0x000  Bulk OUT ring  (BULK_RING_TRBS × 16 = 1024 B)
+ *   +0x400  Bulk IN  ring  (BULK_RING_TRBS × 16 = 1024 B)
+ *   +0x800  DMA bounce buf (6144 B — covers 4K-native sectors)
+ * 4 slots × 0x2000 = 0x8000 → tops at 0x2E000 < 0x42000 DMA budget. */
+#define DMA_BULK_BASE_OFF    0x26000
+#define BULK_STRIDE          0x2000
+#define BULK_OUT_RING_OFF    0x000
+#define BULK_IN_RING_OFF     0x400
+#define BULK_DATA_OFF        0x800
+#define BULK_RING_TRBS       64
+#define BULK_MAX_XFER        6144u   /* max single transfer through bounce buf */
 /* boot149: CTX_SIZE is no longer a compile-time constant.
  * CSZ bit in HCCPARAMS1 determines whether entries are 32 or 64 bytes.
  * read_caps() populates xhci_ctrl.csz; this macro reads it at runtime.  */
@@ -1974,9 +1987,10 @@ int xhci_init(void *base_addr) {
 #define TRB_TYPE_SETUP     2
 #define TRB_TYPE_DATA      3
 #define TRB_TYPE_STATUS    4
-#define TRB_TYPE_ADDR_DEV  11
-#define TRB_TYPE_CMD_CMPL  33
-#define TRB_TYPE_XFER_EVT 32
+#define TRB_TYPE_ADDR_DEV       11
+#define TRB_TYPE_CONFIGURE_EP   12   /* xHCI §6.4.3.5 */
+#define TRB_TYPE_CMD_CMPL       33
+#define TRB_TYPE_XFER_EVT       32
 
 #define TRB_IDT   (1U << 6)
 #define TRB_IOC   (1U << 5)
@@ -1997,9 +2011,15 @@ int xhci_init(void *base_addr) {
  * active_slot tracks which slot is currently driving ep0_enq().
  * g_slot_ids[port] holds the MCU-assigned slot_id for each root-hub port.
  * g_devs[slot_id] holds the usb_device_t for each enumerated slot.         */
-static uint8_t  ep0_cycle_s[MAX_SLOTS_ALLOC + 1]   = {0};
-static uint32_t ep0_enqueue_s[MAX_SLOTS_ALLOC + 1] = {0};
+static uint8_t  ep0_cycle_s[MAX_SLOTS_ALLOC + 1]    = {0};
+static uint32_t ep0_enqueue_s[MAX_SLOTS_ALLOC + 1]  = {0};
 static uint8_t  active_slot = 0;
+
+/* boot159: per-slot bulk endpoint ring state (indexed 1..MAX_SLOTS_ALLOC) */
+static uint8_t  bulk_out_cycle[MAX_SLOTS_ALLOC + 1] = {0};
+static uint32_t bulk_out_enq[MAX_SLOTS_ALLOC + 1]   = {0};
+static uint8_t  bulk_in_cycle[MAX_SLOTS_ALLOC + 1]  = {0};
+static uint32_t bulk_in_enq[MAX_SLOTS_ALLOC + 1]    = {0};
 static uint8_t  g_slot_ids[16] = {0};   /* indexed by port (0-based)        */
 static usb_device_t g_devs[MAX_SLOTS_ALLOC + 1];  /* indexed by slot_id     */
 
@@ -2023,6 +2043,23 @@ static inline volatile uint8_t *slot_ep0_data(uint8_t s) {
     return (volatile uint8_t *)(xhci_dma_buf + DMA_SLOTS_BASE_OFF
                                 + (uint32_t)(s - 1) * SLOT_STRIDE
                                 + SLOT_EP0_DATA_OFF);
+}
+
+/* boot159: bulk endpoint ring and data buffer helpers */
+static inline volatile uint32_t *slot_bulk_out_ring(uint8_t s) {
+    return (volatile uint32_t *)(xhci_dma_buf + DMA_BULK_BASE_OFF
+                                 + (uint32_t)(s - 1) * BULK_STRIDE
+                                 + BULK_OUT_RING_OFF);
+}
+static inline volatile uint32_t *slot_bulk_in_ring(uint8_t s) {
+    return (volatile uint32_t *)(xhci_dma_buf + DMA_BULK_BASE_OFF
+                                 + (uint32_t)(s - 1) * BULK_STRIDE
+                                 + BULK_IN_RING_OFF);
+}
+static inline volatile uint8_t *slot_bulk_data(uint8_t s) {
+    return (volatile uint8_t *)(xhci_dma_buf + DMA_BULK_BASE_OFF
+                                + (uint32_t)(s - 1) * BULK_STRIDE
+                                + BULK_DATA_OFF);
 }
 
 /* boot147: ep0_ring_init now takes slot_id (1-based) so each slot gets its
@@ -2182,9 +2219,10 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
      * data phase because it cannot match that packet size.            */
     uint32_t ep0_mps;
     switch (spd) {
-        case 4:  ep0_mps = 512; break;  /* SuperSpeed */
-        case 3:  ep0_mps = 64;  break;  /* HighSpeed  */
-        default: ep0_mps = 64;  break;  /* FullSpeed/LowSpeed — 64 safe default */
+        case 4:  ep0_mps = 512; break;  /* SuperSpeed             */
+        case 3:  ep0_mps = 64;  break;  /* HighSpeed              */
+        case 2:  ep0_mps = 8;   break;  /* LowSpeed — MUST be 8, xHCI §6.2.3 Table 60 */
+        default: ep0_mps = 64;  break;  /* FullSpeed — 64 conservative default          */
     }
     volatile uint32_t *ep0_ctx = (volatile uint32_t *)(in_ctx + 2 * CTX_SIZE);
     ep0_ctx[1] = (3U << 1) | (4U << 3) | (ep0_mps << 16);
@@ -2764,6 +2802,149 @@ int xhci_scan_ports(void) {
     return 0;
 }
 
+/* boot159: Configure Endpoint command — tells the VL805 MCU about bulk
+ * transfer rings for all bulk endpoints in the device's interface list.
+ * Must be called after config descriptor parsing and before any bulk I/O.
+ *
+ * For each bulk endpoint found:
+ *   - Allocates/inits a transfer ring in the per-slot DMA region
+ *   - Stores slot_id in ep->slot_id so xhci_bulk_transfer can find it
+ *   - Builds the endpoint context (EP type, MPS, ring pointer)
+ * Issues Configure Endpoint TRB (type 12) and waits for CCE.             */
+static int xhci_configure_endpoints(usb_device_t *dev)
+{
+    uint8_t slot_id = (uint8_t)(uintptr_t)dev->hcd_private;
+    if (slot_id == 0 || slot_id > MAX_SLOTS_ALLOC) return -1;
+
+    uint32_t cs = CTX_SIZE;
+    volatile uint8_t *in_ctx  = slot_input_ctx(slot_id);
+    volatile uint8_t *out_ctx = slot_out_ctx(slot_id);
+
+    dma_zero(in_ctx, 34 * cs);
+
+    /* Copy current slot context from output → input (output[0] → input[1]) */
+    volatile uint32_t *in_slot  = (volatile uint32_t *)(in_ctx + cs);
+    volatile uint32_t *out_slot = (volatile uint32_t *)out_ctx;
+    for (uint32_t i = 0; i < cs / 4; i++) in_slot[i] = out_slot[i];
+
+    uint32_t configured_mask = 0;  /* bitmask of DCIs already set up       */
+    uint32_t add_flags = (1u << 0);/* bit0 = always include Slot context   */
+    uint32_t max_dci   = 1;
+
+    /* Scan all interfaces for bulk endpoints */
+    for (int ii = 0; ii < dev->num_interfaces; ii++) {
+        usb_interface_t *intf = &dev->interfaces[ii];
+        for (int ei = 0; ei < intf->endpoint_count; ei++) {
+            usb_endpoint_t *ep = &intf->endpoints[ei];
+
+            if ((ep->bmAttributes & 0x03) != 0x02) continue;  /* bulk only */
+
+            uint8_t ep_num = ep->bEndpointAddress & 0x0F;
+            uint8_t dir_in = (ep->bEndpointAddress & 0x80) ? 1u : 0u;
+            uint8_t dci    = (uint8_t)(ep_num * 2u + dir_in);
+            if (dci < 2 || dci > 31) continue;
+            if (configured_mask & (1u << dci)) continue;  /* deduplicate */
+            configured_mask |= (1u << dci);
+
+            /* Store slot_id in endpoint for xhci_bulk_transfer lookup */
+            ep->slot_id = slot_id;
+
+            add_flags |= (1u << dci);
+            if (dci > max_dci) max_dci = dci;
+
+            /* Init the bulk transfer ring */
+            volatile uint32_t *ring;
+            uint8_t  *cycle_p;
+            uint32_t *enq_p;
+            if (!dir_in) {
+                ring    = slot_bulk_out_ring(slot_id);
+                cycle_p = &bulk_out_cycle[slot_id];
+                enq_p   = &bulk_out_enq[slot_id];
+            } else {
+                ring    = slot_bulk_in_ring(slot_id);
+                cycle_p = &bulk_in_cycle[slot_id];
+                enq_p   = &bulk_in_enq[slot_id];
+            }
+            dma_zero(ring, BULK_RING_TRBS * 16);
+            *cycle_p = 1;
+            *enq_p   = 0;
+            uint64_t ring_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ring));
+            uint32_t li = (BULK_RING_TRBS - 1) * 4;
+            ring[li + 0] = (uint32_t)(ring_dma);
+            ring[li + 1] = (uint32_t)(ring_dma >> 32);
+            ring[li + 2] = 0;
+            ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | 1u;
+
+            /* Endpoint context at in_ctx + (dci+1)*cs
+             *
+             * xHCI §6.2.3 EP Context layout (confirmed from EP0 which works):
+             *   DW0: bits[23:16]=Interval  bits[9:8]=Mult  — 0 for bulk
+             *   DW1: bits[31:16]=MPS  bits[5:3]=EP_Type  bits[2:1]=CErr
+             *   DW2: TR Dequeue Pointer Lo | RCS (bit0)
+             *   DW3: TR Dequeue Pointer Hi
+             *   DW4: bits[15:0]=Average TRB Length (= MPS for bulk)
+             *
+             * boot161 bug: we had EP_Type and CErr in DW0 and MPS alone in
+             * DW1.  VL805 read DW1 EP_Type field = 0 ("Not Valid") and never
+             * generated Transfer Events for any bulk doorbell.  Fixed to match
+             * the EP0 layout in cmd_address_device which is known to work:
+             *   ep0_ctx[1] = (3U<<1)|(4U<<3)|(mps<<16)  DW0=0  DW4=8       */
+            volatile uint32_t *ep_ctx =
+                (volatile uint32_t *)(in_ctx + (uint32_t)(dci + 1u) * cs);
+            uint32_t ep_type = dir_in ? 6u : 2u;
+            uint32_t mps     = ep->wMaxPacketSize & 0x7FFu;
+            ep_ctx[0] = 0u;                             /* Interval=0, Mult=0 (bulk) */
+            ep_ctx[1] = (mps << 16)                     /* Max Packet Size   */
+                      | (ep_type << 3)                  /* EP Type (2=Bulk OUT, 6=Bulk IN) */
+                      | (3u << 1);                      /* CErr = 3          */
+            ep_ctx[2] = (uint32_t)(ring_dma) | 1u;     /* TR Deq Ptr + RCS  */
+            ep_ctx[3] = (uint32_t)(ring_dma >> 32);
+            ep_ctx[4] = mps;                            /* Average TRB Length */
+
+            uart_puts("[xHCI] ConfigureEP:  addr="); print_hex32(ep->bEndpointAddress);
+            uart_puts(" dci="); print_hex32(dci);
+            uart_puts(" mps="); print_hex32(mps);
+            uart_puts(" ring="); print_hex32((uint32_t)ring_dma);
+            uart_puts(" DW1="); print_hex32(ep_ctx[1]);
+            uart_puts("\n");
+        }
+    }
+
+    if (add_flags == (1u << 0)) return 0;   /* no bulk endpoints — skip */
+
+    /* Update MaxContextEntries (Slot Context DW0 bits[31:27]) */
+    in_slot[0] = (in_slot[0] & ~(0x1Fu << 27)) | (max_dci << 27);
+
+    volatile uint32_t *icc = (volatile uint32_t *)in_ctx;
+    icc[0] = 0;            /* Drop flags = 0     */
+    icc[1] = add_flags;    /* Add flags          */
+
+    uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)in_ctx));
+
+    uart_puts("[xHCI] ConfigureEP slot="); print_hex32(slot_id);
+    uart_puts(" add_flags="); print_hex32(add_flags); uart_puts("\n");
+
+    cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0,
+                    TRB_TYPE_CONFIGURE_EP, (uint32_t)slot_id << 24);
+
+    uint32_t ev[4], cc = 0;
+    int got_cce = 0;
+    uint32_t deadline = get_time_ms() + 500U;
+    while (get_time_ms() < deadline) {
+        if (xhci_wait_event(ev, 20) != 0) break;
+        uint32_t ev_type = (ev[3] >> 10) & 0x3Fu;
+        cc = (ev[2] >> 24) & 0xFF;
+        if (ev_type == 0x21u) { got_cce = 1; break; }
+    }
+    if (!got_cce) { uart_puts("[xHCI] ConfigureEP: TIMEOUT\n"); return -1; }
+    if (cc != CC_SUCCESS) {
+        uart_puts("[xHCI] ConfigureEP: CC="); print_hex32(cc); uart_puts("\n");
+        return -1;
+    }
+    uart_puts("[xHCI] ConfigureEP: OK\n");
+    return 0;
+}
+
 /*
  * xhci_enumerate_hub_port — enumerate a device on a downstream hub port.
  *
@@ -2877,20 +3058,73 @@ int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
         int tlen = (int)(rd[2] | ((int)rd[3] << 8));
         if (tlen > 256) tlen = 256;
         for (int i = 0; i < tlen; i++) cfgbuf[i] = rd[i];
+        /* boot158: parse both Interface AND Endpoint descriptors.
+         * Previously only Interface descriptors were parsed here, leaving
+         * endpoint_count=0 on every downstream device — the MSC probe
+         * couldn't find bulk-in/out and declined every storage device.   */
         int off = 0;
         dev->num_interfaces = 0;
-        while (off < tlen && dev->num_interfaces < USB_MAX_INTERFACES) {
+        usb_interface_t *cur_intf = NULL;
+        while (off < tlen) {
             int blen = cfgbuf[off]; if (blen < 2) break;
-            if (cfgbuf[off+1] == 0x04) {   /* Interface descriptor */
-                usb_interface_t *intf = &dev->interfaces[dev->num_interfaces++];
-                intf->bInterfaceNumber   = cfgbuf[off+2];
-                intf->bInterfaceClass    = cfgbuf[off+5];
-                intf->bInterfaceSubClass = cfgbuf[off+6];
-                intf->bInterfaceProtocol = cfgbuf[off+7];
+            uint8_t dtype = cfgbuf[off + 1];
+            if (dtype == 0x04 && blen >= 9) {        /* Interface descriptor */
+                if (dev->num_interfaces < USB_MAX_INTERFACES) {
+                    cur_intf = &dev->interfaces[dev->num_interfaces++];
+                    cur_intf->bInterfaceNumber   = cfgbuf[off+2];
+                    cur_intf->bInterfaceClass    = cfgbuf[off+5];
+                    cur_intf->bInterfaceSubClass = cfgbuf[off+6];
+                    cur_intf->bInterfaceProtocol = cfgbuf[off+7];
+                    cur_intf->endpoint_count     = 0;
+                }
+            } else if (dtype == 0x05 && blen >= 7 && cur_intf) {  /* Endpoint */
+                int ne = cur_intf->endpoint_count;
+                if (ne < USB_MAX_ENDPOINTS) {
+                    usb_endpoint_t *ep = &cur_intf->endpoints[ne];
+                    ep->bEndpointAddress = cfgbuf[off+2];
+                    ep->bmAttributes     = cfgbuf[off+3];
+                    ep->wMaxPacketSize   = (uint16_t)(cfgbuf[off+4]
+                                          | ((uint16_t)cfgbuf[off+5] << 8));
+                    ep->bInterval        = cfgbuf[off+6];
+                    cur_intf->endpoint_count++;
+                }
             }
+            /* All other descriptor types (SS companion 0x30, HID 0x21, etc.)
+             * are skipped safely — we just advance by blen.               */
             off += blen;
         }
     }
+
+    /* boot162: SET_CONFIGURATION — USB devices default to "Address" state
+     * after Address Device.  Bulk endpoints are disabled (NAK everything)
+     * until the host activates a configuration with SET_CONFIGURATION.
+     *
+     * USB 2.0 spec §9.4.7: SET_CONFIGURATION moves the device from Address
+     * state to Configured state, enabling all non-zero endpoints in the
+     * selected configuration.  Without this, every bulk transfer returns
+     * CC=4 (USB Transaction Error) because the device NAKs indefinitely.
+     *
+     * bConfigurationValue is always 1 for single-config devices (virtually
+     * all USB storage devices).  We could read it from cfgbuf[5] but 1 is
+     * safe and avoids an extra parse.                                     */
+    {
+        uint8_t bConfigValue = (dev->num_interfaces > 0 && cfgbuf[1] == 0x02)
+                               ? cfgbuf[5]   /* wValue from config descriptor */
+                               : 1u;
+        int sc_rc = usb_control_transfer(dev,
+                        0x00,          /* bmRequestType: host→device, standard, device */
+                        0x09,          /* bRequest: SET_CONFIGURATION                  */
+                        bConfigValue,  /* wValue: bConfigurationValue                  */
+                        0,             /* wIndex: 0                                    */
+                        NULL, 0, 200); /* no data phase, 200ms timeout                 */
+        uart_puts("[xHCI] SET_CONFIGURATION(");
+        print_hex32(bConfigValue);
+        uart_puts(") rc="); print_hex32((uint32_t)sc_rc); uart_puts("\n");
+    }
+
+    /* boot159: Configure bulk endpoint rings with the xHCI controller
+     * BEFORE handing the device to the USB class driver layer.         */
+    xhci_configure_endpoints(dev);
 
     extern int usb_enumerate_device(usb_device_t *dev, int port);
     usb_enumerate_device(dev, (int)hub_port);
@@ -2983,11 +3217,108 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
     return (int)length;
 }
 
-int xhci_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout) {
-    /* TODO: Implement bulk transfer ring for mass storage.
-     * Requires per-endpoint transfer rings (not yet allocated).
-     * For now: stub returns -1 so mass storage probe will fail gracefully. */
-    (void)ep; (void)data; (void)len; (void)timeout;
+/* boot159: Full bulk transfer implementation.
+ *
+ * Uses the per-slot DMA bounce buffer (slot_bulk_data) so all data the
+ * VL805 MCU DMA's to/from is within the xhci_dma region.  Callers may
+ * pass any buffer (stack, heap) — the copy is handled here.
+ *
+ * Direction is determined by bEndpointAddress bit 7:
+ *   OUT (bit7=0): copy data→DMA buf, enqueue Normal TRB, ring doorbell
+ *   IN  (bit7=1): enqueue Normal TRB, ring doorbell, copy DMA buf→data
+ *
+ * Maximum single transfer: BULK_MAX_XFER = 6144 bytes.
+ */
+int xhci_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout)
+{
+    if (!ep || !data || len == 0) return -1;
+    if (len > BULK_MAX_XFER) {
+        uart_puts("[xHCI] bulk_transfer: transfer exceeds DMA bounce buffer\n");
+        return -1;
+    }
+
+    uint8_t slot_id = ep->slot_id;
+    if (slot_id == 0 || slot_id > MAX_SLOTS_ALLOC) return -1;
+
+    uint8_t ep_num = ep->bEndpointAddress & 0x0Fu;
+    uint8_t dir_in = (ep->bEndpointAddress & 0x80u) ? 1u : 0u;
+    uint8_t dci    = (uint8_t)(ep_num * 2u + dir_in);
+    if (dci < 2 || dci > 31) return -1;
+
+    volatile uint8_t *dma_buf = slot_bulk_data(slot_id);
+
+    if (!dir_in) {
+        dma_copy_to(dma_buf, data, len);        /* OUT: host → device  */
+    } else {
+        dma_zero(dma_buf, len);                 /* IN:  clear recv buf */
+    }
+
+    uint64_t buf_dma = phys_to_dma((uint64_t)virt_to_phys((void *)dma_buf));
+
+    volatile uint32_t *ring;
+    uint8_t  *cycle_p;
+    uint32_t *enq_p;
+    if (!dir_in) {
+        ring    = slot_bulk_out_ring(slot_id);
+        cycle_p = &bulk_out_cycle[slot_id];
+        enq_p   = &bulk_out_enq[slot_id];
+    } else {
+        ring    = slot_bulk_in_ring(slot_id);
+        cycle_p = &bulk_in_cycle[slot_id];
+        enq_p   = &bulk_in_enq[slot_id];
+    }
+
+    /* Enqueue Normal TRB (xHCI §6.4.1.1, TRB type = 1) */
+    uint32_t b = (*enq_p) * 4;
+    ring[b + 0] = (uint32_t)buf_dma;
+    ring[b + 1] = (uint32_t)(buf_dma >> 32);
+    ring[b + 2] = (uint32_t)(len & 0x1FFFFu);
+    ring[b + 3] = TRB_IOC | (1u << TRB_TYPE_SHIFT) | (*cycle_p);
+    asm volatile("dsb sy" ::: "memory");
+
+    uart_puts("[xHCI] bulk_xfer: slot="); print_hex32(slot_id);
+    uart_puts(" dci="); print_hex32(dci);
+    uart_puts(" dir="); uart_puts(dir_in ? "IN" : "OUT");
+    uart_puts(" len="); print_hex32((uint32_t)len);
+    uart_puts(" buf="); print_hex32((uint32_t)buf_dma);
+    uart_puts(" TRB3="); print_hex32(ring[b + 3]);
+    uart_puts("\n");
+
+    (*enq_p)++;
+    if (*enq_p >= BULK_RING_TRBS - 1) {
+        *enq_p    = 0;
+        *cycle_p ^= 1u;
+        uint32_t li = (BULK_RING_TRBS - 1) * 4;
+        ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (*cycle_p);
+    }
+
+    /* Ring doorbell for this slot's endpoint */
+    volatile uint32_t *db = (volatile uint32_t *)xhci_ctrl.doorbell_regs;
+    asm volatile("dsb sy" ::: "memory");
+    db[slot_id] = dci;
+    asm volatile("dsb sy" ::: "memory");
+
+    /* Drain events until Transfer Event (type=0x20) for this endpoint */
+    uint32_t ev[4];
+    uint32_t ms = (timeout > 0 && timeout < 30000) ? (uint32_t)timeout : 5000U;
+    uint32_t deadline = get_time_ms() + ms;
+    while (get_time_ms() < deadline) {
+        if (xhci_wait_event(ev, 20) != 0) continue;
+        uint32_t ev_type = (ev[3] >> 10) & 0x3Fu;
+        if (ev_type == 0x20u) {                 /* Transfer Event */
+            uint8_t cc = (ev[2] >> 24) & 0xFF;
+            if (cc == CC_SUCCESS || cc == CC_SHORT_PKT) {
+                if (dir_in)
+                    dma_copy_from(data, dma_buf, len);
+                return 0;
+            }
+            uart_puts("[xHCI] bulk_transfer: CC=");
+            print_hex32(cc); uart_puts("\n");
+            return -1;
+        }
+        /* Discard other events (PSCEs, CCEs from concurrent commands) */
+    }
+    uart_puts("[xHCI] bulk_transfer: TIMEOUT\n");
     return -1;
 }
 

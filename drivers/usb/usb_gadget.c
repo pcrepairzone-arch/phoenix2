@@ -2,7 +2,7 @@
  * usb_gadget.c – USB Gadget Driver for RISC OS Phoenix
  * Device-side USB (e.g., Pi as mass storage or RNDIS Ethernet)
  * Uses DWC2 controller on Pi (configurable for host/device)
- * Author:R Andrews Grok 4 – 06 Feb 2026
+ * Author:R Andrews  – 06 Feb 2026
  */
 
 #include "kernel.h"
@@ -27,6 +27,7 @@ static dwc2_ctrl_t *dwc2_ctrl;
 #define DWC2_GUSBCFG    0x0008
 #define DWC2_GRSTCTL    0x0020
 #define DWC2_GINTSTS    0x0014
+#define DWC2_GINTMSK    0x0018  // Added missing definition
 #define DWC2_DCTL       0x134
 #define DWC2_DSTS       0x138
 #define DWC2_DIEPCTL(n) (0x220 + (n)*0x20)  // Device IN EP control
@@ -130,12 +131,23 @@ usb_gadget_config_t default_config = {
     .num_functions = 1
 };
 
-/* Module init */
-_kernel_oserror *module_init(const char *arg, int podule)
-{
-    usb_gadget_register_config(&default_config);
-    dwc2_init_gadget();
-    usb_gadget_start(&default_config.gadget);
+// Replace the module_init function with:
+int usb_gadget_init(void) {
+    if (usb_gadget_register_config(&default_config) < 0) {
+        debug_print("Failed to register default config\n");
+        return -1;
+    }
+    
+    if (dwc2_init_gadget() < 0) {
+        debug_print("Failed to initialize DWC2 gadget\n");
+        return -1;
+    }
+    
+    if (usb_gadget_start(&default_config.gadget) < 0) {
+        debug_print("Failed to start USB gadget\n");
+        return -1;
+    }
+    
     debug_print("USB Gadget loaded – device mode ready\n");
-    return NULL;
+    return 0;
 }

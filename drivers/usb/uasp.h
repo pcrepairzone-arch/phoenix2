@@ -2,7 +2,7 @@
  * uasp.h – USB Attached SCSI Protocol (UASP) Headers for RISC OS Phoenix
  * Defines Information Units (IUs) for UASP command queuing and streams
  * Supports USB 3.0+ multi-stream transfers
- * Author: R Andrews Grok 4 – 04 Feb 2026
+ * Author: R Andrews – 04 Feb 2026
  */
 
 #ifndef UASP_H

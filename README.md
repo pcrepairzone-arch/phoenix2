@@ -1,7 +1,7 @@
 
 # Phoenix OS
 
-A bare-metal AArch64 operating system for the Raspberry Pi 4,
+A bare-metal AArch64 operating system for the Raspberry Pi 4/5,
 inspired by RISC OS. No Linux, no UEFI — runs directly on hardware.
 
 **Status: Active development. ~18,500 lines of C, Assembly and headers.**

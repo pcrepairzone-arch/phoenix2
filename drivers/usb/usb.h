@@ -39,6 +39,7 @@ typedef struct usb_endpoint {
     uint8_t  bInterval;          /* Polling interval */
     uint8_t  max_burst;          /* USB 3.0+ burst size */
     uint16_t max_streams;        /* USB 3.0+ stream support */
+    uint8_t  slot_id;            /* xHCI slot owning this endpoint (set by HCD) */
 } usb_endpoint_t;
 
 /* USB Interface */
