@@ -79,7 +79,7 @@ void usb_gadget_stop(usb_gadget_t *gadget) {
     debug_print("USB gadget stopped\n");
 }
 
-/* Endpoint queue (stub – TRB setup) */
+/* Endpoint queue (stub - TRB setup) */
 int usb_gadget_ep_queue(usb_gadget_endpoint_t *ep, void *req, size_t len) {
     // Queue to EP ring (stub)
     return 0;
@@ -131,23 +131,22 @@ usb_gadget_config_t default_config = {
     .num_functions = 1
 };
 
-// Replace the module_init function with:
 int usb_gadget_init(void) {
     if (usb_gadget_register_config(&default_config) < 0) {
         debug_print("Failed to register default config\n");
         return -1;
     }
-    
+
     if (dwc2_init_gadget() < 0) {
         debug_print("Failed to initialize DWC2 gadget\n");
         return -1;
     }
-    
+
     if (usb_gadget_start(&default_config.gadget) < 0) {
         debug_print("Failed to start USB gadget\n");
         return -1;
     }
-    
-    debug_print("USB Gadget loaded – device mode ready\n");
+
+    debug_print("USB Gadget loaded - device mode ready\n");
     return 0;
 }

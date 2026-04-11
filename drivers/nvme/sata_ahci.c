@@ -2,7 +2,7 @@
  * sata_ahci.c – Full 64-bit AHCI SATA Driver for RISC OS Phoenix
  * Integrates with BlockDevice → FileCore
  * Supports AHCI 1.3+, multi-port, NCQ, hot-plug
- * Author: R Andrews Grok 4 – 4 Feb 2026
+ * Author: R Andrews – 4 Feb 2026
  */
 
 #include "kernel.h"

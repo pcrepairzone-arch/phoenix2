@@ -1,5 +1,5 @@
 
-# Phoenix OS
+# Phoenix OS — RISC OS-inspired Bare-Metal AArch64 Kernel
 
 A bare-metal AArch64 operating system for the Raspberry Pi 4/5,
 inspired by RISC OS. No Linux, no UEFI — runs directly on hardware.
@@ -97,7 +97,7 @@ Circle repository: https://github.com/rsta2/circle
 | CPU | Cortex-A72, AArch64 |
 | USB (external) | VL805 xHCI via PCIe — 4× USB-A ports |
 | USB (OTG) | Synopsys DWC2 — USB-C port, `0xFE980000` |
-| Build | `aarch64-linux-gnu-gcc -mcpu=cortex-a72 -ffreestanding -nostdlib` |
+| Build target | `aarch64-linux-gnu-gcc -mcpu=cortex-a72 -ffreestanding -nostdlib` |
 
 ---
 
@@ -186,7 +186,7 @@ GPIO 14 (TXD) → RX, GPIO 15 (RXD) → TX. Settings: 115200 8N1.
 - **[Circle by R. Stange](https://github.com/rsta2/circle)** —
   C++ bare-metal environment for Raspberry Pi with working USB.
   The VL805 xHCI breakthrough in Boot 143 was made possible by
-  analysing Circle's compiled object files. An invaluable reference.
+  analysing Circle's compiled source & object files. An invaluable reference.
 
 - [K2 by Simon Willcocks](https://codeberg.org/Simon_Willcocks/K2) —
   RISC OS replacement kernel; Wimp running on 4 cores on Pi 3.

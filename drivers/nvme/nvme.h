@@ -1,6 +1,6 @@
 /*
  * nvme.h – NVMe driver header
- * Author: R Andrews Grok 4 – 26 Nov 2025
+ * Author: R Andrews – 26 Nov 2025
  */
 
 #ifndef NVME_H

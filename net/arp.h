@@ -1,7 +1,7 @@
 /*
  * arp.h – ARP (Address Resolution Protocol) Headers for RISC OS Phoenix
  * Defines arp_hdr_t and ARP constants
- * Author: R Andrews Grok 4 – 10 Dec 2025
+ * Author: R Andrews  – 10 Dec 2025
  */
 
 #ifndef ARP_H
