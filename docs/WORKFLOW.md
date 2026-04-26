@@ -207,7 +207,7 @@ is_fat32 = (IDA == 0x00000300)                  // FAT32 partition reference
 1. Rob uploads latest `bootlogNNN.txt` and/or source files
 2. Claude reads via Desktop Commander from `C:\Users\rob\phoenix_fixed3\`
 3. Filter noise: `grep -v "xHCI\|MESS:\|bulk_xfer"`
-4. Analysis → fix → edit `kernel/filecore.c` directly
+4. Analysis → fix → edit `kernel/filecore.c` as needed
 5. Rob builds on CM5 and runs on Pi 4B
 
 ### Build cycle
