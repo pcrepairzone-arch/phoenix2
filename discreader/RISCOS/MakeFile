@@ -1,0 +1,228 @@
+#*******************************************************************************
+#                                                                              *
+# Project       : DiscReader                                                   *
+# Filename      : Makefile                                                     *
+# Version       : 1.22 (20-Mar-2001)                                           *
+# Author        : David J Ruck for DEEJ Technology PLC                         *
+# Description   : Reads E & E+ discs using code from DiscKnight                *
+# Information   : Standard build makefile	                               *
+# Environment   : Acorn C/C++ (version 5)                                      *
+# Libraries     : OSLib                                                        *
+#                                                                              *
+#*******************************************************************************
+# Change Log:                                                                  *
+#                                                                              *
+# Ver   Date         Description of change                                     *
+# ----  -----------  ---------------------                                     *
+# 1.00  11-Jun-2001  Initial reviosn based on DiscKnight 1.28 (09-Jun-2001)    *
+#                                                                              *
+#*******************************************************************************
+
+#Envirnoment
+INCS    = C:,OSLib:
+LIBS    = C:o.stubs,OSLib:o.OSLib32
+DEFS    = -D _FILE_OFFSET_BITS=32
+
+# Toolflags:
+CCflags      = -apcs 3/32 -c -Wnp -depend !Depend -throwback -I$(INCS) $(DEFS) -memaccess -L22-S22-L41
+C++flags     = -apcs 3/32 -c -Wnp -depend !Depend -throwback -I$(INCS) $(DEFS) -memaccess -L22-S22-L41
+Link         = CC
+Linkflags    = -L$(LIBS) -o $@
+ObjAsmflags  = -apcs 3/32 -depend !Depend -ThrowBack -Stamp -quit -CloseExec
+CMHGflags    = -32bit -depend !Depend -throwBack 
+LibFileflags = -c -o $@
+Squeezeflags = -v $@
+
+# objects
+DISCKREADER_OBJS =	@.o.DiscReader		\
+			@.o.BigFile		\
+			@.o.BootRecord		\
+			@.o.Map			\
+			@.o.Objects		\
+			@.o.Directories		\
+			@.o.DirUtils		\
+			@.o.DiscOps		\
+			@.o.SparceFile		\
+			@.o.Bits64              
+
+
+# Final targets (reverse order)
+All:  @.bin.DiscReader
+
+@.bin.DiscReader:  $(DISCKREADER_OBJS)
+        $(Link) $(Linkflags) $(DISCKREADER_OBJS)
+
+# Static dependencies:
+.SUFFIXES: .o .s .c .cpp
+.s.o:;   objasm $(asmflags) $<
+.c.o:;   cc     $(ccflags)  $<
+.c++.o:; c++    $(c++flags) $<
+
+
+# Dynamic dependencies:
+o.DiscReader:	c.DiscReader
+o.DiscReader:	OSLib:oslib.h.osfile
+o.DiscReader:	OSLib:oslib.h.types
+o.DiscReader:	OSLib:oslib.h.os
+o.DiscReader:	OSLib:oslib.h.oscore32
+o.DiscReader:	OSLib:oslib.h.osf32
+o.DiscReader:	OSLib:oslib.h.fileswitch
+o.DiscReader:	OSLib:oslib.h.fileswch32
+o.DiscReader:	OSLib:oslib.h.osfind
+o.DiscReader:	OSLib:oslib.h.osfind32
+o.DiscReader:	h.DiscReader
+o.DiscReader:	h.SparceFile
+o.DiscReader:	OSLib:oslib.h.types
+o.DiscReader:	OSLib:oslib.h.osfind
+o.DiscReader:	h.Bits64
+o.DiscReader:	OSLib:oslib.h.types
+o.DiscReader:	h.BigFile
+o.DiscReader:	OSLib:oslib.h.types
+o.DiscReader:	OSLib:oslib.h.osfind
+o.DiscReader:	h.Bits64
+o.DiscReader:	h.SparceFile
+o.BigFile:	c.BigFile
+o.BigFile:	OSLib:oslib.h.osgbpb
+o.BigFile:	OSLib:oslib.h.types
+o.BigFile:	OSLib:oslib.h.os
+o.BigFile:	OSLib:oslib.h.oscore32
+o.BigFile:	OSLib:oslib.h.osf32
+o.BigFile:	OSLib:oslib.h.fileswitch
+o.BigFile:	OSLib:oslib.h.fileswch32
+o.BigFile:	OSLib:oslib.h.osgbpb32
+o.BigFile:	OSLib:oslib.h.osargs
+o.BigFile:	OSLib:oslib.h.osargs32
+o.BigFile:	h.BigFile
+o.BigFile:	OSLib:oslib.h.types
+o.BigFile:	OSLib:oslib.h.osfind
+o.BigFile:	OSLib:oslib.h.osfind32
+o.BigFile:	h.Bits64
+o.BigFile:	OSLib:oslib.h.types
+o.BootRecord:	c.BootRecord
+o.BootRecord:	OSLib:oslib.h.osfile
+o.BootRecord:	OSLib:oslib.h.types
+o.BootRecord:	OSLib:oslib.h.os
+o.BootRecord:	OSLib:oslib.h.oscore32
+o.BootRecord:	OSLib:oslib.h.osf32
+o.BootRecord:	OSLib:oslib.h.fileswitch
+o.BootRecord:	OSLib:oslib.h.fileswch32
+o.BootRecord:	h.DiscReader
+o.BootRecord:	h.SparceFile
+o.BootRecord:	OSLib:oslib.h.types
+o.BootRecord:	OSLib:oslib.h.osfind
+o.BootRecord:	OSLib:oslib.h.osfind32
+o.BootRecord:	h.Bits64
+o.BootRecord:	OSLib:oslib.h.types
+o.Map:	c.Map
+o.Map:	OSLib:oslib.h.osfile
+o.Map:	OSLib:oslib.h.types
+o.Map:	OSLib:oslib.h.os
+o.Map:	OSLib:oslib.h.oscore32
+o.Map:	OSLib:oslib.h.osf32
+o.Map:	OSLib:oslib.h.fileswitch
+o.Map:	OSLib:oslib.h.fileswch32
+o.Map:	h.DiscReader
+o.Map:	h.SparceFile
+o.Map:	OSLib:oslib.h.types
+o.Map:	OSLib:oslib.h.osfind
+o.Map:	OSLib:oslib.h.osfind32
+o.Map:	h.Bits64
+o.Map:	OSLib:oslib.h.types
+o.Objects:	c.Objects
+o.Objects:	OSLib:oslib.h.osfind
+o.Objects:	OSLib:oslib.h.types
+o.Objects:	OSLib:oslib.h.os
+o.Objects:	OSLib:oslib.h.oscore32
+o.Objects:	OSLib:oslib.h.osf32
+o.Objects:	OSLib:oslib.h.fileswitch
+o.Objects:	OSLib:oslib.h.fileswch32
+o.Objects:	OSLib:oslib.h.osfind32
+o.Objects:	OSLib:oslib.h.osfile
+o.Objects:	OSLib:oslib.h.osgbpb
+o.Objects:	OSLib:oslib.h.osgbpb32
+o.Objects:	OSLib:oslib.h.osword
+o.Objects:	h.DiscReader
+o.Objects:	h.SparceFile
+o.Objects:	OSLib:oslib.h.types
+o.Objects:	OSLib:oslib.h.osfind
+o.Objects:	h.Bits64
+o.Objects:	OSLib:oslib.h.types
+o.Directories:	c.Directories
+o.Directories:	OSLib:oslib.h.osfile
+o.Directories:	OSLib:oslib.h.types
+o.Directories:	OSLib:oslib.h.os
+o.Directories:	OSLib:oslib.h.oscore32
+o.Directories:	OSLib:oslib.h.osf32
+o.Directories:	OSLib:oslib.h.fileswitch
+o.Directories:	OSLib:oslib.h.fileswch32
+o.Directories:	h.DiscReader
+o.Directories:	h.SparceFile
+o.Directories:	OSLib:oslib.h.types
+o.Directories:	OSLib:oslib.h.osfind
+o.Directories:	OSLib:oslib.h.osfind32
+o.Directories:	h.Bits64
+o.Directories:	OSLib:oslib.h.types
+o.DirUtils:	c.DirUtils
+o.DirUtils:	OSLib:oslib.h.osword
+o.DirUtils:	OSLib:oslib.h.types
+o.DirUtils:	OSLib:oslib.h.os
+o.DirUtils:	OSLib:oslib.h.oscore32
+o.DirUtils:	OSLib:oslib.h.osf32
+o.DirUtils:	OSLib:oslib.h.osfile
+o.DirUtils:	OSLib:oslib.h.fileswitch
+o.DirUtils:	OSLib:oslib.h.fileswch32
+o.DirUtils:	OSLib:oslib.h.territory
+o.DirUtils:	h.DiscReader
+o.DirUtils:	h.SparceFile
+o.DirUtils:	OSLib:oslib.h.types
+o.DirUtils:	OSLib:oslib.h.osfind
+o.DirUtils:	OSLib:oslib.h.osfind32
+o.DirUtils:	h.Bits64
+o.DirUtils:	OSLib:oslib.h.types
+o.DiscOps:	c.DiscOps
+o.DiscOps:	C:h.kernel
+o.DiscOps:	OSLib:oslib.h.osfind
+o.DiscOps:	OSLib:oslib.h.types
+o.DiscOps:	OSLib:oslib.h.os
+o.DiscOps:	OSLib:oslib.h.oscore32
+o.DiscOps:	OSLib:oslib.h.osf32
+o.DiscOps:	OSLib:oslib.h.fileswitch
+o.DiscOps:	OSLib:oslib.h.fileswch32
+o.DiscOps:	OSLib:oslib.h.osfind32
+o.DiscOps:	OSLib:oslib.h.osfile
+o.DiscOps:	OSLib:oslib.h.osgbpb
+o.DiscOps:	OSLib:oslib.h.osgbpb32
+o.DiscOps:	OSLib:oslib.h.osargs
+o.DiscOps:	OSLib:oslib.h.osargs32
+o.DiscOps:	OSLib:oslib.h.messagetrans
+o.DiscOps:	h.BigFile
+o.DiscOps:	OSLib:oslib.h.types
+o.DiscOps:	OSLib:oslib.h.osfind
+o.DiscOps:	h.Bits64
+o.DiscOps:	OSLib:oslib.h.types
+o.DiscOps:	h.SparceFile
+o.DiscOps:	OSLib:oslib.h.types
+o.DiscOps:	OSLib:oslib.h.osfind
+o.DiscOps:	h.Bits64
+o.DiscOps:	h.DiscReader
+o.DiscOps:	h.SparceFile
+o.SparceFile:	c.SparceFile
+o.SparceFile:	OSLib:oslib.h.osgbpb
+o.SparceFile:	OSLib:oslib.h.types
+o.SparceFile:	OSLib:oslib.h.os
+o.SparceFile:	OSLib:oslib.h.oscore32
+o.SparceFile:	OSLib:oslib.h.osf32
+o.SparceFile:	OSLib:oslib.h.fileswitch
+o.SparceFile:	OSLib:oslib.h.fileswch32
+o.SparceFile:	OSLib:oslib.h.osgbpb32
+o.SparceFile:	OSLib:oslib.h.osargs
+o.SparceFile:	OSLib:oslib.h.osargs32
+o.SparceFile:	h.SparceFile
+o.SparceFile:	OSLib:oslib.h.types
+o.SparceFile:	OSLib:oslib.h.osfind
+o.SparceFile:	OSLib:oslib.h.osfind32
+o.SparceFile:	h.Bits64
+o.SparceFile:	OSLib:oslib.h.types
+o.Bits64:	c.Bits64
+o.Bits64:	h.Bits64
+o.Bits64:	OSLib:oslib.h.types

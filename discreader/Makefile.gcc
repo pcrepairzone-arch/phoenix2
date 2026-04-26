@@ -1,0 +1,53 @@
+# Makefile for x86 Linux and ARM
+
+CC      = gcc
+WARNS   = -Wall -Wparentheses -Wunused -Wundef -Wpointer-arith \
+          -Wwrite-strings -Wstrict-prototypes -Wmissing-prototypes \
+          -Wmissing-declarations -Wnested-externs -Wmissing-prototypes 
+NOWARNS = -Wno-unused-result -Wno-format-security -Wno-strict-aliasing \
+          -Wno-format-truncation -Wno-stringop-truncation -Wno-unused-but-set-variable
+CFLAGS  = -O3 -I../OSLib -D__USE_LARGEFILE64 -D_FILE_OFFSET_BITS=64 $(WARNS) $(NOWARNS)
+CCOUT   = -MMD -MP -c -o $@ $<
+LINK    = $(CC)
+LDFLAGS = 
+LDLIBS  = -lm
+BIN     = bin
+
+OSLIB   = ../OSLib/$(BIN)/oslib.a
+
+DiscReader_OBJS=	\
+	Bits64.o		\
+	BootRecord.o	\
+	Directories.o	\
+	DirUtils.o		\
+	DiscOps.o		\
+	DiscReader.o	\
+	Map.o			\
+	Objects.o		\
+	BigFile.o		\
+	SparceFile.o
+
+TARGETS = $(BIN)/discreader
+
+SOURCES = $(wildcard *.c)
+OBJECTS = $(SOURCES:.c=.o)
+DEPENDS = $(SOURCES:.c=.d)
+
+all:	$(BIN) $(TARGETS)
+
+clean:
+	rm -f $(TARGETS)
+	rm -f $(OBJECTS)
+	rm -f $(DEPENDS)
+
+-include  $(DEPENDS)    
+
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(CCOUT)
+
+$(BIN):
+	mkdir -p $@
+
+$(BIN)/discreader: $(DiscReader_OBJS) $(OSLIB)
+	$(LINK) $(LDFLAGS) $^ $(LDLIBS) -o $@
