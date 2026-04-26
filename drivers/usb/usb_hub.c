@@ -9,6 +9,16 @@
  * The VIA Labs VL812 USB 3.0 hub on the DeskPi Pro (VID=2109, PID=3431) is
  * the primary target.  Downstream devices (e.g. SanDisk USB drive) are
  * reached through this hub.
+ *
+ * boot178: Speed detection fix — for a USB2 hub's port, wPortStatus bits:
+ *   bit 9  (PS_LS_DEV) = 1 → Low-Speed  (1.5 Mbps)
+ *   bit 10 (PS_HS_DEV) = 1 → High-Speed (480 Mbps)
+ *   neither set         → Full-Speed (12 Mbps), NOT SuperSpeed.
+ * Previous code fell through to XHCI_SPEED_SS which caused Address Device
+ * timeouts for FS keyboards/mice.
+ *
+ * boot178: hub_poll_hotplug() added — polls each hub port for C_PORT_CONNECTION
+ * change bits and enumerates newly connected devices.  Called from wimp_task.
  */
 
 #include "usb.h"
@@ -82,6 +92,10 @@ static void hub_delay_ms(uint32_t ms) {
     while (hub_ms() < end) { asm volatile("nop"); }
 }
 
+/* ── Persistent hub state (for hotplug polling) ──────────────────────────── */
+static usb_device_t *g_hub_dev       = NULL;
+static uint8_t       g_hub_num_ports = 0;
+
 /* ── Hub Descriptor ─────────────────────────────────────────────────────── */
 typedef struct {
     uint8_t  bLength;
@@ -128,6 +142,8 @@ static int hub_probe(usb_device_t *dev, usb_interface_t *intf) {
     (void)intf;
     uart_puts("[HUB] hub_probe: VID="); hub_print_hex(dev->idVendor);
     uart_puts(" PID="); hub_print_hex(dev->idProduct); uart_puts("\n");
+    /* Save reference for hub_poll_hotplug() */
+    g_hub_dev = dev;
 
     /* ── SET_CONFIGURATION(1) ────────────────────────────────────────── */
     usb_control_transfer(dev, 0x00, USB_REQ_SET_CONFIG, 1, 0, NULL, 0, 200);
@@ -151,6 +167,7 @@ static int hub_probe(usb_device_t *dev, usb_interface_t *intf) {
 
     if (num_ports == 0 || num_ports > 15) num_ports = 4;
     if (pwrgood_ms < 100) pwrgood_ms = 100;  /* spec minimum 100ms */
+    g_hub_num_ports = num_ports;
 
     /* ── Power on all ports ──────────────────────────────────────────── */
     for (uint8_t p = 1; p <= num_ports; p++)
@@ -207,10 +224,16 @@ static int hub_probe(usb_device_t *dev, usb_interface_t *intf) {
         }
 
         /* ── Determine device speed ──────────────────────────────────── */
+        /* USB2 hub wPortStatus speed bits (§11.24.2.7):
+         *   bit9  PS_LS_DEV = Low-Speed  (1.5 Mbps)
+         *   bit10 PS_HS_DEV = High-Speed (480 Mbps)
+         *   neither set     = Full-Speed (12 Mbps)   ← boot178 fix
+         * SuperSpeed devices appear on separate SS companion ports
+         * with a different wPortStatus encoding (USB3 §10.16.2.6). */
         uint32_t spd;
-        if (ps.wPortStatus & PS_LS_DEV)        spd = XHCI_SPEED_LS;
-        else if (ps.wPortStatus & PS_HS_DEV)   spd = XHCI_SPEED_HS;
-        else                                    spd = XHCI_SPEED_SS; /* SS or FS guess */
+        if      (ps.wPortStatus & PS_LS_DEV) spd = XHCI_SPEED_LS;
+        else if (ps.wPortStatus & PS_HS_DEV) spd = XHCI_SPEED_HS;
+        else                                 spd = XHCI_SPEED_FS; /* boot178: FS not SS */
 
         uart_puts("[HUB]   Port "); hub_print_hex(p);
         uart_puts(": device connected, speed="); hub_print_hex(spd); uart_puts("\n");
@@ -229,6 +252,81 @@ static int hub_probe(usb_device_t *dev, usb_interface_t *intf) {
 
 static void hub_disconnect(usb_device_t *dev) {
     (void)dev;
+}
+
+/*
+ * hub_poll_hotplug — check all hub ports for connect/disconnect changes.
+ *
+ * Called periodically from the wimp_task main loop (boot178).  Issues
+ * GET_PORT_STATUS for each port and acts on C_PORT_CONNECTION changes:
+ *   connect   → reset the port and enumerate the new device
+ *   disconnect → print message (slot cleanup is future work)
+ *
+ * Rate-limited by the caller (every ~500 ms is sufficient).
+ */
+void hub_poll_hotplug(void)
+{
+    if (!g_hub_dev || g_hub_num_ports == 0) return;
+
+    for (uint8_t p = 1; p <= g_hub_num_ports; p++) {
+        port_status_t ps;
+        if (hub_get_port_status(g_hub_dev, p, &ps) != 0) continue;
+
+        /* Only act when the connection-change bit is set */
+        if (!(ps.wPortChange & PC_C_CONNECTION)) continue;
+
+        /* Clear the C_PORT_CONNECTION change bit */
+        hub_clear_port_feature(g_hub_dev, p, C_PORT_CONNECTION);
+
+        if (ps.wPortStatus & PS_CONNECTION) {
+            /* ── New device: reset port then enumerate ───────────────── */
+            uart_puts("[HUB] Hotplug: device connected on port ");
+            hub_print_hex(p); uart_puts(" — resetting...\n");
+
+            hub_set_port_feature(g_hub_dev, p, PORT_RESET);
+
+            /* Wait for C_PORT_RESET (up to 500 ms) */
+            int reset_ok = 0;
+            for (int t = 0; t < 50; t++) {
+                hub_delay_ms(10);
+                if (hub_get_port_status(g_hub_dev, p, &ps) != 0) break;
+                if (ps.wPortChange & PC_C_RESET) { reset_ok = 1; break; }
+            }
+            if (!reset_ok) {
+                uart_puts("[HUB] Hotplug: reset timeout on port ");
+                hub_print_hex(p); uart_puts("\n");
+                continue;
+            }
+            hub_clear_port_feature(g_hub_dev, p, C_PORT_RESET);
+
+            if (hub_get_port_status(g_hub_dev, p, &ps) != 0) continue;
+            if (!(ps.wPortStatus & PS_ENABLE)) {
+                uart_puts("[HUB] Hotplug: port not enabled after reset\n");
+                continue;
+            }
+
+            /* Determine speed (same logic as hub_probe) */
+            uint32_t spd;
+            if      (ps.wPortStatus & PS_LS_DEV) spd = XHCI_SPEED_LS;
+            else if (ps.wPortStatus & PS_HS_DEV) spd = XHCI_SPEED_HS;
+            else                                 spd = XHCI_SPEED_FS;
+
+            uart_puts("[HUB] Hotplug: enumerating port ");
+            hub_print_hex(p);
+            uart_puts(" speed="); hub_print_hex(spd); uart_puts("\n");
+
+            hub_delay_ms(10);
+            if (xhci_enumerate_hub_port(g_hub_dev, p, spd) != 0) {
+                uart_puts("[HUB] Hotplug: enumerate failed on port ");
+                hub_print_hex(p); uart_puts("\n");
+            }
+        } else {
+            /* ── Device disconnected ─────────────────────────────────── */
+            uart_puts("[HUB] Hotplug: device disconnected from port ");
+            hub_print_hex(p); uart_puts("\n");
+            /* TODO: Disable Slot + free hid_device entry (future work) */
+        }
+    }
 }
 
 /* ── Registration ────────────────────────────────────────────────────────── */

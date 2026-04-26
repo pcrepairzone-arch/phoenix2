@@ -135,3 +135,102 @@ file_ops_t *get_fs_ops(inode_t *inode) {
     (void)inode;
     return NULL;
 }
+
+
+/* ── vfs_register_filesystem ────────────────────────────────────────────── */
+/* Forward declarations for symbols defined in other translation units      */
+extern void uart_puts(const char *s);
+extern void filecore_init(void);
+extern void filecore_list_root(void);
+extern int  filecore_get_root_entry(uint32_t idx, vfs_dirent_t *out);
+extern int  filecore_get_child_entry(uint32_t sin, uint32_t idx,
+                                      vfs_dirent_t *out);
+/* g_fc_bdev is blockdev_t* in filecore.c — forward as void* to avoid
+ * including blockdev headers. The pointer value is only stored, never
+ * dereferenced in vfs.c.                                                   */
+extern void *g_fc_bdev;
+/* Simple registry: for now, one slot — extend to array later               */
+static const vfs_filesystem_t *registered_fs = NULL;
+
+int vfs_register_filesystem(const vfs_filesystem_t *fs)
+{
+    if (!fs) return -1;
+    registered_fs = fs;
+    uart_puts("[VFS] Registered filesystem: "); uart_puts(fs->name); uart_puts("\n");
+    return 0;
+}
+
+int vfs_mount(const char *fsname, const char *mountpoint, uint32_t flags, void *opts)
+{
+    (void)opts;
+    if (!registered_fs || !registered_fs->mount) return -1;
+    void *fsdata = NULL;
+    int rc = registered_fs->mount(fsname, mountpoint, flags, &fsdata);
+    if (rc == 0) {
+        uart_puts("[VFS] Mounted "); uart_puts(fsname);
+        uart_puts(" at "); uart_puts(mountpoint); uart_puts("\n");
+    }
+    return rc;
+}
+
+/* ── FileCore VFS driver ────────────────────────────────────────────────── */
+/* boot247: Wire the proven SBPr parser into the VFS layer.                 */
+
+/* FileCore readdir callback — returns root entries for "/" path */
+static int filecore_vfs_readdir(void *fsdata, const char *path,
+                                 vfs_dirent_t *dirent, uint32_t *cookie)
+{
+    (void)fsdata;
+    (void)path;   /* TODO: parse path for subdirectory traversal */
+
+    /* cookie tracks position in the directory listing */
+    int rc = filecore_get_root_entry(*cookie, dirent);
+    if (rc == 0) {
+        (*cookie)++;
+        return 0;       /* entry returned, more may follow */
+    }
+    *cookie = 0;
+    return -1;          /* end of directory */
+}
+
+/* FileCore mount callback */
+static int filecore_vfs_mount(const char *dev, const char *mnt,
+                               uint32_t flags, void **fsdata)
+{
+    (void)dev; (void)mnt; (void)flags;
+
+    uart_puts("[VFS] FileCore: initialising disc scan\n");
+    filecore_init();
+    filecore_list_root();
+
+    *fsdata = g_fc_bdev;
+    uart_puts("[VFS] FileCore: mounted SCSI::laxarusb.$\n");
+    return 0;
+}
+
+static int filecore_vfs_umount(void *fsdata)
+{
+    (void)fsdata;
+    uart_puts("[VFS] FileCore: unmounted\n");
+    return 0;
+}
+
+static const vfs_filesystem_t filecore_fs_driver = {
+    .name    = "FileCore",
+    .flags   = VFS_FS_READONLY | VFS_FS_CASE_INSENSITIVE,
+    .mount   = filecore_vfs_mount,
+    .umount  = filecore_vfs_umount,
+    .readdir = filecore_vfs_readdir,
+};
+
+/* Called from kernel_main during boot */
+void vfs_register_filecore(void)
+{
+    uart_puts("[VFS] Registering FileCore driver\n");
+    int rc = vfs_register_filesystem(&filecore_fs_driver);
+    if (rc != 0) {
+        uart_puts("[VFS] Registration failed\n");
+        return;
+    }
+    vfs_mount("FileCore", "HardDisc0", 0, NULL);
+}

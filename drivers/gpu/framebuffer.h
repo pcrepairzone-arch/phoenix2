@@ -6,11 +6,16 @@
 
 #include <stdint.h>
 
-/* Packed 32-bit ARGB pixel */
+/* Packed 32-bit pixel.
+ * Pi 4 VideoCore sets pixel-order=1 (RGB): memory layout is RGBA
+ * — byte 0 = R, byte 1 = G, byte 2 = B, byte 3 = A.
+ * As a little-endian uint32_t that means 0xAABBGGRR.
+ * boot169: corrected from old 0xAARRGGBB which swapped R↔B and
+ *          caused blue to appear red on screen.                     */
 typedef uint32_t pixel_t;
 
-#define RGB(r,g,b)   ((pixel_t)(0xFF000000 | ((r)<<16) | ((g)<<8) | (b)))
-#define RGBA(r,g,b,a) ((pixel_t)(((a)<<24) | ((r)<<16) | ((g)<<8) | (b)))
+#define RGB(r,g,b)    ((pixel_t)(0xFF000000u | ((uint32_t)(b)<<16) | ((uint32_t)(g)<<8) | (uint32_t)(r)))
+#define RGBA(r,g,b,a) ((pixel_t)(((uint32_t)(a)<<24) | ((uint32_t)(b)<<16) | ((uint32_t)(g)<<8) | (uint32_t)(r)))
 
 /* Standard palette */
 #define COL_BLACK      RGB(0,   0,   0  )
@@ -64,5 +69,11 @@ void con_puts(const char *s);
 void con_printf(const char *fmt, ...);
 void con_clear(void);
 void con_set_colours(pixel_t fg, pixel_t bg);
+
+/* Mouse cursor sprite (boot179) */
+void cursor_init(void);
+void cursor_update(int x, int y);
+void cursor_show(void);
+void cursor_hide(void);
 
 #endif /* FRAMEBUFFER_H */

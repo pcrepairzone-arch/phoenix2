@@ -116,6 +116,14 @@ int mouse_poll(mouse_event_t *ev)
     return 1;
 }
 
+/* ── Absolute pointer position query (boot179) ───────────────────────────── */
+
+void mouse_get_pos(int16_t *x, int16_t *y)
+{
+    if (x) *x = mouse_x;
+    if (y) *y = mouse_y;
+}
+
 /* ── Helper queries (used by WIMP layer directly) ─────────────────────────── */
 
 int is_f3_pressed(keyboard_event_t *ev)  { return ev->key_code == KEY_F3;  }

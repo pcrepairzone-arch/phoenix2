@@ -172,6 +172,15 @@ void con_putc(char ch){
     if(ch=='\r'){cc=0;return;}
     if(ch=='\n'){cc=0;cr++;if(cr>=crows)con_scroll();return;}
     if(ch=='\t'){int n=(cc+4)&~3;while(cc<n)con_putc(' ');return;}
+    /* boot179: backspace — move left one column and erase */
+    if(ch=='\b'){
+        if(cc>0){--cc;}
+        else if(cr>0){--cr;cc=ccols-1;}  /* wrap to end of previous line */
+        else return;                       /* already at 0,0 — nothing to erase */
+        cbuf[cr][cc]=' ';
+        fb_draw_char(CON_MX+cc*CON_CW, CON_MY+cr*CON_CH, ' ', cfg, cbg);
+        return;
+    }
     cbuf[cr][cc]=ch;
     fb_draw_char(CON_MX+cc*CON_CW,CON_MY+cr*CON_CH,ch,cfg,cbg);
     if(++cc>=ccols){cc=0;cr++;if(cr>=crows)con_scroll();}
@@ -203,3 +212,104 @@ pixel_t fb_get_pixel(int x, int y) {
     if (!fb.valid||(unsigned)x>=fb.width||(unsigned)y>=fb.height) return 0;
     return ((uint32_t*)((uint8_t*)fb.base+y*fb.pitch))[x];
 }
+
+/* ── Mouse cursor sprite (boot179) ──────────────────────────────────────────
+ *
+ * 8×10 solid arrow, top-left hotspot.  White 1-pixel halo drawn first so the
+ * cursor is legible on any background colour.
+ *
+ *   Row  Bits (MSB=col0)   Shape
+ *    0   0x80  #.......    hotspot
+ *    1   0xC0  ##......
+ *    2   0xE0  ###.....
+ *    3   0xF0  ####....
+ *    4   0xF8  #####...
+ *    5   0xFC  ######..    <- arrowhead base
+ *    6   0xC0  ##......    shaft
+ *    7   0xC0  ##......
+ *    8   0xC0  ##......
+ *    9   0xC0  ##......
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+#define CURSOR_BITS_W   8
+#define CURSOR_BITS_H  10
+#define CURSOR_SAVE_W  10   /* fill area + 1px halo each side */
+#define CURSOR_SAVE_H  12
+
+static const uint8_t cursor_fill_bits[CURSOR_BITS_H] = {
+    0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC,   /* arrowhead triangle */
+    0xC0, 0xC0, 0xC0, 0xC0                 /* shaft */
+};
+
+static pixel_t cursor_save[CURSOR_SAVE_H][CURSOR_SAVE_W];
+static int     cursor_sx = -1, cursor_sy = -1; /* top-left of save area; -1 = not drawn */
+static int     cursor_visible = 0;
+
+static void cursor_restore(void) {
+    if (cursor_sx < 0) return;
+    for (int r = 0; r < CURSOR_SAVE_H; r++)
+        for (int c = 0; c < CURSOR_SAVE_W; c++)
+            fb_set_pixel(cursor_sx + c, cursor_sy + r, cursor_save[r][c]);
+    cursor_sx = cursor_sy = -1;
+}
+
+static void cursor_blit(int x, int y) {
+    /* Save the pixels under the cursor (including halo band) */
+    int sx = x - 1, sy = y - 1;
+    for (int r = 0; r < CURSOR_SAVE_H; r++)
+        for (int c = 0; c < CURSOR_SAVE_W; c++)
+            cursor_save[r][c] = fb_get_pixel(sx + c, sy + r);
+    cursor_sx = sx;
+    cursor_sy = sy;
+
+    /* Pass 1 — white halo: every transparent pixel adjacent to a fill pixel */
+    for (int r = -1; r <= CURSOR_BITS_H; r++) {
+        for (int c = -1; c <= CURSOR_BITS_W; c++) {
+            /* Skip if this is a fill pixel itself */
+            int self_fill = ((unsigned)r < (unsigned)CURSOR_BITS_H &&
+                             (unsigned)c < (unsigned)CURSOR_BITS_W)
+                            && ((cursor_fill_bits[r] >> (7 - c)) & 1u);
+            if (self_fill) continue;
+            /* Check all 8 neighbours for a fill pixel */
+            int border = 0;
+            for (int dr = -1; dr <= 1 && !border; dr++)
+                for (int dc = -1; dc <= 1 && !border; dc++) {
+                    int nr = r + dr, nc = c + dc;
+                    if ((unsigned)nr < (unsigned)CURSOR_BITS_H &&
+                        (unsigned)nc < (unsigned)CURSOR_BITS_W)
+                        if ((cursor_fill_bits[nr] >> (7 - nc)) & 1u)
+                            border = 1;
+                }
+            if (border) fb_set_pixel(x + c, y + r, COL_WHITE);
+        }
+    }
+
+    /* Pass 2 — black fill */
+    for (int r = 0; r < CURSOR_BITS_H; r++)
+        for (int c = 0; c < CURSOR_BITS_W; c++)
+            if ((cursor_fill_bits[r] >> (7 - c)) & 1u)
+                fb_set_pixel(x + c, y + r, COL_BLACK);
+}
+
+void cursor_init(void) {
+    cursor_sx = cursor_sy = -1;
+    cursor_visible = 1;
+}
+
+void cursor_update(int x, int y) {
+    if (!fb.valid || !cursor_visible) return;
+    /* Clamp so save area (1px outside fill) stays within framebuffer */
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+    if (x + CURSOR_BITS_W + 1 > (int)fb.width)
+        x = (int)fb.width  - CURSOR_BITS_W - 1;
+    if (y + CURSOR_BITS_H + 1 > (int)fb.height)
+        y = (int)fb.height - CURSOR_BITS_H - 1;
+    /* Don't redraw if position unchanged */
+    if (cursor_sx == x - 1 && cursor_sy == y - 1) return;
+    cursor_restore();
+    cursor_blit(x, y);
+}
+
+void cursor_show(void) { cursor_visible = 1; }
+void cursor_hide(void) { cursor_restore(); cursor_visible = 0; }

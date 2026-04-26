@@ -173,6 +173,10 @@ void mmu_init(void)
 #define L2_DEVICE(pa)  ((pa) | PTE_VALID | PTE_BLOCK | PTE_AF | \
                          PTE_SH_OUTER | PTE_AP_RW | PTE_ATTRINDX(MAIR_DEVICE) | \
                          PTE_PXN | PTE_UXN)
+    /* 2 MB L2 block descriptor (Normal Non-Cacheable) — framebuffer/GPU shared RAM */
+#define L2_NC(pa)      ((pa) | PTE_VALID | PTE_BLOCK | PTE_AF | \
+                         PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NC) | \
+                         PTE_PXN | PTE_UXN)
     /* 4 KB L3 page descriptor (Normal WB) */
 #define L3_NORMAL(pa)  ((pa) | PTE_VALID | PTE_PAGE | PTE_AF | \
                          PTE_SH_INNER | PTE_AP_RW | PTE_ATTRINDX(MAIR_NORMAL))
@@ -243,15 +247,29 @@ void mmu_init(void)
                 (unsigned long long)dma_l3_last - 1);
 
     /* ── Build l2_first_gb: 2 MB blocks for the first 1 GB ─────── */
+    /*
+     * GPU split: "MEM GPU: 128 ARM: 896" → GPU gets top 128 MB of the 1 GB.
+     * ARM RAM:   0x00000000 – 0x37FFFFFF  (896 MB)  Normal WB
+     * GPU/FB RAM:0x38000000 – 0x3FFFFFFF  (128 MB)  Normal NC
+     *   The GPU-accessible SDRAM (including framebuffer) must be Non-Cacheable
+     *   so CPU writes reach physical RAM and the GPU/display engine can see them.
+     *   Marking as NC avoids explicit cache-flush calls after every fb_putpixel.
+     */
+#define GPU_RAM_START 0x38000000ULL   /* top 128 MB of 1 GB = GPU share */
 
     for (int i = 0; i < 512; i++) {
         uint64_t pa = (uint64_t)i << 21;   /* 2 MB each, starting at 0 */
         if ((uint64_t)i == dma_l2_idx)
             /* Replace with table pointer to the L3 table we just built */
             l2_first_gb[i] = TABLE_DESC((uint64_t)l3_dma_2mb);
+        else if (pa >= GPU_RAM_START)
+            /* GPU/framebuffer memory — Normal Non-Cacheable so GPU sees CPU writes */
+            l2_first_gb[i] = L2_NC(pa);
         else
             l2_first_gb[i] = L2_NORMAL(pa);
     }
+    debug_print("[MMU] GPU/FB RAM 0x38000000-0x3FFFFFFF mapped NC "
+                "(framebuffer writes bypass D-cache)\n");
 
     /* ── L1 table ────────────────────────────────────────────────── */
 
@@ -291,10 +309,12 @@ void mmu_init(void)
     /* ── Pi 5: PCIe RC @ 0x1F00000000  (index 124) ──────────────── */
     l1_table[124] = L1_DEVICE(0x1F00000000ULL);
 
+#undef GPU_RAM_START
 #undef L1_NORMAL
 #undef L1_DEVICE
 #undef L2_NORMAL
 #undef L2_DEVICE
+#undef L2_NC
 #undef L3_NORMAL
 #undef L3_DEVICE
 #undef L3_NC

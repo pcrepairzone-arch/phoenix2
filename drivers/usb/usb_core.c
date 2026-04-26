@@ -51,6 +51,7 @@
 
 #include "kernel.h"
 #include "usb.h"
+#include "usb_xhci.h"   /* xhci_bulk_transfer — direct route for xHCI endpoints */
 
 extern void uart_puts(const char *s);
 
@@ -154,6 +155,15 @@ int usb_control_transfer(usb_device_t *dev, uint8_t request_type,
  * @return   Bytes transferred or -1 on error
  */
 int usb_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout) {
+    /* boot165 fix: route xHCI endpoints directly by slot_id.
+     * usb_register_hc(&g_dwc2_hc_ops) at the end of usb_init() overwrites
+     * g_hc_ops, so after DWC2 init all bulk transfers go to DWC2 — which
+     * has no xHCI slot and returns -1 for every xHCI device.
+     * Fix: if ep->slot_id > 0, the endpoint belongs to an xHCI slot and
+     * must go directly to xhci_bulk_transfer(), bypassing g_hc_ops.       */
+    if (ep && ep->slot_id > 0)
+        return xhci_bulk_transfer(ep, data, len, timeout);
+
     if (!g_hc_ops) {
         debug_print("[USB] usb_bulk_transfer: no HCD registered\n");
         return -1;

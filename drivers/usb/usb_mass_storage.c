@@ -9,7 +9,6 @@
 #include "usb.h"
 #include "blockdriver.h"
 #include "uasp.h"
-#include <string.h>
 
 extern void uart_puts(const char *s);
 
@@ -91,7 +90,14 @@ typedef struct {
  * dir_in=1 for device→host data (e.g. READ CAPACITY, READ),
  * dir_in=0 for host→device (e.g. WRITE), buf=NULL/buf_len=0 for no data.
  * Returns 0 on success (CSW status=0), -1 on failure.
- */
+ *
+ * boot184 fix: when the data-IN phase stalls (CC=6), BOT spec §6.6.2 requires
+ * the host to: (1) clear the ENDPOINT_HALT on bulk-IN, then (2) read the CSW.
+ * Previously we returned -1 immediately, leaving the pending CSW in the pipe.
+ * Every subsequent CBW was then interpreted by the device as arriving while a
+ * CSW was outstanding → phase error → device stalls again.  Now we always
+ * attempt to clear the stall and drain the CSW before returning, leaving the
+ * BOT state machine clean for the next command.                               */
 static int bot_scsi_cmd(usb_storage_t *drive, int lun,
                         const uint8_t *cdb, uint8_t cdb_len,
                         void *buf, uint32_t buf_len, int dir_in)
@@ -105,7 +111,8 @@ static int bot_scsi_cmd(usb_storage_t *drive, int lun,
     cbw.flags     = dir_in ? 0x80u : 0x00u;
     cbw.lun       = (uint8_t)lun;
     cbw.cmd_len   = cdb_len;
-    memcpy(cbw.cmd, cdb, cdb_len);
+    for (int _i = 0; _i < cdb_len && _i < 16; _i++)
+        cbw.cmd[_i] = cdb[_i];
 
     /* Phase 1: Command */
     if (usb_bulk_transfer(drive->bulk_out, &cbw, 31, USB_TIMEOUT) < 0) {
@@ -114,11 +121,30 @@ static int bot_scsi_cmd(usb_storage_t *drive, int lun,
     }
 
     /* Phase 2: Data (optional) */
+    int data_stalled = 0;
     if (buf_len && buf) {
         usb_endpoint_t *ep = dir_in ? drive->bulk_in : drive->bulk_out;
         if (usb_bulk_transfer(ep, buf, buf_len, USB_TIMEOUT) < 0) {
-            uart_puts("[MSC] BOT: data phase failed\n");
-            return -1;
+            /* Data phase stalled.  Per BOT spec §6.6.2:
+             * - Clear ENDPOINT_HALT on the stalled pipe
+             * - Then proceed to read the CSW
+             * NOT returning -1 here keeps the pipe clean for the next command. */
+            data_stalled = 1;
+            uart_puts("[MSC] BOT: data phase stalled — clearing halt\n");
+            if (dir_in) {
+                usb_control_transfer(drive->dev,
+                    0x02u,   /* bmRequestType: std | ep | host→dev */
+                    0x01u,   /* bRequest: CLEAR_FEATURE             */
+                    0x0000u, /* wValue: ENDPOINT_HALT               */
+                    drive->bulk_in->bEndpointAddress,
+                    NULL, 0, 200);
+            } else {
+                usb_control_transfer(drive->dev,
+                    0x02u, 0x01u, 0x0000u,
+                    drive->bulk_out->bEndpointAddress,
+                    NULL, 0, 200);
+            }
+            /* Fall through to Phase 3 to drain the CSW */
         }
     }
 
@@ -132,7 +158,30 @@ static int bot_scsi_cmd(usb_storage_t *drive, int lun,
         return -1;
     }
 
+    if (data_stalled) return -1;   /* command failed; pipe is now clean */
     return (csw.status == 0) ? 0 : -1;
+}
+
+/* ── Wall-clock helpers (CNTPCT_EL0 @ 54 MHz on BCM2711) ────────────────── */
+static inline uint32_t msc_time_ms(void) {
+    uint64_t v;
+    asm volatile("isb; mrs %0, cntpct_el0" : "=r"(v) :: "memory");
+    return (uint32_t)(v / 54000ULL);
+}
+
+static void msc_delay_ms(uint32_t ms) {
+    uint32_t deadline = msc_time_ms() + ms;
+    while (msc_time_ms() < deadline)
+        asm volatile("nop");
+}
+
+/* ── SCSI TEST UNIT READY (opcode 0x00, no data phase) ───────────────────── *
+ * Returns 0 if device reports GOOD status, -1 if CHECK CONDITION / timeout.
+ */
+static int bot_test_unit_ready(usb_storage_t *drive, int lun)
+{
+    uint8_t cdb[6] = {0x00, 0, 0, 0, 0, 0};   /* TEST UNIT READY */
+    return bot_scsi_cmd(drive, lun, cdb, 6, NULL, 0, 1);
 }
 
 /* ── SCSI READ CAPACITY(10) ───────────────────────────────────────────────── *
@@ -170,6 +219,52 @@ static int bot_read_capacity(usb_storage_t *drive, int lun)
     return 0;
 }
 
+/* ── SCSI READ CAPACITY(16) ─────────────────────────────────────────────────
+ * SERVICE ACTION IN (0x9E) / READ CAPACITY (SA 0x10)
+ * Returns 32 bytes: [Last LBA 8B big-endian][Block Size 4B big-endian]...
+ * Required for drives > 2 TiB and by USB-SATA bridges (RTL9210 etc) that
+ * stall RC(10) to signal they need the 16-byte variant.
+ * Returns 0 on success, -1 on failure.
+ */
+static int bot_read_capacity16(usb_storage_t *drive, int lun)
+{
+    uint8_t cdb[16] = {0};
+    cdb[0]  = 0x9Eu;   /* SERVICE ACTION IN(16) */
+    cdb[1]  = 0x10u;   /* READ CAPACITY service action */
+    cdb[10] = 0u;      /* Logical Block Address bytes 2-9 = 0 */
+    cdb[11] = 0u;
+    cdb[12] = 0u;
+    cdb[13] = 32u;     /* Allocation length = 32 bytes */
+    cdb[14] = 0u;      /* PMI = 0 */
+    cdb[15] = 0u;
+
+    uint8_t data[32] = {0};
+    if (bot_scsi_cmd(drive, lun, cdb, 16, data, 32, 1) < 0)
+        return -1;
+
+    uint64_t last_lba =
+        ((uint64_t)data[0] << 56) | ((uint64_t)data[1] << 48) |
+        ((uint64_t)data[2] << 40) | ((uint64_t)data[3] << 32) |
+        ((uint64_t)data[4] << 24) | ((uint64_t)data[5] << 16) |
+        ((uint64_t)data[6] <<  8) |  (uint64_t)data[7];
+
+    uint32_t blk_len =
+        ((uint32_t)data[8]  << 24) | ((uint32_t)data[9]  << 16) |
+        ((uint32_t)data[10] <<  8) |  (uint32_t)data[11];
+
+    if (blk_len == 0 || blk_len > 65536) {
+        uart_puts("[MSC] RC(16): bad block length, defaulting to 512\n");
+        blk_len = 512;
+    }
+
+    uart_puts("[MSC] RC(16): last_lba=0x"); print_hex64(last_lba);
+    uart_puts("  blk_len="); print_hex32(blk_len); uart_puts("\n");
+
+    drive->capacity[lun]   = last_lba + 1ULL;
+    drive->block_size[lun] = blk_len;
+    return 0;
+}
+
 /* ── SCSI READ(10) / WRITE(10) over BOT ───────────────────────────────────── */
 static int usb_bot_rw(usb_storage_t *drive, int lun, uint64_t lba,
                       uint32_t blocks, void *buffer, int write)
@@ -190,13 +285,91 @@ static int usb_bot_rw(usb_storage_t *drive, int lun, uint64_t lba,
                         buffer, blocks * bsize, !write);
 }
 
+/* ── BOT error recovery ────────────────────────────────────────────────────── *
+ * Called when a bulk transfer fails with CC=4 (USB Transaction Error).        *
+ * Sequence per USB MSC BOT spec §5.3.4:                                       *
+ *   1. BOT Mass Storage Reset (class-specific control request, via EP0)        *
+ *   2. CLEAR_FEATURE ENDPOINT_HALT on bulk IN endpoint (standard, via EP0)    *
+ *   3. CLEAR_FEATURE ENDPOINT_HALT on bulk OUT endpoint (standard, via EP0)   *
+ *   4. xHCI endpoint reset + re-configure (xhci_ep_recover)                   *
+ *   5. TEST UNIT READY to verify device responsiveness                         *
+ * ──────────────────────────────────────────────────────────────────────────── */
+extern int xhci_ep_recover(usb_device_t *dev);
+
+static int bot_recover(usb_storage_t *drive)
+{
+    uart_puts("[MSC] BOT recovery: resetting device endpoints...\n");
+
+    /* Step 1: BOT Mass Storage Reset
+     * bmRequestType = 0x21 (out, class, interface)
+     * bRequest      = 0xFF  */
+    usb_control_transfer(drive->dev,
+                         0x21u,          /* bmRequestType: class | interface | host→dev */
+                         0xFFu,          /* bRequest: Bulk-Only Mass Storage Reset      */
+                         0u,             /* wValue: 0                                   */
+                         drive->intf_num,/* wIndex: interface number                    */
+                         NULL, 0, 500);
+    msc_delay_ms(50);
+
+    /* Step 2: Clear HALT on bulk IN endpoint
+     * bmRequestType = 0x02 (out, standard, endpoint), bRequest = 0x01 (CLEAR_FEATURE)
+     * wValue = 0x0000 (ENDPOINT_HALT feature selector)                              */
+    usb_control_transfer(drive->dev,
+                         0x02u,          /* bmRequestType: standard | endpoint | host→dev */
+                         0x01u,          /* bRequest: CLEAR_FEATURE                       */
+                         0x0000u,        /* wValue: ENDPOINT_HALT                         */
+                         drive->bulk_in->bEndpointAddress,
+                         NULL, 0, 200);
+
+    /* Step 3: Clear HALT on bulk OUT endpoint */
+    usb_control_transfer(drive->dev,
+                         0x02u,
+                         0x01u,
+                         0x0000u,
+                         drive->bulk_out->bEndpointAddress,
+                         NULL, 0, 200);
+
+    msc_delay_ms(100);
+
+    /* Step 4: Reset xHCI endpoint contexts and rebuild transfer rings */
+    int rc = xhci_ep_recover(drive->dev);
+    if (rc < 0) {
+        uart_puts("[MSC] BOT recovery: xhci_ep_recover failed\n");
+        return -1;
+    }
+
+    msc_delay_ms(200);
+
+    /* Step 5: Verify device is responsive with TEST UNIT READY */
+    int tur_ok = 0;
+    for (int i = 0; i < 5; i++) {
+        if (bot_test_unit_ready(drive, 0) == 0) { tur_ok = 1; break; }
+        msc_delay_ms(100);
+    }
+    uart_puts("[MSC] BOT recovery: ");
+    uart_puts(tur_ok ? "device ready\n" : "device NOT responding\n");
+    return tur_ok ? 0 : -1;
+}
+
 /* ── blockdev_ops_t callbacks (multi-block: lba + count) ─────────────────── */
 static ssize_t usb_bdev_read(blockdev_t *bdev, uint64_t lba,
                               uint32_t count, void *buf)
 {
     usb_bdev_priv_t *p = (usb_bdev_priv_t *)bdev->private;
-    if (usb_bot_rw(p->drive, p->lun, lba, count, buf, 0) < 0)
+    if (usb_bot_rw(p->drive, p->lun, lba, count, buf, 0) < 0) {
+        /* First read failed — attempt BOT recovery and retry once */
+        uart_puts("[MSC] read failed @ LBA "); print_hex32((uint32_t)lba);
+        uart_puts(" — attempting BOT recovery\n");
+        if (bot_recover(p->drive) == 0) {
+            if (usb_bot_rw(p->drive, p->lun, lba, count, buf, 0) < 0) {
+                uart_puts("[MSC] read still failed after recovery\n");
+                return -1;
+            }
+            uart_puts("[MSC] read succeeded after recovery\n");
+            return (ssize_t)count;
+        }
         return -1;
+    }
     return (ssize_t)count;
 }
 
@@ -254,12 +427,89 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
         return -1;
     }
 
-    /* Issue READ CAPACITY(10) to LUN 0 to get sector count and block size   */
+    /* boot168: Give slow devices (NVMe adapters, USB-SATA bridges) time to
+     * initialise before the first SCSI command.  A bare 500 ms here prevents
+     * the RTL9210 and similar bridges from stalling the bulk IN pipe when we
+     * hit them cold with READ CAPACITY.                                      */
+    msc_delay_ms(500);
+
+    /* boot168: TEST UNIT READY retry loop.
+     * Standard SCSI init order: TUR (until GOOD) → READ CAPACITY.
+     * TUR has no data phase — failures come back as CSW status=1 (CHECK
+     * CONDITION = not ready yet), which is a clean exchange that leaves the
+     * BOT pipe uncorrupted.  We retry up to 5 s before giving up.
+     * This prevents the mid-phase RC failure that left the RTL9210 pipe
+     * stalled in boot167.                                                    */
+    uart_puts("[MSC] TEST UNIT READY...\n");
+    int tur_ok = 0;
+    uint32_t tur_deadline = msc_time_ms() + 5000u;
+    while (msc_time_ms() < tur_deadline) {
+        if (bot_test_unit_ready(drive, 0) == 0) {
+            tur_ok = 1;
+            break;
+        }
+        msc_delay_ms(100);
+    }
+    if (tur_ok)
+        uart_puts("[MSC] Device ready\n");
+    else
+        uart_puts("[MSC] TUR timeout — trying READ CAPACITY anyway\n");
+
+    /* INQUIRY — issue before READ CAPACITY.
+     * Many USB-SATA bridges (RTL9210 etc.) require an INQUIRY to initialise
+     * their internal SCSI emulation layer; without it they accept TUR but stall
+     * any command that has a data phase (including READ CAPACITY).
+     * We don't use the response data at this point — just ensuring the SCSI
+     * state machine advances past its initial state.                          */
+    {
+        uint8_t inq_cdb[6] = {0x12, 0, 0, 0, 36, 0};
+        uint8_t inq_buf[36] = {0};
+        int inq_rc = bot_scsi_cmd(drive, 0, inq_cdb, 6, inq_buf, 36, 1);
+        if (inq_rc == 0) {
+            uart_puts("[MSC] INQUIRY OK  vendor='");
+            for (int _i = 8; _i < 16; _i++) {
+                char _c = (char)(inq_buf[_i] & 0x7Fu);
+                if (_c < 0x20) _c = ' ';
+                uart_puts((char[]){_c, '\0'});
+            }
+            uart_puts("'  product='");
+            for (int _i = 16; _i < 32; _i++) {
+                char _c = (char)(inq_buf[_i] & 0x7Fu);
+                if (_c < 0x20) _c = ' ';
+                uart_puts((char[]){_c, '\0'});
+            }
+            uart_puts("'\n");
+        } else {
+            uart_puts("[MSC] INQUIRY failed (non-fatal)\n");
+        }
+    }
+
+    /* READ CAPACITY: try RC(10) first, fall back to RC(16) if stalled.
+     *
+     * USB-SATA bridges (RTL9210, etc.) often stall the bulk-IN pipe on
+     * RC(10) to signal "use the 16-byte variant instead".  After the stall
+     * the IN endpoint is halted — we must call bot_recover() to clear it
+     * before attempting any further commands.
+     *
+     * Sequence: RC(10) → on failure → BOT recover → RC(16)
+     *           → on failure → BOT recover → RC(10) retry → give up        */
+    /* RC(10) first; if it fails the stall is now cleared and CSW drained by
+     * bot_scsi_cmd itself, so RC(16) can follow immediately without a full
+     * bot_recover() cycle.  Only fall back to bot_recover() if RC(16) also
+     * fails (which would suggest a more serious protocol confusion).           */
+    uart_puts("[MSC] READ CAPACITY(10)...\n");
     if (bot_read_capacity(drive, 0) < 0) {
-        uart_puts("[MSC] READ CAPACITY failed — device not ready?\n");
-        /* Fall back to safe defaults so the drive still registers           */
-        drive->capacity[0]   = 0;
-        drive->block_size[0] = 512;
+        uart_puts("[MSC] RC(10) failed — trying RC(16)\n");
+        if (bot_read_capacity16(drive, 0) < 0) {
+            uart_puts("[MSC] RC(16) failed — full BOT recover, retry RC(10)\n");
+            bot_recover(drive);
+            msc_delay_ms(100);
+            if (bot_read_capacity(drive, 0) < 0) {
+                uart_puts("[MSC] READ CAPACITY failed — registering with 0 blocks\n");
+                drive->capacity[0]   = 0;
+                drive->block_size[0] = 512;
+            }
+        }
     }
 
     uart_puts("[MSC] LUN 0: capacity=0x");

@@ -42,6 +42,7 @@ typedef struct {
     usb_endpoint_t  *int_in;   /* Interrupt IN endpoint */
     uint8_t          protocol; /* USB_PROTOCOL_KEYBOARD=1, USB_PROTOCOL_MOUSE=2 */
     uint8_t          last_report[8]; /* Debounce: compare against previous report */
+    uint8_t          get_report_warned; /* boot179: printed first GET_REPORT result */
 } hid_device_t;
 
 #define HID_MAX_DEVICES 4
@@ -212,19 +213,33 @@ static void hid_process_mouse(hid_device_t *hid, const uint8_t *data)
 static void hid_poll(hid_device_t *hid)
 {
     uint8_t report[8] = { 0 };
-    int len;
+    int len = -1;
 
+    /* boot178: Try interrupt endpoint first.  xhci_interrupt_transfer()
+     * currently returns -1 (not yet implemented as a full interrupt ring).
+     * Fall through to GET_REPORT in that case so boot-protocol HID works
+     * immediately.  When interrupt ring support lands, this path auto-upgrades. */
     if (hid->int_in) {
-        /* Interrupt endpoint poll (boot-protocol, 8-byte report) */
         len = usb_interrupt_transfer(hid->int_in, report, 8, 10);
-    } else {
-        /* Fallback: HID GET_REPORT class request over EP0
+    }
+
+    if (len <= 0) {
+        /* GET_REPORT class request over EP0 (HID spec §7.2.1).
          * bmRequestType=0xA1 (IN|Class|Interface), bRequest=1 (GET_REPORT)
-         * wValue=0x0100 (Input report type, report ID 0)                    */
+         * wValue=0x0100 (Input report, report ID 0)                        */
         len = usb_control_transfer(hid->dev,
                                    0xA1, 0x01, 0x0100,
                                    hid->intf->bInterfaceNumber,
                                    report, 8, 100);
+
+        /* boot179: log the first GET_REPORT result per device so we know
+         * whether the dongle supports it (len>0) or rejects it (len<=0).   */
+        if (!hid->get_report_warned) {
+            hid->get_report_warned = 1;
+            debug_print("[HID] GET_REPORT proto=0x%02x first result: len=%d%s\n",
+                        hid->protocol, len,
+                        len > 0 ? " (OK)" : " (device may not support GET_REPORT)");
+        }
     }
 
     if (len > 0) {

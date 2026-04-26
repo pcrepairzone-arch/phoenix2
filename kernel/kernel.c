@@ -22,6 +22,7 @@
 #include "kernel.h"
 #include "errno.h"
 #include "error.h"
+#include "../drivers/gpu/framebuffer.h"  /* con_printf() */
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations for subsystem init functions                  */
@@ -95,11 +96,13 @@ void kernel_main(uint64_t dtb_ptr)
     device_tree_parse(dtb_ptr);
     nr_cpus = detect_nr_cpus();
     debug_print("      CPUs detected: %d\n", nr_cpus);
+    con_printf("  CPU:    %d cores  1024 MB RAM\n", nr_cpus);
 
     /* [3/9] MMU */
     debug_print("[3/9] MMU...\n");
     mmu_init();
     debug_print("MMU ready\n");
+    con_printf("  MMU:    identity map  caches on\n");
 
     /* [4/9] Scheduler — data structures only, no tasks yet.
      * task_create() uses spin_lock_irqsave which restores DAIF, potentially
@@ -139,6 +142,7 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("[IRQ] CPU IRQs unmasked (DAIF.I cleared)\n");
 
     debug_print("IRQ/Timer ready\n");
+    con_printf("  IRQ:    GIC-400  Timer ready\n");
 
     /* Now safe to create the idle task (IRQs are masked/managed) */
     debug_print("Creating idle task...\n");
@@ -150,18 +154,23 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("\n[7/10] PCI bus...\n");
     pci_init();
     debug_print("PCI ready\n");
+    con_printf("  PCI:    VL805 xHCI online\n");
 
     /* [8/10] USB subsystem */
     debug_print("\n[8/10] USB subsystem...\n");
     usb_init();
     debug_print("USB ready\n");
+    con_printf("  USB:    xHCI + DWC2 ready\n");
 
     /* [9/10] MMC / SD card */
     debug_print("\n[9/10] MMC / SD card...\n");
-    if (mmc_init() == 0)
+    if (mmc_init() == 0) {
         debug_print("MMC ready\n");
-    else
+        con_printf("  MMC:    eMMC online\n");
+    } else {
         debug_print("MMC: no card or init failed (continuing)\n");
+        con_printf("  MMC:    no card\n");
+    }
 
     /* [10/10] VFS + Network + Signals */
     debug_print("\n[10/10] VFS / Network / Signals...\n");
@@ -171,8 +180,14 @@ void kernel_main(uint64_t dtb_ptr)
     register_default_handlers();
     debug_print("Subsystems ready\n");
 
+    /* Final screen status */
+    con_printf("\n");
+    con_printf("  --------------------------------\n");
+    con_printf("  Boot complete\n");
+    con_printf("  --------------------------------\n");
+
     debug_print("\n========================================\n");
-    debug_print("  Boot complete – launching init\n");
+    debug_print("  Boot complete - launching init\n");
     debug_print("========================================\n\n");
 
     /* Create the init task and start scheduling */

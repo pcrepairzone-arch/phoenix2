@@ -193,6 +193,7 @@ static int evt_ring_poll(uint32_t ev[4]);
 #define TRB_TYPE_LINK        6
 #define TRB_TYPE_ENABLE_SLOT 9
 #define TRB_TYPE_NOOP_CMD   23  /* xHCI §6.4.3.9 Command No-op — MCU keepalive ping */
+#define TRB_TYPE_RESET_EP   14  /* xHCI §6.4.3.8 Reset Endpoint — Halted → Stopped  */
 #define TRB_TYPE_PORT_CHNG_EVT 34
 
 #define CC_SUCCESS          1
@@ -1948,7 +1949,8 @@ int xhci_init(void *base_addr) {
 
 /* ── DMA extension + full enumeration functions (from your original) ─────── */
 /* boot147: per-slot DMA memory layout — SLOT_STRIDE bytes per slot, slots 1..MAX_SLOTS_ALLOC.
- * Base: 0x22000; top: 0x22000 + 4×0x1000 = 0x26000 < 0x42000 DMA budget.
+ * boot178: expanded from 4 → 8 slots to support keyboard + mouse hotplug.
+ * Base: 0x22000; top: 0x22000 + 8×0x1000 = 0x2A000 < 0x42000 DMA budget.
  * Within each SLOT_STRIDE block:
  *   +SLOT_INPUT_CTX_OFF  input context  (34 × CTX_SIZE = 1088 bytes)
  *   +SLOT_OUT_CTX_OFF    output context (32 × CTX_SIZE = 1024 bytes)
@@ -1957,7 +1959,7 @@ int xhci_init(void *base_addr) {
  * Old single-slot DMA_INPUT/OUT/EP0_RING/EP0_DATA_OFF constants removed.   */
 #define DMA_SLOTS_BASE_OFF   0x22000
 #define SLOT_STRIDE          0x1000
-#define MAX_SLOTS_ALLOC      4
+#define MAX_SLOTS_ALLOC      8        /* boot178: was 4; 8 supports hub+MSC+MSC+KBD+MOUSE+3spare */
 #define SLOT_INPUT_CTX_OFF   0x000
 #define SLOT_OUT_CTX_OFF     0x500
 #define SLOT_EP0_RING_OFF    0x900
@@ -1966,13 +1968,14 @@ int xhci_init(void *base_addr) {
 #define EP0_RING_TRBS  64
 
 /* boot159: per-slot bulk endpoint transfer rings.
- * Layout from 0x26000 (just above the 4 per-slot blocks ending at 0x26000).
+ * boot178: base moved from 0x26000 → 0x2A000 to make room for 8 per-slot blocks.
+ * Layout from 0x2A000 (just above the 8 per-slot blocks ending at 0x2A000).
  * Each slot gets BULK_STRIDE = 0x2000 (8KB):
  *   +0x000  Bulk OUT ring  (BULK_RING_TRBS × 16 = 1024 B)
  *   +0x400  Bulk IN  ring  (BULK_RING_TRBS × 16 = 1024 B)
  *   +0x800  DMA bounce buf (6144 B — covers 4K-native sectors)
- * 4 slots × 0x2000 = 0x8000 → tops at 0x2E000 < 0x42000 DMA budget. */
-#define DMA_BULK_BASE_OFF    0x26000
+ * 8 slots × 0x2000 = 0x10000 → tops at 0x3A000 < 0x42000 DMA budget. */
+#define DMA_BULK_BASE_OFF    0x2A000
 #define BULK_STRIDE          0x2000
 #define BULK_OUT_RING_OFF    0x000
 #define BULK_IN_RING_OFF     0x400
@@ -2811,7 +2814,7 @@ int xhci_scan_ports(void) {
  *   - Stores slot_id in ep->slot_id so xhci_bulk_transfer can find it
  *   - Builds the endpoint context (EP type, MPS, ring pointer)
  * Issues Configure Endpoint TRB (type 12) and waits for CCE.             */
-static int xhci_configure_endpoints(usb_device_t *dev)
+int xhci_configure_endpoints(usb_device_t *dev)
 {
     uint8_t slot_id = (uint8_t)(uintptr_t)dev->hcd_private;
     if (slot_id == 0 || slot_id > MAX_SLOTS_ALLOC) return -1;
@@ -2943,6 +2946,61 @@ static int xhci_configure_endpoints(usb_device_t *dev)
     }
     uart_puts("[xHCI] ConfigureEP: OK\n");
     return 0;
+}
+
+/*
+ * xhci_ep_recover — recover a USB mass storage device's bulk endpoints.
+ *
+ * Called after a bulk transfer fails with CC=4 (USB Transaction Error), which
+ * leaves the xHCI endpoint in "Halted" state and the BOT state machine broken.
+ *
+ * Recovery sequence (USB MSC BOT spec §5.3.4):
+ *   1. RESET ENDPOINT (xHCI command) for each bulk endpoint: Halted → Stopped
+ *   2. Re-zero bulk transfer rings and reset software cycle/enq state
+ *   3. CONFIGURE ENDPOINT with fresh rings: Stopped → Running
+ *
+ * The device-side CLEAR_HALT and BOT Mass Storage Reset are issued via EP0
+ * (control transfers) by the MSC layer before calling this function.
+ */
+int xhci_ep_recover(usb_device_t *dev)
+{
+    uint8_t slot_id = (uint8_t)(uintptr_t)dev->hcd_private;
+    if (slot_id == 0 || slot_id > MAX_SLOTS_ALLOC) return -1;
+
+    uart_puts("[xHCI] EP recover: slot="); print_hex32(slot_id); uart_puts("\n");
+
+    /* Issue RESET ENDPOINT for every bulk endpoint belonging to this device */
+    for (int ii = 0; ii < dev->num_interfaces; ii++) {
+        usb_interface_t *intf = &dev->interfaces[ii];
+        for (int ei = 0; ei < intf->endpoint_count; ei++) {
+            usb_endpoint_t *ep = &intf->endpoints[ei];
+            if ((ep->bmAttributes & 0x03) != 0x02) continue;  /* bulk only */
+            uint8_t ep_num = ep->bEndpointAddress & 0x0F;
+            uint8_t dir_in = (ep->bEndpointAddress & 0x80) ? 1u : 0u;
+            uint8_t dci    = (uint8_t)(ep_num * 2u + dir_in);
+
+            uart_puts("[xHCI] RESET_EP: dci="); print_hex32(dci); uart_puts("\n");
+            cmd_ring_submit(0, 0, 0, TRB_TYPE_RESET_EP,
+                            ((uint32_t)slot_id << 24) | ((uint32_t)dci << 16));
+
+            /* Wait for Command Completion Event */
+            uint32_t ev[4];
+            uint32_t dl = get_time_ms() + 500U;
+            int got = 0;
+            while (get_time_ms() < dl) {
+                if (xhci_wait_event(ev, 20) != 0) break;
+                if (((ev[3] >> 10) & 0x3FU) == 0x21U) {
+                    uint8_t cc = (ev[2] >> 24) & 0xFF;
+                    uart_puts("[xHCI] RESET_EP cc="); print_hex32(cc); uart_puts("\n");
+                    got = 1; break;
+                }
+            }
+            if (!got) uart_puts("[xHCI] RESET_EP: timeout\n");
+        }
+    }
+
+    /* Re-configure all bulk endpoints with fresh rings (resets rings too) */
+    return xhci_configure_endpoints(dev);
 }
 
 /*
@@ -3286,10 +3344,13 @@ int xhci_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout)
 
     (*enq_p)++;
     if (*enq_p >= BULK_RING_TRBS - 1) {
-        *enq_p    = 0;
-        *cycle_p ^= 1u;
+        *enq_p = 0;
+        /* Write Link TRB with the CURRENT cycle bit so hardware matches CCS,
+         * then toggle cycle for subsequent TRBs (boot189 fix: was toggling
+         * before writing, giving hardware the wrong cycle bit on every wrap). */
         uint32_t li = (BULK_RING_TRBS - 1) * 4;
         ring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (*cycle_p);
+        *cycle_p ^= 1u;
     }
 
     /* Ring doorbell for this slot's endpoint */
@@ -3492,4 +3553,62 @@ void xhci_irq_handler(int vector, void *data) {
  * Called by pci.c xhci_setup_msi() to compute the PCIe MSI target address. */
 uint64_t xhci_dma_phys(void) {
     return (uint64_t)virt_to_phys((void *)xhci_dma_buf);
+}
+
+/*
+ * xhci_check_hotplug — drain the event ring for Port Status Change Events.
+ *
+ * Called from the wimp_task main loop (boot178) when no bulk/control
+ * transfers are in flight.  The event ring is safe to consume here because
+ * we are single-threaded polled: all prior transfers have already consumed
+ * their completion events before wimp_task runs.
+ *
+ * For each PSCE (TRB type 0x22 = 34):
+ *   – Extract the root-hub port number from DW2 bits[31:24]
+ *   – Read PORTSC to see whether a device connected or disconnected
+ *   – Clear the change bits (W1C via PORTSC_WIC)
+ *   – On connect: call enumerate_port() to enumerate the new device
+ *   – On disconnect: log (full slot teardown is future work)
+ *
+ * Returns number of PSCE events processed.
+ */
+int xhci_check_hotplug(void)
+{
+    if (!xhci_ctrl.initialized) return 0;
+
+    uint32_t ev[4];
+    int found = 0;
+
+    while (evt_ring_poll(ev)) {
+        uint32_t type = (ev[3] >> 10) & 0x3FU;
+        if (type != 0x22U) {
+            /* Not a PSCE — discard (unexpected mid-idle event) */
+            continue;
+        }
+
+        /* PSCE: port number is in DW2 bits[31:24], 1-indexed */
+        uint32_t port1 = (ev[2] >> 24) & 0xFFU;
+        if (port1 == 0 || port1 > (uint32_t)xhci_ctrl.max_ports) continue;
+        int port0 = (int)(port1 - 1u);   /* 0-indexed for enumerate_port() */
+
+        void    *op     = xhci_ctrl.op_regs;
+        uint32_t portsc = readl(op + 0x400 + port0 * 0x10);
+
+        /* Clear all W1C change bits, preserve PP and other RW bits */
+        writel((portsc & ~(PORTSC_CCS | PORTSC_PED)) | PORTSC_WIC,
+               op + 0x400 + port0 * 0x10);
+        asm volatile("dsb sy" ::: "memory");
+
+        if (portsc & PORTSC_CCS) {
+            uart_puts("[USB] Root-hub hotplug: device connected on port ");
+            print_hex32(port1); uart_puts("\n");
+            enumerate_port(port0);
+        } else {
+            uart_puts("[USB] Root-hub hotplug: device disconnected from port ");
+            print_hex32(port1); uart_puts("\n");
+            /* TODO: Disable Slot + free device resources (future work) */
+        }
+        found++;
+    }
+    return found;
 }

@@ -19,11 +19,14 @@ void fb_mark_ready(void)  { _fb_up = 1; }
 void fb_mark_unready(void){ _fb_up = 0; }
 
 static void _put(char c) {
-    /* Always send to UART */
+    /* Always send to UART only.
+     * boot169: removed the automatic debug_print→con_putc mirror.
+     * Hundreds of xHCI/USB/FAT32 diagnostic lines were flooding the
+     * screen and making it unreadable.  Screen output is now produced
+     * only by explicit con_printf() calls at key boot milestones.    */
     if (c == '\n') uart_putc('\r');
     uart_putc(c);
-    /* Mirror to screen console once framebuffer is up */
-    if (_fb_up) con_putc(c);
+    (void)_fb_up;   /* suppress unused-variable warning */
 }
 
 /* Real debug print with UART */
@@ -202,9 +205,104 @@ int strncmp(const char *s1, const char *s2, size_t n) {
 void pci_scan_bus(void) {}
 void vfs_init(void) {}
 void net_init(void) {}
-void wimp_task(void)  { while(1) { __asm__ volatile("wfe"); } }
-void paint_task(void) { while(1) { __asm__ volatile("wfe"); } }
-void netsurf_task(void) { while(1) { __asm__ volatile("wfe"); } }
+
+/*
+ * wimp_task — main desktop/input polling loop (boot178).
+ *
+ * Replaces the bare WFE stub with a real service loop:
+ *   • hid_poll_all()    — reads HID boot-protocol reports (keyboard + mouse)
+ *   • hub_poll_hotplug() — checks for USB devices plugged into the hub
+ *   • xhci_check_hotplug() — processes root-hub PSCE events
+ *
+ * HID is polled every iteration (~yield cadence ≈ 10 ms).
+ * Hotplug is rate-limited to every 500 ms to avoid flooding the bus with
+ * GET_PORT_STATUS control transfers.
+ */
+
+/* ARM system counter: CNTPCT_EL0 / CNTFRQ_EL0, gives milliseconds */
+static inline uint32_t wimp_ms(void) {
+    uint64_t cnt, freq;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    return (uint32_t)(cnt / (freq / 1000ULL));
+}
+
+void wimp_task(void)
+{
+    extern int  hid_poll_all(void)               __attribute__((weak));
+    extern void hub_poll_hotplug(void)           __attribute__((weak));
+    extern int  xhci_check_hotplug(void)         __attribute__((weak));
+    extern void mouse_get_pos(int16_t *x,
+                              int16_t *y)        __attribute__((weak));
+    extern void cursor_init(void)                __attribute__((weak));
+    extern void cursor_update(int x, int y)      __attribute__((weak));
+    extern void con_puts(const char *s)          __attribute__((weak));
+
+    /* boot179: Initialise mouse cursor and place it at the starting
+     * mouse position (mouse_init() sets this to (640,360)).         */
+    if (cursor_init) cursor_init();
+    int16_t last_mx = 640, last_my = 360;
+    if (mouse_get_pos && cursor_update) {
+        mouse_get_pos(&last_mx, &last_my);
+        cursor_update((int)last_mx, (int)last_my);
+    }
+
+    debug_print("[WIMP] task running — cursor at (%d,%d)\n",
+                (int)last_mx, (int)last_my);
+
+    /* keyboard_poll: drain the RISC OS keyboard event ring */
+    extern int keyboard_poll(void *ev) __attribute__((weak));
+
+    /* Print a prompt so the user knows the console is live */
+    if (con_puts) con_puts("\n[ESC to stop loop]\n> ");
+    uint32_t last_hotplug = wimp_ms();
+
+    while (1) {
+        /* ── HID input: keyboard + mouse (every loop) ─────────────────── */
+        if (hid_poll_all) hid_poll_all();
+
+        /* ── Keyboard events: drain queue, break on ESC ───────────────── */
+        if (keyboard_poll) {
+            /* keyboard_event_t is { uint8_t key_code, key_char, modifiers } */
+            uint8_t ev[4];
+            while (keyboard_poll(ev)) {
+                uint8_t kchar = ev[1];  /* key_char at offset 1 */
+                if (kchar == 0x1B) {    /* ESC key */
+                    if (con_puts) con_puts("\n[Loop stopped by ESC]\n");
+                    debug_print("[WIMP] ESC pressed — loop halted\n");
+                    goto loop_exit;
+                }
+            }
+        }
+
+        /* ── Mouse cursor: update position if moved ───────────────────── */
+        if (mouse_get_pos && cursor_update) {
+            int16_t mx, my;
+            mouse_get_pos(&mx, &my);
+            if (mx != last_mx || my != last_my) {
+                last_mx = mx;
+                last_my = my;
+                cursor_update((int)mx, (int)my);
+            }
+        }
+
+        /* ── USB hotplug: rate-limited to once per 500 ms ─────────────── */
+        uint32_t now = wimp_ms();
+        if ((now - last_hotplug) >= 500u) {
+            last_hotplug = now;
+            if (hub_poll_hotplug)   hub_poll_hotplug();
+            if (xhci_check_hotplug) xhci_check_hotplug();
+        }
+
+        yield();
+    }
+loop_exit:
+    /* Cursor stays at current position; system idles in WFE */
+    while (1) { __asm__ volatile("wfe"); }
+}
+
+void paint_task(void)    { while(1) { __asm__ volatile("wfe"); } }
+void netsurf_task(void)  { while(1) { __asm__ volatile("wfe"); } }
 
 void mmu_free_pagetable(task_t *task) { (void)task; }
 void mmu_free_usermemory(task_t *task) { (void)task; }

@@ -12,6 +12,15 @@
 /* Global MMC state - keep it simple */
 static mmc_host_t mmc_host;
 
+/* ── Wall-clock helper (CNTPCT_EL0, 54 MHz on BCM2711) ────────────────────
+ * Matches get_time_ms() in usb_xhci.c — copied here to avoid a cross-driver
+ * dependency.  Returns low 32 bits of elapsed ms; wraps every ~49 days.    */
+static inline uint32_t mmc_time_ms(void) {
+    uint64_t v;
+    asm volatile("isb; mrs %0, cntpct_el0" : "=r"(v) :: "memory");
+    return (uint32_t)(v / 54000ULL);
+}
+
 /* Direct MMIO access - no ioremap needed */
 #define MMIO_READ(addr)   (*(volatile uint32_t*)(addr))
 #define MMIO_WRITE(addr, val) (*(volatile uint32_t*)(addr) = (val))
@@ -555,7 +564,32 @@ int mmc_init(void)
         debug_print("MMC: Failed to set block size\n");
         return -1;
     }
-    
+
+    /* boot166: raise SD clock from init speed (~390 KHz) to 25 MHz for
+     * data transfers.  At 390 KHz a 512-byte block takes ~10 ms to
+     * transfer, but the PIO read-ready loop only spun ~0.07 ms — the
+     * buffer-read-ready bit never had time to set before timeout.
+     *
+     * Sequence (SDHCI spec §3.2.3):
+     *   1. Clear SD Clock Enable (bit 2) — stop clock while changing divider.
+     *   2. Write new SDCLK_FREQ_SEL.
+     *   3. Wait for Internal Clock Stable (bit 1).
+     *   4. Set SD Clock Enable (bit 2) again.
+     *
+     * BCM2711 EMMC2 base clock = 200 MHz.
+     * SDCLK_FREQ_SEL = 4 → 200 MHz / 8 = 25 MHz (Normal Speed, safe for all SD).
+     * Writing 0x0401: bits[15:8]=0x04 (SEL), bit0=1 (Internal Clock Enable).    */
+    sdhci_write16(SDHCI_CLOCK_CONTROL,
+                  sdhci_read16(SDHCI_CLOCK_CONTROL) & ~0x0004u);  /* SD CLK off */
+    sdhci_write16(SDHCI_CLOCK_CONTROL, 0x0401u);                  /* SEL=4, ICS EN */
+    {
+        int ics_wait = 10000;
+        while (!(sdhci_read16(SDHCI_CLOCK_CONTROL) & 0x0002u) && ics_wait-- > 0);
+    }
+    sdhci_write16(SDHCI_CLOCK_CONTROL,
+                  sdhci_read16(SDHCI_CLOCK_CONTROL) | 0x0004u);   /* SD CLK on */
+    debug_print("MMC: Clock raised to 25 MHz for data transfer\n");
+
     /* Register with the block device layer — see mmc_bd_* below */
     blockdev_t *bd = blockdev_register("mmc", mmc_host.capacity, 512);
     if (bd) {
@@ -604,33 +638,42 @@ int mmc_read_blocks(uint32_t start_block, uint32_t num_blocks, void *buffer)
     
     /* Read data via PIO */
     for (uint32_t block = 0; block < num_blocks; block++) {
-        /* Wait for buffer read ready */
-        int timeout = 100000;
-        while (!(sdhci_read(SDHCI_INT_STATUS) & 0x20) && timeout > 0) {
-            timeout--;
+        /* Wait for Buffer Read Ready (INT_STATUS bit 5 = 0x20).
+         * boot166: use wall-clock ms timeout — the old iteration-count loop
+         * (~0.07 ms) expired before the buffer was ready at any clock speed.
+         * 200 ms is generous; at 25 MHz a 512-byte block arrives in ~0.16 ms. */
+        uint32_t brr_deadline = mmc_time_ms() + 200u;
+        while (!(sdhci_read(SDHCI_INT_STATUS) & 0x20u)) {
+            if (mmc_time_ms() > brr_deadline) {
+                debug_print("MMC: Read timeout (BRR not set)\n");
+                return -1;
+            }
+            /* Also abort on error interrupt */
+            if (sdhci_read(SDHCI_INT_STATUS) & 0x8000u) {
+                debug_print("MMC: Read error (INT_STATUS error bit)\n");
+                sdhci_write(SDHCI_INT_STATUS, 0xFFFFFFFFu);
+                return -1;
+            }
         }
-        
-        if (timeout == 0) {
-            debug_print("MMC: Read timeout\n");
-            return -1;
-        }
-        
-        /* Read 512 bytes (128 words) */
+
+        /* Read 512 bytes (128 × 32-bit words) */
         for (int i = 0; i < 128; i++) {
             *buf++ = sdhci_read(SDHCI_BUFFER);
         }
-        
-        /* Clear buffer read ready */
-        sdhci_write(SDHCI_INT_STATUS, 0x20);
+
+        /* Clear Buffer Read Ready */
+        sdhci_write(SDHCI_INT_STATUS, 0x20u);
     }
-    
-    /* Wait for transfer complete */
-    int timeout = 100000;
-    while (!(sdhci_read(SDHCI_INT_STATUS) & 0x02) && timeout > 0) {
-        timeout--;
+
+    /* Wait for Transfer Complete (INT_STATUS bit 1 = 0x02) */
+    uint32_t tc_deadline = mmc_time_ms() + 500u;
+    while (!(sdhci_read(SDHCI_INT_STATUS) & 0x02u)) {
+        if (mmc_time_ms() > tc_deadline) {
+            debug_print("MMC: Transfer complete timeout\n");
+            return -1;
+        }
     }
-    
-    sdhci_write(SDHCI_INT_STATUS, 0x02);  /* Clear transfer complete */
+    sdhci_write(SDHCI_INT_STATUS, 0x02u);  /* Clear transfer complete */
     
     return 0;
 }

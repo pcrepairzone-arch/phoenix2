@@ -138,6 +138,14 @@ xhci_controller_t *xhci_get_controller(void);
  */
 int xhci_scan_ports(void);
 
+/*
+ * xhci_check_hotplug — poll the event ring for Port Status Change Events.
+ * Call from the main kernel idle/WIMP loop.  Safe when no transfers in flight.
+ * Returns number of PSCE events processed (0 = nothing changed).
+ * boot178: added for USB hot-plug / hot-unplug detection.
+ */
+int xhci_check_hotplug(void);
+
 /* ── USB Core HCD ops callbacks ─────────────────────────────────────────────
  * Registered automatically by xhci_init() via usb_register_hc().
  * External code should use usb_control_transfer() etc. in usb_core.c rather
@@ -220,5 +228,30 @@ int xhci_enumerate_device(usb_device_t *dev, int port);
  */
 int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
                              uint32_t dev_speed);
+
+/**
+ * @brief Re-configure bulk endpoint rings after a transfer failure.
+ *
+ * Issues RESET ENDPOINT (Halted → Stopped) for each bulk endpoint in @dev,
+ * then CONFIGURE ENDPOINT with fresh rings (Stopped → Running).
+ * Call after BOT Mass Storage Reset and CLEAR_HALT (via usb_control_transfer)
+ * to fully recover from a CC=4 (USB Transaction Error) bulk failure.
+ *
+ * @param dev   USB device whose bulk endpoints need recovery
+ * @return 0 on success, -1 on failure
+ */
+int xhci_ep_recover(usb_device_t *dev);
+
+/**
+ * @brief Configure all bulk endpoints for a USB device.
+ *
+ * Sets up xHCI endpoint contexts and transfer rings for every bulk endpoint
+ * found in the device's interface list.  Called during device enumeration and
+ * after endpoint recovery.
+ *
+ * @param dev   USB device to configure
+ * @return 0 on success, -1 on failure
+ */
+int xhci_configure_endpoints(usb_device_t *dev);
 
 #endif /* USB_XHCI_H */
