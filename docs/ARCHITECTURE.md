@@ -26,3 +26,4 @@ The codebase is written in C with minimal AArch64 assembler for boot, exceptions
 0x00100000 +               Kernel heap (kernel_malloc)
                            Task stacks, VFS buffers, driver buffers
 ```
+```
