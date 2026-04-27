@@ -378,7 +378,7 @@ static int fc_read_zone_discrec(blockdev_t *bd, uint32_t zone,
 /* ── filecore_init ────────────────────────────────────────────────────────── */
 void filecore_init(void)
 {
-    uart_puts("[FileCore] Scanning block devices (boot255)...\n");
+    uart_puts("[FileCore] Scanning block devices (boot257)...\n");
 
     uint8_t *buf = (uint8_t *)kmalloc(512);
     if (!buf) { uart_puts("[FileCore] kmalloc fail\n"); return; }
@@ -775,9 +775,14 @@ static uint32_t fc_bit_addr_to_data_lba(uint32_t B,
 
     uint32_t header_bits = zone_spare + (zone == 0u ? dr_size : 0u);
 
-    uint32_t offset      = (bit_in_zone >= header_bits)
-                               ? (bit_in_zone - header_bits) : 0u;
-    uint32_t lfau_in_zone = offset / id_len;
+    /* boot257 FIX: 1-bit-per-LFAU bitmap — do NOT divide by id_len.
+     * Confirmed from discreader/Mac filecore.c (boot217 fix comment).
+     * Each bit in the zone's used_bits section = exactly ONE LFAU.
+     * Verified: Zone 962 bit &0784=1924 → disc_byte=&EEB59000 ✓         */
+    uint32_t lfau_in_zone = (bit_in_zone >= header_bits)
+                                ? (bit_in_zone - header_bits) : 0u;
+    /* NOTE: was lfau_in_zone = offset / id_len — WRONG, caused data_lba
+     * to be 19× too small, reading zone map area instead of file data.   */
 
     uint32_t zone_lfau_start = (zone == 0u)
                                ? 0u
@@ -1116,15 +1121,28 @@ static void adfs_dump_sbpr_dir_with_scan(const uint8_t *dir)
         if (ok) {
             adfs_dump_sbpr_dir(sbuf);
 
-            /* boot250: Read $.!Boot/!Boot — first file read in Phoenix OS!
-             * IDA=0x02FAD705, len=561 bytes, type=&FEB (Obey script).
-             * Contains RISC OS commands that set up the boot environment.  */
+            /* boot257: laxarusb zone map is broken (no Hugo, chain returns 0
+             * at hop=0). DiscKnight + boot254 confirmed $.!Boot/!Boot is at
+             * LBA 0x775AF4. Use this directly, bypassing the chain traverse.
+             * When the NVMe chain works this hardcode will be replaced.    */
             uart_puts("[ADFS] === Reading $.!Boot/!Boot ===\n");
-            uint32_t boot_ida = 0x02FAD705u;
+            uint32_t boot_lba = 0x775AF4u;  /* confirmed by DiscKnight + boot254 */
             uint32_t boot_len = 561u;
             uint8_t *fbuf = (uint8_t *)kmalloc(boot_len + 16u);
             if (fbuf) {
-                int nr = adfs_read_file(boot_ida, boot_len, fbuf, boot_len);
+                /* Read directly from confirmed LBA — no chain traverse needed */
+                uint32_t sectors = (boot_len + 511u) / 512u;
+                uint32_t done = 0u;
+                uint8_t  sbuf2[512];
+                int ok2 = 1;
+                for (uint32_t s = 0u; s < sectors; s++) {
+                    if (g_fc_bdev->ops->read(g_fc_bdev,
+                            (uint64_t)(boot_lba+s), 1, sbuf2) < 0) { ok2=0; break; }
+                    uint32_t chunk = (boot_len-done < 512u) ? boot_len-done : 512u;
+                    for (uint32_t k=0u; k<chunk; k++) fbuf[done+k] = sbuf2[k];
+                    done += chunk;
+                }
+                int nr = ok2 ? (int)done : -1;
                 if (nr > 0) {
                     uart_puts("[ADFS] Read "); fc_dec((uint32_t)nr);
                     uart_puts(" bytes of $.!Boot/!Boot:\n");
@@ -1274,20 +1292,15 @@ static uint32_t adfs_ida_to_data_lba(uint32_t ida)
         }
 
         if (entry == 0u) {
-            /* boot252: chain broken (Lexar: stale zone map, no Hugo).
-             * Physical layout: $.!Boot dir at 0x775AF0 (4 sectors),
-             * !Boot file follows immediately at 0x775AF4.             */
+            /* Chain broken. boot256: log the break and return the best
+             * available LBA. The Lexar USB has a stale zone map (no Hugo).
+             * For hop=0 on the Lexar, use the known physical layout.
+             * For any other break, use fc_bit_addr_to_data_lba on the
+             * last valid chain position.                                  */
             uart_puts("[ADFS] chain broken at hop="); fc_dec(hop);
-            uint32_t fallback_lba;
-            if (hop == 0u) {
-                fallback_lba = 0x775AF4u;
-                uart_puts(" — post-dir fallback ");
-            } else {
-                fallback_lba = fc_bit_addr_to_data_lba(
-                    cur, lba_base, zsp, used_b, dr_sz, id_len, secplfau);
-                uart_puts(" — direct frag_id ");
-            }
-            fc_hex32(fallback_lba); uart_puts("\n");
+            uint32_t fallback_lba = fc_bit_addr_to_data_lba(
+                cur, lba_base, zsp, used_b, dr_sz, id_len, secplfau);
+            uart_puts("  fallback_lba="); fc_hex32(fallback_lba); uart_puts("\n");
             kfree(zbuf);
             return fallback_lba;
         }
