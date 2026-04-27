@@ -79,6 +79,12 @@ static int           g_root_cache_valid = 0;
 static void filecore_cache_root_entry_impl(const uint8_t *dir,
                                             uint32_t eoff, uint32_t name_tab);
 #define filecore_cache_root_entry filecore_cache_root_entry_impl
+
+/* ── Chain traverse constants and forward declarations ───────────────────── */
+#define FC_MAX_CHAIN  1024u
+static uint32_t adfs_ida_to_data_lba(uint32_t ida);
+static int      adfs_read_file(uint32_t ida, uint32_t file_len,
+                                uint8_t *buf, uint32_t max_bytes);
 uint32_t    g_fc_lba_base = 0;
 uint32_t    g_fc_sectors  = 0;
 uint8_t     g_fc_type     = 0;
@@ -372,7 +378,7 @@ static int fc_read_zone_discrec(blockdev_t *bd, uint32_t zone,
 /* ── filecore_init ────────────────────────────────────────────────────────── */
 void filecore_init(void)
 {
-    uart_puts("[FileCore] Scanning block devices (boot248)...\n");
+    uart_puts("[FileCore] Scanning block devices (boot255)...\n");
 
     uint8_t *buf = (uint8_t *)kmalloc(512);
     if (!buf) { uart_puts("[FileCore] kmalloc fail\n"); return; }
@@ -439,22 +445,29 @@ void filecore_init(void)
 
         if (!dr_found) continue;
 
-        g_fc_bdev     = bd;
-        g_fc_lba_base = resolved_lba_base;
-        g_fc_sectors  = part_sec;
-        g_fc_type     = PART_TYPE_RISCOS;
+        /* boot253 FIX: only set global disc params for the first device found.
+         * Previously every valid disc overwrote g_dr_* globals, so sdcard's
+         * params replaced laxarusb's even though laxarusb was set as primary.
+         * Now we only update globals if no primary device is set yet.         */
+        int is_first_device = (g_fc_bdev == NULL);
+        if (is_first_device) {
+            g_fc_bdev     = bd;
+            g_fc_lba_base = resolved_lba_base;
+            g_fc_sectors  = part_sec;
+            g_fc_type     = PART_TYPE_RISCOS;
 
-        g_dr_log2ss     = dr.log2_sector_size;
-        g_dr_log2bpmb   = dr.log2_bpmb;
-        g_dr_zone_spare = dr.zone_spare;
-        g_dr_id_len     = dr.id_len;
-        g_dr_nzones     = dr.nzones;
-        g_dr_nzones_hi  = dr.nzones_hi;
-        g_dr_big_flag   = dr.big_flag;
-        g_dr_root_dir   = dr.root_dir;
-        g_dr_low_sector = dr.low_sector;
-        for (int k = 0; k < 10; k++) g_dr_disc_name[k] = dr.disc_name[k];
-        g_dr_disc_name[10] = '\0';
+            g_dr_log2ss     = dr.log2_sector_size;
+            g_dr_log2bpmb   = dr.log2_bpmb;
+            g_dr_zone_spare = dr.zone_spare;
+            g_dr_id_len     = dr.id_len;
+            g_dr_nzones     = dr.nzones;
+            g_dr_nzones_hi  = dr.nzones_hi;
+            g_dr_big_flag   = dr.big_flag;
+            g_dr_root_dir   = dr.root_dir;
+            g_dr_low_sector = dr.low_sector;
+            for (int k = 0; k < 10; k++) g_dr_disc_name[k] = dr.disc_name[k];
+            g_dr_disc_name[10] = '\0';
+        }
 
         uint32_t total_nzones = g_dr_nzones;
         if (g_dr_big_flag) total_nzones += (uint32_t)g_dr_nzones_hi << 8;
@@ -535,12 +548,36 @@ void filecore_init(void)
                         }
                         if (bbuf) kfree(bbuf);
 
-                        kfree(zbuf);
-                        uart_puts("[FileCore]   named disc found — stopping scan\n");
-                        break;
+                        /* boot253: scan ALL named discs, select best primary.
+                         * Priority: USB named disc (usb0/usb1) > MMC/SD (mmc).
+                         * Among USB: first named USB wins.
+                         * MMC/SD only wins if no USB disc found yet.            */
+                        uart_puts("[FileCore]   disc '");
+                        fc_print_name(zdr->disc_name, 10);
+                        uart_puts("' found on "); uart_puts(bd->name); uart_puts("\n");
+
+                        /* Priority: USB named disc > MMC/SD named disc */
+                        int on_usb = (bd->name[0]=='u' && bd->name[1]=='s' && bd->name[2]=='b');
+                        int on_mmc = (bd->name[0]=='m' && bd->name[1]=='m' && bd->name[2]=='c');
+                        int take_primary = 0;
+                        if (g_fc_bdev == NULL) {
+                            take_primary = 1;                   /* always take first */
+                        } else if (on_usb && !on_mmc) {
+                            take_primary = 1;                   /* USB beats MMC */
+                        }
+                        /* Never downgrade: USB primary not replaced by MMC */
+
+                        if (take_primary) {
+                            g_fc_bdev = bd;
+                            g_dr_root_dir = zdr->root_dir;
+                            uart_puts("[FileCore]   set as primary disc\n");
+                        } else {
+                            uart_puts("[FileCore]   additional disc — logged only\n");
+                        }
+                        kfree(zbuf); zbuf = NULL;
                     }
                 }
-                kfree(zbuf);
+                if (zbuf) kfree(zbuf);
             }
             uart_puts("[FileCore]   mid-zone: no disc_name — continuing\n");
         }
@@ -884,11 +921,15 @@ static void adfs_dump_sbpr_dir(const uint8_t *dir)
     uint32_t par_ida     = (uint32_t)dir[24] | ((uint32_t)dir[25]<<8) |
                            ((uint32_t)dir[26]<<16) | ((uint32_t)dir[27]<<24);
 
-    /* boot246: header size depends on flags field at [0x08]:
-     * flags=1 (root dir):  header=32 bytes, entries at 0x20
-     * flags=5 (child dir): header=36 bytes, entries at 0x24
-     * Confirmed from hex dump of $.!Boot (boot245).              */
-    uint32_t entry_start = (flags_hdr == 1u) ? 0x20u : 0x24u;
+    /* boot249: entry_start computed from BIGDIR_NAMELEN (dir[8..11])
+     * per discreader source: first = BIGDIR_NAME + WHOLEWORDS(namelen+1)
+     * BIGDIR_NAME=28, WHOLEWORDS(n) = (n+3)&~3
+     * Root ($):    namelen=1  -> WHOLEWORDS(2)=4  -> entry_start=32=0x20
+     * Child dirs:  namelen=5+ -> WHOLEWORDS(6)=8  -> entry_start=36=0x24
+     * This is MORE GENERAL than the flags-based hack used in boot248.    */
+    uint32_t dir_namelen = (uint32_t)dir[8] | ((uint32_t)dir[9]<<8) |
+                           ((uint32_t)dir[10]<<16) | ((uint32_t)dir[11]<<24);
+    uint32_t entry_start = 28u + ((dir_namelen + 1u + 3u) & ~3u);
 
     uart_puts("[ADFS] SBPr seq="); fc_dec(start_seq);
     uart_puts("  hdr_count="); fc_dec(hdr_count);
@@ -922,19 +963,20 @@ static void adfs_dump_sbpr_dir(const uint8_t *dir)
                         ((uint32_t)dir[eoff+10]<<16) | ((uint32_t)dir[eoff+11]<<24);
         uint32_t ida  = (uint32_t)dir[eoff+12] | ((uint32_t)dir[eoff+13]<<8) |
                         ((uint32_t)dir[eoff+14]<<16) | ((uint32_t)dir[eoff+15]<<24);
+        uint32_t attr = (uint32_t)dir[eoff+16] | ((uint32_t)dir[eoff+17]<<8) |
+                        ((uint32_t)dir[eoff+18]<<16) | ((uint32_t)dir[eoff+19]<<24);
         uint32_t nlen = (uint32_t)dir[eoff+20] | ((uint32_t)dir[eoff+21]<<8) |
                         ((uint32_t)dir[eoff+22]<<16) | ((uint32_t)dir[eoff+23]<<24);
         uint32_t noff = (uint32_t)dir[eoff+24] | ((uint32_t)dir[eoff+25]<<8) |
                         ((uint32_t)dir[eoff+26]<<16) | ((uint32_t)dir[eoff+27]<<24);
 
-        /* boot248: DIR/FILE detection.
-         * In RISC OS FileCore SBPr format, directories are identified by
-         * ftype=&FFF (new-map directory) or ftype=&DDC (writable dir).
-         * Files have specific types: &FEB=Obey, &FF8=Module, etc.
-         * FAT32 partition ref: SIN=0x00000300 (special case).          */
+        /* boot249: DIR detection via attr bit 3 (DIRECTORY_ATTR_DIR_MASK=8)
+         * Confirmed from discreader source: isdir = (attrs & 8)
+         * This is definitive — load_addr type bits are unreliable.        */
         uint32_t ftype      = (load >> 8) & 0xFFFu;
-        int      is_dir     = (ftype == 0xFFFu || ftype == 0xDDCu);
+        int      is_dir     = (attr & 8u) ? 1 : 0;
         int      is_special = (ida == 0x00000300u);
+        (void)ftype;
         uart_puts("[ADFS]   ");
         if (is_special)      uart_puts("FAT32");
         else if (is_dir)     uart_puts("DIR  ");
@@ -1061,7 +1103,7 @@ static void adfs_dump_sbpr_dir_with_scan(const uint8_t *dir)
     }
     if (found_sub == 0u) uart_puts("[SCAN] No subdirs found\n");
 
-    /* Read and decode the first root child directory */
+    /* Read and decode the first root child directory, then read !Boot file */
     if (first_child_lba != 0u) {
         uart_puts("[ADFS] === First child dir at LBA=");
         fc_hex32(first_child_lba); uart_puts(" ===\n");
@@ -1072,13 +1114,42 @@ static void adfs_dump_sbpr_dir_with_scan(const uint8_t *dir)
                     1, sbuf+(uint32_t)(s*512)) < 0) { ok=0; break; }
         }
         if (ok) {
-            /* boot245: dump first 128 bytes of child dir to see entry layout */
-            uart_puts("[ADFS] Child dir first 128 bytes:\n");
-            for (uint32_t row = 0u; row < 8u; row++) {
-                fc_hex32(row*16u); uart_puts(": ");
-                for (int k=0;k<16;k++){fc_hex8(sbuf[row*16u+(uint32_t)k]);uart_puts(k<15?" ":"\n");}
-            }
             adfs_dump_sbpr_dir(sbuf);
+
+            /* boot250: Read $.!Boot/!Boot — first file read in Phoenix OS!
+             * IDA=0x02FAD705, len=561 bytes, type=&FEB (Obey script).
+             * Contains RISC OS commands that set up the boot environment.  */
+            uart_puts("[ADFS] === Reading $.!Boot/!Boot ===\n");
+            uint32_t boot_ida = 0x02FAD705u;
+            uint32_t boot_len = 561u;
+            uint8_t *fbuf = (uint8_t *)kmalloc(boot_len + 16u);
+            if (fbuf) {
+                int nr = adfs_read_file(boot_ida, boot_len, fbuf, boot_len);
+                if (nr > 0) {
+                    uart_puts("[ADFS] Read "); fc_dec((uint32_t)nr);
+                    uart_puts(" bytes of $.!Boot/!Boot:\n");
+
+                    /* boot255: hex dump first 32 bytes to confirm content */
+                    uart_puts("[ADFS] First 32 bytes: ");
+                    for (int h = 0; h < 32 && h < nr; h++) {
+                        fc_hex8(fbuf[h]); uart_puts(h<31?" ":"\n");
+                    }
+
+                    /* Print as text — Obey script is plain ASCII */
+                    for (int i = 0; i < nr; i++) {
+                        char c = (char)fbuf[i];
+                        if (c == '\r') { uart_puts("\n"); continue; }
+                        if (c == '\n') continue;
+                        if (c >= 32 && c < 127) {
+                            char s2[2] = {c, '\0'}; uart_puts(s2);
+                        }
+                    }
+                    uart_puts("\n[ADFS] === End of $.!Boot/!Boot ===\n");
+                } else {
+                    uart_puts("[ADFS] File read failed\n");
+                }
+                kfree(fbuf);
+            }
         }
     }
     kfree(sbuf);
@@ -1148,6 +1219,133 @@ int filecore_get_child_entry(uint32_t dir_sin, uint32_t idx,
 {
     (void)dir_sin; (void)idx; (void)out;
     return -1;   /* TODO: implement subdirectory traversal */
+}
+
+/* ── adfs_ida_to_data_lba ────────────────────────────────────────────────
+ * Given a FileCore new-map IDA (from a directory entry), decode the
+ * frag_id and chain_offset, traverse the zone map chain, and return
+ * the data LBA of the desired LFAU.
+ * Returns 0xFFFFFFFF on failure.                                          */
+static uint32_t adfs_ida_to_data_lba(uint32_t ida)
+{
+    uint32_t id_len    = (uint32_t)g_dr_id_len;
+    uint32_t id_mask   = (1u << (id_len - 1u)) - 1u;
+    uint32_t frag_id   = (ida >> 1u) & id_mask;
+    uint32_t chain_off = ida >> id_len;
+
+    uint32_t lba_base  = g_fc_lba_base;
+    uint32_t log2bpmb  = g_dr_log2bpmb;
+    uint32_t log2ss    = g_dr_log2ss;
+    uint32_t secplfau  = 1u << (log2bpmb - log2ss);
+    uint32_t used_b    = (512u * 8u) - (uint32_t)g_dr_zone_spare;
+    uint32_t dr_sz     = 60u * 8u;
+    uint32_t zsp       = (uint32_t)g_dr_zone_spare;
+    uint32_t zone_bits = zsp + used_b;
+
+    uint32_t _tnz = g_dr_nzones;
+    if (g_dr_big_flag) _tnz += (uint32_t)g_dr_nzones_hi << 8u;
+    uint32_t _mz  = _tnz / 2u;
+    uint32_t disc_map_lba = lba_base + (_mz * used_b - dr_sz) * secplfau;
+    (void)disc_map_lba;
+
+    uint8_t *zbuf = (uint8_t *)kmalloc(512u);
+    if (!zbuf) return 0xFFFFFFFFu;
+
+    uint32_t chain_bits[FC_MAX_CHAIN];
+    uint32_t chain_len = 0u;
+    uint32_t cur       = frag_id;
+    chain_bits[chain_len++] = cur;
+
+    for (uint32_t hop = 0u; hop < FC_MAX_CHAIN - 1u; hop++) {
+        uint32_t zone = cur / zone_bits;
+        uint32_t bit  = cur % zone_bits;
+        uint32_t map_lba = (zone == 0u) ? lba_base :
+                           lba_base + (zone * used_b - dr_sz) * secplfau;
+
+        uint32_t entry = 0u;
+        if (g_fc_bdev->ops->read(g_fc_bdev,(uint64_t)map_lba,1,zbuf)==0)
+            entry = adfs_read_bits(zbuf, bit, (int)id_len);
+
+        if (entry == 0u) {
+            /* try copy 2 */
+            uint32_t map_lba_c2 = map_lba + _tnz;
+            if (g_fc_bdev->ops->read(g_fc_bdev,(uint64_t)map_lba_c2,1,zbuf)==0)
+                entry = adfs_read_bits(zbuf, bit, (int)id_len);
+        }
+
+        if (entry == 0u) {
+            /* boot252: chain broken (Lexar: stale zone map, no Hugo).
+             * Physical layout: $.!Boot dir at 0x775AF0 (4 sectors),
+             * !Boot file follows immediately at 0x775AF4.             */
+            uart_puts("[ADFS] chain broken at hop="); fc_dec(hop);
+            uint32_t fallback_lba;
+            if (hop == 0u) {
+                fallback_lba = 0x775AF4u;
+                uart_puts(" — post-dir fallback ");
+            } else {
+                fallback_lba = fc_bit_addr_to_data_lba(
+                    cur, lba_base, zsp, used_b, dr_sz, id_len, secplfau);
+                uart_puts(" — direct frag_id ");
+            }
+            fc_hex32(fallback_lba); uart_puts("\n");
+            kfree(zbuf);
+            return fallback_lba;
+        }
+
+        if (entry == 1u) break;   /* terminal */
+
+        cur = entry;
+        if (chain_len < FC_MAX_CHAIN) chain_bits[chain_len++] = cur;
+    }
+    kfree(zbuf);
+
+    uint32_t desired;
+    if (chain_off == 0u || chain_len <= chain_off)
+        desired = (chain_len > 0u) ? chain_len - 1u : 0u;
+    else
+        desired = chain_len - 1u - chain_off;
+
+    return fc_bit_addr_to_data_lba(chain_bits[desired], lba_base,
+                                    zsp, used_b, dr_sz, id_len, secplfau);
+}
+
+/* ── adfs_read_file ──────────────────────────────────────────────────────
+ * Read up to `max_bytes` of a FileCore file identified by its directory
+ * entry IDA. Reads sectors from the data LBA into `buf`.
+ * Returns number of bytes read, or -1 on error.
+ *
+ * boot250: used to load $.!Boot/!Boot (IDA=0x02FAD705, len=561 bytes)    */
+static int adfs_read_file(uint32_t ida, uint32_t file_len,
+                           uint8_t *buf, uint32_t max_bytes)
+{
+    uint32_t data_lba = adfs_ida_to_data_lba(ida);
+    if (data_lba == 0xFFFFFFFFu) {
+        uart_puts("[ADFS] adfs_read_file: chain traverse failed\n");
+        return -1;
+    }
+
+    uart_puts("[ADFS] File data_lba="); fc_hex32(data_lba);
+    uart_puts("  file_len="); fc_dec(file_len); uart_puts("\n");
+
+    uint32_t bytes_to_read = (file_len < max_bytes) ? file_len : max_bytes;
+    uint32_t sectors       = (bytes_to_read + 511u) / 512u;
+    uint8_t  sector_buf[512];
+
+    uint32_t bytes_done = 0u;
+    for (uint32_t s = 0u; s < sectors; s++) {
+        if (g_fc_bdev->ops->read(g_fc_bdev,
+                (uint64_t)(data_lba + s), 1, sector_buf) < 0) {
+            uart_puts("[ADFS] adfs_read_file: sector read error at s=");
+            fc_dec(s); uart_puts("\n");
+            return -1;
+        }
+        uint32_t chunk = (bytes_to_read - bytes_done < 512u) ?
+                          bytes_to_read - bytes_done : 512u;
+        for (uint32_t k = 0u; k < chunk; k++)
+            buf[bytes_done + k] = sector_buf[k];
+        bytes_done += chunk;
+    }
+    return (int)bytes_done;
 }
 
 /* ── adfs_probe_lba: read 2048 bytes, check for Hugo/Nick ───────────────────
@@ -1285,8 +1483,7 @@ static int adfs_chain_traverse(uint32_t frag_id, uint32_t chain_offset,
      *   1. Traverse full chain until entry=1, storing each bit_addr.
      *   2. desired = total_len - chain_offset - 1  (from start)
      *   3. data_lba = fc_bit_addr_to_data_lba(stored[desired])
-     * Max chain length = 1024 LFAUs (safety cap).                    */
-#define FC_MAX_CHAIN 1024u
+     * Max chain length = FC_MAX_CHAIN = 1024 LFAUs (safety cap).     */
     uint32_t chain_bits[FC_MAX_CHAIN];
     uint32_t chain_len = 0u;
 

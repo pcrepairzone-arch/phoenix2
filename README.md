@@ -1,91 +1,129 @@
-
 # Phoenix OS — RISC OS-inspired Bare-Metal AArch64 Kernel
 
 A bare-metal AArch64 operating system for the Raspberry Pi 4/5,
 inspired by RISC OS. No Linux, no UEFI — runs directly on hardware.
 
-**Status: Active development. ~18,500 lines of C, Assembly and headers.**
+**Status: Active development — boot254 milestone. ~22,000 lines of C, Assembly and headers.**
 
 ---
 
-## 🎉 Boot 143 Milestone — VL805 xHCI Event Ring Working
+## 🎉 Boot 254 Milestone — First RISC OS File Read
 
-After 143 boot iterations and months of debugging, the VL805 xHCI
-event ring is fully operational. The MCU is writing events, CCEs are
-arriving, and Address Device is completing successfully:
+Phoenix OS can now read real RISC OS 5 FileCore discs and load file
+content from them bare-metal. This is the complete output from boot254,
+reading `$.!Boot/!Boot` — the RISC OS boot Obey script — directly from
+a Lexar USB stick:
 
 ```
-[BOOT116]   *** 1 event(s) received — event ring WORKING! ***
-[xHCI] No-op CCE received! CC=0x00000001 — MCU DMA write-back confirmed
-[xHCI] *** EVENT RING WORKING ***
-[xHCI] TRB[0]: MCU WROTE TRB[0]! type=CCE
-[xHCI] Address Device OK  slot=1
-[boot142] MFINDEX post-portscan: t0=0x0000062a  (RUNNING)
+[ADFS] *** SBPr DIRECTORY FOUND at LBA=0x775AC8 ***
+[ADFS]   DIR  !Boot      DIR  Apps       DIR  Diversions  DIR  Documents
+[ADFS]   DIR  Printing   DIR  Public     DIR  Updates     DIR  Utilities
+[ADFS]   DIR  Wallpaper
+[ADFS] 9 object(s) in root directory
+[ADFS]   FILE !Boot  sin=0x02fad705  len=561  type=&FEB
+[ADFS]   FILE !Help  sin=0x02fad707  len=126  type=&FFF
+[ADFS]   FILE !Run   sin=0x02fad708  len=459  type=&FEB
+[ADFS]   DIR  Choices   DIR  Library   FAT32 Loader   DIR  Resources
+[ADFS]   DIR  RO310Hook .. RO530Hook   DIR  Themes   DIR  Utils
+[ADFS] 18 object(s) in root directory
+[ADFS] === Reading $.!Boot/!Boot ===
+[ADFS] Read 561 bytes of $.!Boot/!Boot:
+Set Alias$BootEnd Unset Alias$BootEnd|m
+ObeyIf "<Boot$Dir>"="" Then Set Alias$BootEnd Unset Alias$BootEnd
+Iconsprites <Obey$Dir>.Themes.!Sprites
+If "<Boot$Path>"="" Then SetMacro Boot$Path <Boot$Dir>.
+If "<Boot$Dir>"="" Then Set Boot$Dir <Obey$Dir>
+If "<Run$Path>" = ",%.," then Set Run$Path ,%.,<Boot$Dir>.Library.
+If "<BootResources$Dir>"<>"" then Do Repeat Filer_Boot <BootResources$Dir>
+BootEnd
+RMEnsure UtilityModule 3.50 ObeyError No Boot application has been run
+[ADFS] === End of $.!Boot/!Boot ===
 ```
 
-This unblocks full USB-A keyboard enumeration. Next: fix EP0
-GET_DESCRIPTOR to complete enumeration and get HID reports.
+Verified against `*cat SCSI::laxarusb.$.!Boot` on a CM4 running RISC OS 5.
 
 ---
 
-## 🙏 Huge Thanks to the Circle Project
+## What Works (boot254)
 
-**This breakthrough would not have happened without Circle.**
-
-[Circle](https://github.com/rsta2/circle) is a C++ bare-metal
-environment for the Raspberry Pi by R. Stange, and it is the only
-other bare-metal project with a working VL805 xHCI driver for the Pi 4.
-
-When we were completely stuck on the VL805 event ring after exhausting
-every approach the xHCI specification suggested, we built Circle's
-`sample/08-usbkeyboard`. The link step failed due to a toolchain
-incompatibility, but **the compile step succeeded** — producing `.o`
-object files containing Circle's compiled xHCI driver code.
-
-By analysing those source files & compiled object files, we 
-identified three undocumented VL805-specific requirements that are not 
-in the xHCI specification and are not visible from register state alone:
-
-1. **`CMD_INTE` must be written alone BEFORE `CMD_RS | CMD_INTE`** —
-   the MCU needs to see the interrupt enable bit set before the run
-   bit in order to know where to deliver events.
-
-2. **`ERSTSZ=1` must be written BEFORE `ERSTBA`** — the MCU latches
-   the segment count at `ERSTBA` write time. With `ERSTSZ=0` when
-   `ERSTBA` arrives, the MCU treats the event ring as having zero
-   valid segments and never writes to it.
-
-3. **`ERDP` must be written with `EHB=1` (bit 3 set) on init** —
-   Circle always ORs `0x8` into the initial ERDP write. The VL805
-   MCU uses this as an undocumented "host ready" handshake before
-   it will begin posting events to the ring.
-
-None of these behaviours are documented anywhere. We would not have
-found them without Circle's source code to compare against.
-
-**R. Stange and the Circle project: thank you.** Phoenix OS stands on
-your shoulders for this milestone.
-
-Circle repository: https://github.com/rsta2/circle
-
----
-
-## What Works
-
-- Full AArch64 bare-metal boot (BCM2711, Pi 4)
+- Full AArch64 bare-metal boot (BCM2711, Pi 4B)
 - Identity-mapped MMU with Normal-NC DMA regions
-- GIC-400 interrupt controller
+- GIC-400 interrupt controller, ARM timer
 - 4-CPU scheduler skeleton
-- GPU framebuffer (2560×1080 confirmed)
+- GPU framebuffer (1920×1080)
 - PCIe RC bring-up — VL805 USB 3.0 controller via PCIe
-- **VL805 xHCI driver — event ring working (Boot 143)**
-  - MCU initialisation, scratchpad DMA, MFINDEX
-  - No-op CCE received, Enable Slot, Address Device all working
-- **DWC2 SoC USB OTG (USB-C port) — EP0 GET_DESCRIPTOR working (Boot 118)**
-  - GSNPSID confirmed (0x4f54280a = Synopsys DWC2 rev 2.80a)
-  - Full EP0 control transfer engine
-- SD/MMC, UART serial, mailbox, device tree parser
-- WIMP, networking, filesystem — scaffolded stubs
+- **VL805 xHCI driver — full USB enumeration (boot143+)**
+- **USB mass storage (BOT) — Lexar USB, Samsung NVMe via RTL9210**
+- **FileCore disc record read** — boot block + mid-zone cross-check
+- **SBPr directory format** — root dir (9 entries) + child dirs (18 entries)
+- **DIR/FILE/FAT32 type detection** — matches RISC OS `*cat` exactly
+- **RISC OS file type decode** — &FEB=Obey, &FFF=Text/Dir, &DDC=WrDir
+- **Multi-disc scan** — USB preferred over MMC, named disc over unnamed
+- **First file read — `$.!Boot/!Boot` Obey script (561 bytes)** ✅
+- VFS layer — FileCore driver registered, root cache populated
+- WIMP, networking — scaffolded stubs
+
+---
+
+## 🙏 Acknowledgements
+
+### David J Ruck
+
+**Special thanks to David J Ruck** (david@ruck.me.uk) for his invaluable
+help during the FileCore driver development. David's deep knowledge of
+RISC OS FileCore internals provided the critical breakthrough on chain
+traversal: the insight that `chain_offset` counts hops **from the END**
+of the chain, not the start. This single piece of knowledge unblocked
+weeks of debugging and is now documented in
+`docs/SBPr_Directory_Format.pdf`.
+
+```c
+/* David J Ruck's insight — chain_offset counts from END of chain */
+if (chain_offset == 0 || chain_len <= chain_offset)
+    desired_idx = chain_len - 1;
+else
+    desired_idx = chain_len - 1 - chain_offset;
+```
+
+Phoenix OS stands on the shoulders of people like David who keep
+RISC OS knowledge alive. Thank you David. 🙏
+
+### Circle Project
+
+**Huge thanks to R. Stange and the Circle project** for the VL805 xHCI
+breakthrough at boot 143. Circle is a C++ bare-metal environment for
+Raspberry Pi: https://github.com/rsta2/circle
+
+By analysing Circle's compiled source and object files, we identified
+three undocumented VL805-specific requirements not in the xHCI spec:
+
+1. `CMD_INTE` must be written alone BEFORE `CMD_RS | CMD_INTE`
+2. `ERSTSZ=1` must be written BEFORE `ERSTBA`
+3. `ERDP` must be written with `EHB=1` on init (undocumented handshake)
+
+### Others
+
+- [K2 by Simon Willcocks](https://codeberg.org/Simon_Willcocks/K2) —
+  RISC OS replacement kernel; Wimp running on 4 cores on Pi 3.
+- [dwelch67 bare-metal Pi](https://github.com/dwelch67/raspberrypi) —
+  Extensive bare-metal Pi examples and community resource.
+
+---
+
+## SBPr Directory Format
+
+The RISC OS 5 `SBPr` new-map directory format was fully reverse-engineered
+during boots 228–254. The complete specification is in
+`docs/SBPr_Directory_Format.pdf`.
+
+**Key facts:**
+- Detection: `buf[4..7] == 'SBPr'` (not the classic `'Hugo'` at buf[1..4])
+- Root dirs: `flags=1`, header 32 bytes, entries at offset `0x20`
+- Child dirs: `flags=5`, header 36 bytes, entries at offset `0x24`
+- Entry stride: 28 bytes — `load(4)+exec(4)+len(4)+IDA(4)+attr(4)+nlen(4)+noff(4)`
+- Names: ASCII, `0x0D`-terminated, stored in name table after entries
+- Directories: `ftype==0xFFF` or `0xDDC`; Files: all other types
+- FAT32 partition ref: `IDA==0x00000300` (special case)
 
 ---
 
@@ -93,59 +131,13 @@ Circle repository: https://github.com/rsta2/circle
 
 | Item | Detail |
 |------|--------|
-| Board | Raspberry Pi 4B (BCM2711, boardrev c03112) |
-| CPU | Cortex-A72, AArch64 |
-| USB (external) | VL805 xHCI via PCIe — 4× USB-A ports |
-| USB (OTG) | Synopsys DWC2 — USB-C port, `0xFE980000` |
-| Build target | `aarch64-linux-gnu-gcc -mcpu=cortex-a72 -ffreestanding -nostdlib` |
-
----
-
-## USB Architecture
-
-The Pi 4 has **two completely independent USB subsystems:**
-
-```
-USB-A ports (×4) ──→ VL805 xHCI (PCIe, 0x600000000)  ←── usb_xhci.c
-USB-C OTG port   ──→ DWC2 SoC   (MMIO, 0xFE980000)   ←── usb_dwc2.c
-```
-
-These share no hardware. DWC2 init does not affect VL805 and vice versa.
-
----
-
-## DMA Layout (.xhci_dma section, phys 0x00010000)
-
-```
-PCIe address base: 0xC0010000  (DMA_OFFSET = 0xC0000000)
-
-Offset   Name          PCIe addr
-0x0000   DCBAA         0xC0010000
-0x0800   CMD_RING      0xC0010800
-0x0C00   EVT_RING      0xC0010C00
-0x1000   MSI_PAD       0xC0011000
-0x1040   ERST          0xC0011040
-0x1080   SCRATCH_ARR   0xC0011080
-0x2000+  SCRATCH[0-30] 0xC0012000+
-```
-
-**Critical:** VL805 firmware only accepts inbound DMA with PCIe top
-nibble `0xC`. The linker script must place `.xhci_dma` at `0x00010000`.
-
----
-
-## VL805 xHCI — Key Lessons (Rules 38-41)
-
-Discovered via Circle object file analysis (Boot 143):
-
-| Rule | Finding |
-|------|---------|
-| 38 | Write `CMD_INTE` alone BEFORE `CMD_RS\|CMD_INTE` — separate writes required |
-| 39 | Write `ERSTSZ=1` BEFORE `ERSTBA` — MCU latches segment count at ERSTBA time |
-| 40 | Write `ERDP` with `EHB=1` (OR `0x8`) on init — undocumented MCU "host ready" signal |
-| 41 | MFINDEX starts after first port reset, not at RS=1 — tied to PHY activity |
-
-Full rule set (Rules 1-42) documented in `Documents/journal.txt`.
+| Board | Raspberry Pi 4B (BCM2711, Cortex-A72) |
+| USB A ports | VL805 xHCI via PCIe |
+| Test disc | Lexar USB 8GB — RISC OS 5 (disc name: `laxarusb`) |
+| NVMe | Samsung 970 Evo Plus 250GB via RTL9210 USB adaptor |
+| SD card | 64GB — basic RISC OS 5 install (`sdcard`) |
+| Build | `aarch64-linux-gnu-gcc -mcpu=cortex-a72 -ffreestanding -nostdlib` |
+| Serial | GPIO 14/15, 115200 8N1 |
 
 ---
 
@@ -156,14 +148,8 @@ make                    # build kernel8.img
 make clean && make      # clean rebuild
 ```
 
-Copy to SD card boot partition alongside `start4.elf`, `fixup4.dat`,
-`bcm2711-rpi-4-b.dtb`, and `config.txt`.
-
----
-
-## Serial Console
-
-GPIO 14 (TXD) → RX, GPIO 15 (RXD) → TX. Settings: 115200 8N1.
+Copy `kernel8.img` to the SD card FAT32 boot partition alongside
+`start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`, and `config.txt`.
 
 ---
 
@@ -171,28 +157,33 @@ GPIO 14 (TXD) → RX, GPIO 15 (RXD) → TX. Settings: 115200 8N1.
 
 | File | Purpose |
 |------|---------|
-| `drivers/usb/usb_xhci.c` | VL805 xHCI driver (~2,750 lines) |
-| `drivers/usb/usb_dwc2.c` | DWC2 OTG driver |
-| `drivers/usb/usb_init.c` | USB subsystem init |
-| `drivers/usb/usb_core.c` | HCD-agnostic USB API |
+| `kernel/filecore.c` | FileCore + ADFS driver — SBPr decoder, file read |
+| `kernel/vfs.c` | VFS layer + FileCore driver registration |
+| `kernel/vfs.h` | VFS types: vfs_dirent_t, vfs_filesystem_t |
+| `drivers/usb/usb_xhci.c` | VL805 xHCI driver |
+| `drivers/usb/usb_mass_storage.c` | USB MSC/BOT driver |
 | `kernel/mmu.c` | Identity map + Normal-NC DMA pages |
 | `kernel/pci.c` | BCM2711 PCIe RC + VL805 init |
-| `Documents/journal.txt` | Full session-by-session debug journal |
+| `docs/WORKFLOW.md` | Session guide — read at start of every dev session |
+| `docs/SBPr_Directory_Format.pdf` | RISC OS 5 SBPr format specification |
+| `docs/journal.txt` | Full session-by-session debug journal |
 
 ---
 
-## Related Work & Acknowledgments
+## Milestone History
 
-- **[Circle by R. Stange](https://github.com/rsta2/circle)** —
-  C++ bare-metal environment for Raspberry Pi with working USB.
-  The VL805 xHCI breakthrough in Boot 143 was made possible by
-  analysing Circle's compiled source & object files. An invaluable reference.
-
-- [K2 by Simon Willcocks](https://codeberg.org/Simon_Willcocks/K2) —
-  RISC OS replacement kernel; Wimp running on 4 cores on Pi 3.
-
-- [dwelch67 bare-metal Pi](https://github.com/dwelch67/raspberrypi) —
-  Extensive bare-metal Pi examples and community resource.
+| Boot | Milestone |
+|------|-----------|
+| 118 | DWC2 OTG USB-C EP0 working |
+| 143 | VL805 xHCI event ring working — USB breakthrough |
+| 163 | USB hub enumeration |
+| 181 | USB mass storage (BOT) — Lexar USB reads |
+| 184 | FAT32 partition listed; FileCore 0xAD partition found |
+| 232 | SBPr directory format identified |
+| 239 | Correct SBPr entry format decoded |
+| 246 | Root dir all 9 entries correct |
+| 249 | Child dir `$.!Boot` all 18 entries correct — DIR/FILE/FAT32 perfect |
+| **254** | **First file read — `$.!Boot/!Boot` Obey script (561 bytes)** ✅ |
 
 ---
 
