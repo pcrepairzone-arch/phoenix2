@@ -86,6 +86,7 @@ static void filecore_cache_root_entry_impl(const uint8_t *dir,
 static uint32_t adfs_ida_to_data_lba(uint32_t ida);
 static int      adfs_read_file(uint32_t ida, uint32_t file_len,
                                 uint8_t *buf, uint32_t max_bytes);
+/* NOTE: adfs_ida_to_data_lba_ctx forward decl is after fc_disc_slot_t below */
 uint32_t    g_fc_lba_base = 0;
 uint32_t    g_fc_sectors  = 0;
 uint8_t     g_fc_type     = 0;
@@ -222,6 +223,10 @@ typedef struct {
 } fc_disc_slot_t;
 static fc_disc_slot_t g_disc_slots[FC_MAX_DISCS];
 static int            g_disc_count = 0;
+
+/* Forward decl here — after fc_disc_slot_t is defined */
+static uint32_t adfs_ida_to_data_lba_ctx(uint32_t ida, blockdev_t *bd,
+                                          const fc_disc_slot_t *slot);
 
 /* ── Log a DiscRec's key fields ──────────────────────────────────────────── */
 static void fc_log_discrec(const filecore_disc_rec_t *dr, const char *prefix) {
@@ -394,7 +399,7 @@ static int fc_read_zone_discrec(blockdev_t *bd, uint32_t zone,
 /* ── filecore_init ────────────────────────────────────────────────────────── */
 void filecore_init(void)
 {
-    uart_puts("[FileCore] Scanning block devices (boot259)...\n");
+    uart_puts("[FileCore] Scanning block devices (boot261)...\n");
 
     uint8_t *buf = (uint8_t *)kmalloc(512);
     if (!buf) { uart_puts("[FileCore] kmalloc fail\n"); return; }
@@ -415,34 +420,40 @@ void filecore_init(void)
         uint32_t part_sec  = 0;
         int mbr_rc = filecore_parse_mbr(buf, &part_type, &part_lba, &part_sec);
 
-        if (mbr_rc < 0) {
+        /* boot261: mirror Mac boot236 fix — distinguish mbr_rc==-1 (truly no MBR)
+         * from mbr_rc==-2 (MBR present but no recognised partition).
+         * For -2 we still try the full-disc overlay — that's how the NVMe
+         * (Castle full-disc FileCore, no 0xAD partition entry) is detected.  */
+        if (mbr_rc == -1) {
             uart_puts("[FileCore]   No usable MBR on this device\n"); continue;
         }
-        if (part_type != PART_TYPE_RISCOS) {
-            uart_puts("[FileCore]   No 0xAD partition — skipping ADFS check\n"); continue;
-        }
-
-        uart_puts("[FileCore] 0xAD partition at LBA="); fc_hex32(part_lba); uart_puts("\n");
 
         filecore_disc_rec_t dr;
         uint32_t resolved_lba_base = 0;
         int dr_found = 0;
 
-        uart_puts("[FileCore] Trying zone-0 at part_lba="); fc_hex32(part_lba); uart_puts("\n");
-        if (fc_try_zone0_discrec(bd, part_lba, buf, &dr) == 0) {
-            uart_puts("[FileCore] Zone-0 DiscRec valid → partitioned ADFS\n");
-            resolved_lba_base = part_lba;
-            dr_found = 1;
-        }
+        /* Try partition-relative DiscRec only if 0xAD partition found */
+        if (mbr_rc == 0 && part_type == PART_TYPE_RISCOS) {
+            uart_puts("[FileCore] 0xAD partition at LBA="); fc_hex32(part_lba); uart_puts("\n");
 
-        if (!dr_found) {
-            uart_puts("[FileCore] Trying boot DiscRec (part_lba+6)...\n");
-            int rc = fc_try_boot_discrec(bd, part_lba, buf, &dr);
-            if (rc >= 0) {
-                uart_puts("[FileCore] Boot DiscRec valid at part_lba+6 → partitioned ADFS\n");
+            uart_puts("[FileCore] Trying zone-0 at part_lba="); fc_hex32(part_lba); uart_puts("\n");
+            if (fc_try_zone0_discrec(bd, part_lba, buf, &dr) == 0) {
+                uart_puts("[FileCore] Zone-0 DiscRec valid\n");
                 resolved_lba_base = part_lba;
                 dr_found = 1;
             }
+
+            if (!dr_found) {
+                uart_puts("[FileCore] Trying boot DiscRec (part_lba+6)...\n");
+                int rc = fc_try_boot_discrec(bd, part_lba, buf, &dr);
+                if (rc >= 0) {
+                    uart_puts("[FileCore] Boot DiscRec valid at part_lba+6\n");
+                    resolved_lba_base = part_lba;
+                    dr_found = 1;
+                }
+            }
+        } else {
+            uart_puts("[FileCore]   No 0xAD partition — trying full-disc overlay\n");
         }
 
         if (!dr_found) {
@@ -1172,25 +1183,50 @@ static void adfs_dump_sbpr_dir_with_scan(const uint8_t *dir)
         if (ok) {
             adfs_dump_sbpr_dir(sbuf);
 
-            /* boot257: laxarusb zone map is broken (no Hugo, chain returns 0
-             * at hop=0). DiscKnight + boot254 confirmed $.!Boot/!Boot is at
-             * LBA 0x775AF4. Use this directly, bypassing the chain traverse.
-             * When the NVMe chain works this hardcode will be replaced.    */
-            uart_puts("[ADFS] === Reading $.!Boot/!Boot ===\n");
-            uint32_t boot_lba = 0x775AF4u;  /* confirmed by DiscKnight + boot254 */
-            uint32_t boot_len = 561u;
+            /* boot260: Try NVMe (slot 1, clean chain) first.
+             * NVMe IDA for $.!Boot/!Boot = 0x0a8ba103 (from Mac bootlog235).
+             * If NVMe chain fails, fall back to Lexar hardcoded LBA.        */
+            uart_puts("[ADFS] === Reading $.!Boot/!Boot (boot260) ===\n");
+
+            uint32_t boot_lba  = 0xFFFFFFFFu;
+            uint32_t boot_len  = 561u;
+            blockdev_t *file_bd = NULL;
+
+            /* Try NVMe first (g_disc_slots[1] if it exists and is USB) */
+            if (g_disc_count >= 2 && g_fc_bdev2 != NULL) {
+                uint32_t nvme_ida = 0x0a8ba103u;
+                uart_puts("[ADFS]   Trying NVMe IDA=0x0a8ba103 on ");
+                uart_puts(g_fc_bdev2->name); uart_puts("\n");
+                boot_lba = adfs_ida_to_data_lba_ctx(nvme_ida,
+                               g_fc_bdev2, &g_disc_slots[1]);
+                if (boot_lba != 0xFFFFFFFFu) {
+                    file_bd  = g_fc_bdev2;
+                    boot_len = 561u;
+                    uart_puts("[ADFS]   NVMe chain OK  data_lba=");
+                    fc_hex32(boot_lba); uart_puts("\n");
+                } else {
+                    uart_puts("[ADFS]   NVMe chain failed\n");
+                }
+            }
+
+            /* Fall back to Lexar hardcoded LBA (confirmed boot254+) */
+            if (boot_lba == 0xFFFFFFFFu) {
+                boot_lba = 0x775AF4u;
+                file_bd  = g_fc_bdev;
+                uart_puts("[ADFS]   Using Lexar hardcoded LBA 0x775AF4\n");
+            }
+
             uint8_t *fbuf = (uint8_t *)kmalloc(boot_len + 16u);
             if (fbuf) {
-                /* Read directly from confirmed LBA — no chain traverse needed */
                 uint32_t sectors = (boot_len + 511u) / 512u;
-                uint32_t done = 0u;
-                uint8_t  sbuf2[512];
+                uint32_t done    = 0u;
+                uint8_t  sec2[512];
                 int ok2 = 1;
                 for (uint32_t s = 0u; s < sectors; s++) {
-                    if (g_fc_bdev->ops->read(g_fc_bdev,
-                            (uint64_t)(boot_lba+s), 1, sbuf2) < 0) { ok2=0; break; }
+                    if (file_bd->ops->read(file_bd,
+                            (uint64_t)(boot_lba+s), 1, sec2) < 0) { ok2=0; break; }
                     uint32_t chunk = (boot_len-done < 512u) ? boot_len-done : 512u;
-                    for (uint32_t k=0u; k<chunk; k++) fbuf[done+k] = sbuf2[k];
+                    for (uint32_t k=0u; k<chunk; k++) fbuf[done+k] = sec2[k];
                     done += chunk;
                 }
                 int nr = ok2 ? (int)done : -1;
@@ -1290,73 +1326,60 @@ int filecore_get_child_entry(uint32_t dir_sin, uint32_t idx,
     return -1;   /* TODO: implement subdirectory traversal */
 }
 
-/* ── adfs_ida_to_data_lba ────────────────────────────────────────────────
- * Given a FileCore new-map IDA (from a directory entry), decode the
- * frag_id and chain_offset, traverse the zone map chain, and return
- * the data LBA of the desired LFAU.
- * Returns 0xFFFFFFFF on failure.                                          */
-static uint32_t adfs_ida_to_data_lba(uint32_t ida)
+/* ── adfs_ida_to_data_lba_ctx ────────────────────────────────────────────────
+ * Given a FileCore IDA and a disc slot context, traverse the zone map chain
+ * and return the data LBA. Works with ANY disc (primary, secondary, NVMe).
+ * boot260: refactored to use explicit context instead of globals.           */
+static uint32_t adfs_ida_to_data_lba_ctx(uint32_t ida,
+                                          blockdev_t *bd,
+                                          const fc_disc_slot_t *slot)
 {
-    uint32_t id_len    = (uint32_t)g_dr_id_len;
+    uint32_t id_len    = (uint32_t)slot->dr.id_len;
     uint32_t id_mask   = (1u << (id_len - 1u)) - 1u;
     uint32_t frag_id   = (ida >> 1u) & id_mask;
     uint32_t chain_off = ida >> id_len;
 
-    uint32_t lba_base  = g_fc_lba_base;
-    uint32_t log2bpmb  = g_dr_log2bpmb;
-    uint32_t log2ss    = g_dr_log2ss;
-    uint32_t secplfau  = 1u << (log2bpmb - log2ss);
-    uint32_t used_b    = (512u * 8u) - (uint32_t)g_dr_zone_spare;
+    uint32_t lba_base  = slot->lba_base;
+    uint32_t secplfau  = 1u << (slot->dr.log2_bpmb - slot->dr.log2_sector_size);
+    uint32_t used_b    = (512u * 8u) - (uint32_t)slot->dr.zone_spare;
     uint32_t dr_sz     = 60u * 8u;
-    uint32_t zsp       = (uint32_t)g_dr_zone_spare;
+    uint32_t zsp       = (uint32_t)slot->dr.zone_spare;
     uint32_t zone_bits = zsp + used_b;
 
-    uint32_t _tnz = g_dr_nzones;
-    if (g_dr_big_flag) _tnz += (uint32_t)g_dr_nzones_hi << 8u;
-    uint32_t _mz  = _tnz / 2u;
-    uint32_t disc_map_lba = lba_base + (_mz * used_b - dr_sz) * secplfau;
-    (void)disc_map_lba;
+    uint32_t _tnz = (uint32_t)slot->dr.nzones;
+    if (slot->dr.big_flag) _tnz += (uint32_t)slot->dr.nzones_hi << 8u;
 
     uint8_t *zbuf = (uint8_t *)kmalloc(512u);
     if (!zbuf) return 0xFFFFFFFFu;
 
     uint32_t chain_bits[FC_MAX_CHAIN];
     uint32_t chain_len = 0u;
-    uint32_t cur       = frag_id;
+    uint32_t cur = frag_id;
     chain_bits[chain_len++] = cur;
 
     for (uint32_t hop = 0u; hop < FC_MAX_CHAIN - 1u; hop++) {
-        uint32_t zone = cur / zone_bits;
-        uint32_t bit  = cur % zone_bits;
+        uint32_t zone    = cur / zone_bits;
+        uint32_t bit     = cur % zone_bits;
         uint32_t map_lba = (zone == 0u) ? lba_base :
                            lba_base + (zone * used_b - dr_sz) * secplfau;
 
         uint32_t entry = 0u;
-        if (g_fc_bdev->ops->read(g_fc_bdev,(uint64_t)map_lba,1,zbuf)==0)
+        if (bd->ops->read(bd, (uint64_t)map_lba, 1, zbuf) == 0)
             entry = adfs_read_bits(zbuf, bit, (int)id_len);
 
         if (entry == 0u) {
-            /* try copy 2 */
-            uint32_t map_lba_c2 = map_lba + _tnz;
-            if (g_fc_bdev->ops->read(g_fc_bdev,(uint64_t)map_lba_c2,1,zbuf)==0)
+            if (bd->ops->read(bd, (uint64_t)(map_lba + _tnz), 1, zbuf) == 0)
                 entry = adfs_read_bits(zbuf, bit, (int)id_len);
         }
 
         if (entry == 0u) {
-            /* Chain broken. boot256: log the break and return the best
-             * available LBA. The Lexar USB has a stale zone map (no Hugo).
-             * For hop=0 on the Lexar, use the known physical layout.
-             * For any other break, use fc_bit_addr_to_data_lba on the
-             * last valid chain position.                                  */
             uart_puts("[ADFS] chain broken at hop="); fc_dec(hop);
-            uint32_t fallback_lba = fc_bit_addr_to_data_lba(
-                cur, lba_base, zsp, used_b, dr_sz, id_len, secplfau);
-            uart_puts("  fallback_lba="); fc_hex32(fallback_lba); uart_puts("\n");
+            uart_puts(" on "); uart_puts(bd->name); uart_puts("\n");
             kfree(zbuf);
-            return fallback_lba;
+            return 0xFFFFFFFFu;
         }
 
-        if (entry == 1u) break;   /* terminal */
+        if (entry == 1u) break;
 
         cur = entry;
         if (chain_len < FC_MAX_CHAIN) chain_bits[chain_len++] = cur;
@@ -1371,6 +1394,19 @@ static uint32_t adfs_ida_to_data_lba(uint32_t ida)
 
     return fc_bit_addr_to_data_lba(chain_bits[desired], lba_base,
                                     zsp, used_b, dr_sz, id_len, secplfau);
+}
+
+/* ── adfs_ida_to_data_lba ────────────────────────────────────────────────
+ * Given a FileCore new-map IDA (from a directory entry), decode the
+ * frag_id and chain_offset, traverse the zone map chain, and return
+ * the data LBA of the desired LFAU.
+ * Returns 0xFFFFFFFF on failure.                                          */
+static uint32_t adfs_ida_to_data_lba(uint32_t ida)
+{
+    /* boot260: simple wrapper — delegates to context-aware version */
+    if (g_disc_count > 0)
+        return adfs_ida_to_data_lba_ctx(ida, g_fc_bdev, &g_disc_slots[0]);
+    return 0xFFFFFFFFu;
 }
 
 /* ── adfs_read_file ──────────────────────────────────────────────────────
