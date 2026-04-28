@@ -43,7 +43,8 @@ extern void pci_init(void);             /* kernel/pci.c             */
 extern int usb_init(void);
 extern int mmc_init(void);              /* drivers/mmc/mmc.c        */
 extern void vfs_init(void);             /* kernel/vfs.c (stub)      */
-extern void filecore_init(void);        /* kernel/filecore.c (stub) */
+extern void filecore_init(void);        /* kernel/filecore.c        */
+extern void filecore_show_results(void);/* kernel/filecore.c        */
 extern void net_init(void);             /* net/tcpip.c (stub)       */
 extern void wimp_init(void);            /* wimp/wimp.c (stub)       */
 extern void register_default_handlers(void); /* kernel/signal.c    */
@@ -176,6 +177,7 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("\n[10/10] VFS / Network / Signals...\n");
     vfs_init();
     filecore_init();
+    filecore_show_results();
     net_init();
     register_default_handlers();
     debug_print("Subsystems ready\n");

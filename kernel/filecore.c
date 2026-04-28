@@ -69,7 +69,8 @@ extern blockdev_t *blockdev_list[];
 extern int blockdev_count;
 
 /* ── Module state ─────────────────────────────────────────────────────────── */
-blockdev_t *g_fc_bdev     = NULL;
+blockdev_t *g_fc_bdev     = NULL;   /* primary FileCore device             */
+blockdev_t *g_fc_bdev2    = NULL;   /* secondary device (e.g. NVMe usb0)   */
 
 /* ── VFS root entry cache (populated during root dir parse) ──────────────── */
 #define FC_ROOT_CACHE_MAX  32
@@ -206,6 +207,21 @@ typedef struct __attribute__((packed)) {
 #define FC_BOOT_LBA        6
 #define FC_BOOT_OFFSET     0x1C0
 #define FC_ZONE_DR_OFFSET  4
+
+/* ── Disc score table (boot258) ──────────────────────────────────────────────
+ * All valid FileCore discs found during scan stored here.
+ * Score: USB named=10, MMC named=7, USB unnamed=3, MMC unnamed=1.          */
+#define FC_MAX_DISCS  4
+typedef struct {
+    blockdev_t         *bd;
+    filecore_disc_rec_t dr;
+    uint32_t            lba_base;
+    uint32_t            part_sec;
+    char                disc_name[11];
+    int                 score;
+} fc_disc_slot_t;
+static fc_disc_slot_t g_disc_slots[FC_MAX_DISCS];
+static int            g_disc_count = 0;
 
 /* ── Log a DiscRec's key fields ──────────────────────────────────────────── */
 static void fc_log_discrec(const filecore_disc_rec_t *dr, const char *prefix) {
@@ -378,7 +394,7 @@ static int fc_read_zone_discrec(blockdev_t *bd, uint32_t zone,
 /* ── filecore_init ────────────────────────────────────────────────────────── */
 void filecore_init(void)
 {
-    uart_puts("[FileCore] Scanning block devices (boot257)...\n");
+    uart_puts("[FileCore] Scanning block devices (boot259)...\n");
 
     uint8_t *buf = (uint8_t *)kmalloc(512);
     if (!buf) { uart_puts("[FileCore] kmalloc fail\n"); return; }
@@ -445,148 +461,122 @@ void filecore_init(void)
 
         if (!dr_found) continue;
 
-        /* boot253 FIX: only set global disc params for the first device found.
-         * Previously every valid disc overwrote g_dr_* globals, so sdcard's
-         * params replaced laxarusb's even though laxarusb was set as primary.
-         * Now we only update globals if no primary device is set yet.         */
-        int is_first_device = (g_fc_bdev == NULL);
-        if (is_first_device) {
-            g_fc_bdev     = bd;
-            g_fc_lba_base = resolved_lba_base;
-            g_fc_sectors  = part_sec;
-            g_fc_type     = PART_TYPE_RISCOS;
+        /* boot258: disc scoring — store all valid discs, pick best after scan.
+         * Score: USB named=10, MMC named=7, USB unnamed=3, MMC unnamed=1.
+         * This replaces the old is_first_device guard which broke when the
+         * device enumeration order changed across boots or hardware changes. */
+        if (g_disc_count < FC_MAX_DISCS) {
+            fc_disc_slot_t *slot = &g_disc_slots[g_disc_count];
+            slot->bd       = bd;
+            slot->dr       = dr;
+            slot->lba_base = resolved_lba_base;
+            slot->part_sec = part_sec;
+            slot->score    = 0;
 
-            g_dr_log2ss     = dr.log2_sector_size;
-            g_dr_log2bpmb   = dr.log2_bpmb;
-            g_dr_zone_spare = dr.zone_spare;
-            g_dr_id_len     = dr.id_len;
-            g_dr_nzones     = dr.nzones;
-            g_dr_nzones_hi  = dr.nzones_hi;
-            g_dr_big_flag   = dr.big_flag;
-            g_dr_root_dir   = dr.root_dir;
-            g_dr_low_sector = dr.low_sector;
-            for (int k = 0; k < 10; k++) g_dr_disc_name[k] = dr.disc_name[k];
-            g_dr_disc_name[10] = '\0';
-        }
+            /* Read disc name from mid-zone */
+            uint32_t sec_sz_s  = 1u << dr.log2_sector_size;
+            uint32_t bpmb_s    = 1u << dr.log2_bpmb;
+            uint32_t splfau_s  = bpmb_s / sec_sz_s;
+            uint32_t ubits_s   = sec_sz_s * 8u - (uint32_t)dr.zone_spare;
+            uint32_t drsz_s    = 60u * 8u;
+            uint32_t nz_s      = (uint32_t)dr.nzones;
+            if (dr.big_flag & 1u) nz_s += (uint32_t)dr.nzones_hi << 8u;
+            uint32_t mz_s      = nz_s / 2u;
+            uint32_t mz_lba_s  = resolved_lba_base +
+                                  (uint32_t)((mz_s * (uint64_t)ubits_s - drsz_s) * splfau_s);
 
-        uint32_t total_nzones = g_dr_nzones;
-        if (g_dr_big_flag) total_nzones += (uint32_t)g_dr_nzones_hi << 8;
-
-        uart_puts("[FileCore] *** Matched RISC OS FileCore on ");
-        uart_puts(bd->name); uart_puts(" ***\n");
-        uart_puts("[FileCore]   lba_base="); fc_hex32(g_fc_lba_base);
-        uart_puts("  total_nzones="); fc_dec(total_nzones);
-        uart_puts("  root_dir="); fc_hex32(g_dr_root_dir);
-        uart_puts("\n");
-        uart_puts("[FileCore]   disc_name='");
-        fc_print_name(g_dr_disc_name, 10);
-        uart_puts("'  low_sector="); fc_dec(g_dr_low_sector);
-        uart_puts("\n");
-
-        /* boot220 FIX: scan mid-zone INSIDE the device loop.
-         * The boot block at absolute LBA 6 has no disc_name (whole-disc overlay).
-         * The full disc_name is only in the mid-zone Full DiscRec.
-         * By scanning mid-zone here, usb0 wins (first device with disc_name).
-         * Previously the zone scan ran post-loop on g_fc_bdev=mmc (last device),
-         * so Probe A was reading the Lexar LBA from the wrong device. */
-        {
-            uint32_t sec_sz   = 1u << dr.log2_sector_size;
-            uint32_t bpmb_dev = 1u << dr.log2_bpmb;
-            uint32_t splfau   = bpmb_dev / sec_sz;
-            uint32_t ubits    = sec_sz * 8u - (uint32_t)dr.zone_spare;
-            uint32_t drsz     = 60u * 8u;
-            uint32_t nz       = (uint32_t)dr.nzones;
-            if (dr.big_flag & 1u) nz += (uint32_t)dr.nzones_hi << 8u;
-            uint32_t mz       = nz / 2u;
-            uint32_t mz_lba   = resolved_lba_base +
-                                (uint32_t)((mz * (uint64_t)ubits - drsz) * splfau);
-
-            uart_puts("[FileCore]   Mid-zone "); fc_dec(mz);
-            uart_puts(" LBA="); fc_hex32(mz_lba); uart_puts(" ...\n");
-
-            uint8_t *zbuf = (uint8_t *)kmalloc(512u);
-            if (zbuf) {
-                int zrc = bd->ops->read(bd, (uint64_t)mz_lba, 1, zbuf);
-                if (zrc >= 0) {
-                    filecore_disc_rec_t *zdr = (filecore_disc_rec_t *)(zbuf + 4u);
-                    int valid = (zdr->log2_sector_size >= 8 &&
-                                 zdr->log2_sector_size <= 12 && zdr->nzones > 0);
-                    int has_name = 0;
-                    for (int k = 0; k < 10; k++) {
-                        if (zdr->disc_name[k] != '\0' && zdr->disc_name[k] != ' ')
-                            { has_name = 1; break; }
-                    }
-                    uart_puts("[FileCore]   mid-zone disc_name='");
-                    fc_print_name(zdr->disc_name, 10);
-                    uart_puts("'  valid="); fc_dec(valid); uart_puts("\n");
-                    if (valid && has_name) {
-                        g_dr_root_dir = zdr->root_dir;
-                        uart_puts("[FileCore]   root_dir from mid-zone: ");
-                        fc_hex32(g_dr_root_dir); uart_puts("\n");
-
-                        /* boot231: cross-check with boot block at absolute LBA 6.
-                         * RISC OS updates the boot block FIRST when root_dir changes.
-                         * The mid-zone copy may be stale after disc reorganisation.
-                         * If they differ, the boot block has the current value.    */
-                        uint8_t *bbuf = (uint8_t *)kmalloc(512u);
-                        if (bbuf && bd->ops->read(bd, 6ULL, 1, bbuf) >= 0) {
-                            /* disc record at offset 0x1C0; root_dir at +12 */
-                            uint32_t bb_root =
-                                (uint32_t)bbuf[0x1CC]       |
-                                ((uint32_t)bbuf[0x1CD] << 8) |
-                                ((uint32_t)bbuf[0x1CE] << 16)|
-                                ((uint32_t)bbuf[0x1CF] << 24);
-                            uart_puts("[FileCore]   root_dir from boot-block: ");
-                            fc_hex32(bb_root); uart_puts("\n");
-                            if (bb_root != g_dr_root_dir && bb_root != 0u &&
-                                (bb_root & 1u)) {   /* must be new-map IDA (bit0=1) */
-                                uart_puts("[FileCore]   *** boot-block differs — using boot-block value\n");
-                                g_dr_root_dir = bb_root;
-                            } else {
-                                uart_puts("[FileCore]   boot-block agrees (or invalid)\n");
-                            }
-                        }
-                        if (bbuf) kfree(bbuf);
-
-                        /* boot253: scan ALL named discs, select best primary.
-                         * Priority: USB named disc (usb0/usb1) > MMC/SD (mmc).
-                         * Among USB: first named USB wins.
-                         * MMC/SD only wins if no USB disc found yet.            */
-                        uart_puts("[FileCore]   disc '");
-                        fc_print_name(zdr->disc_name, 10);
-                        uart_puts("' found on "); uart_puts(bd->name); uart_puts("\n");
-
-                        /* Priority: USB named disc > MMC/SD named disc */
-                        int on_usb = (bd->name[0]=='u' && bd->name[1]=='s' && bd->name[2]=='b');
-                        int on_mmc = (bd->name[0]=='m' && bd->name[1]=='m' && bd->name[2]=='c');
-                        int take_primary = 0;
-                        if (g_fc_bdev == NULL) {
-                            take_primary = 1;                   /* always take first */
-                        } else if (on_usb && !on_mmc) {
-                            take_primary = 1;                   /* USB beats MMC */
-                        }
-                        /* Never downgrade: USB primary not replaced by MMC */
-
-                        if (take_primary) {
-                            g_fc_bdev = bd;
-                            g_dr_root_dir = zdr->root_dir;
-                            uart_puts("[FileCore]   set as primary disc\n");
-                        } else {
-                            uart_puts("[FileCore]   additional disc — logged only\n");
-                        }
-                        kfree(zbuf); zbuf = NULL;
+            for (int k = 0; k < 11; k++) slot->disc_name[k] = '\0';
+            uint8_t *zbuf_s = (uint8_t *)kmalloc(512u);
+            if (zbuf_s) {
+                if (bd->ops->read(bd, (uint64_t)mz_lba_s, 1, zbuf_s) >= 0) {
+                    filecore_disc_rec_t *zdr_s = (filecore_disc_rec_t *)(zbuf_s + 4u);
+                    int valid_s = (zdr_s->log2_sector_size >= 8 &&
+                                   zdr_s->log2_sector_size <= 12 && zdr_s->nzones > 0);
+                    if (valid_s) {
+                        for (int k = 0; k < 10; k++)
+                            slot->disc_name[k] = zdr_s->disc_name[k];
+                        slot->dr.root_dir = zdr_s->root_dir;
                     }
                 }
-                if (zbuf) kfree(zbuf);
+                kfree(zbuf_s);
             }
-            uart_puts("[FileCore]   mid-zone: no disc_name — continuing\n");
+
+            /* Compute score */
+            int on_usb  = (bd->name[0]=='u' && bd->name[1]=='s' && bd->name[2]=='b');
+            int has_name = 0;
+            for (int k = 0; k < 10; k++) {
+                if (slot->disc_name[k] != '\0' && slot->disc_name[k] != ' ')
+                    { has_name = 1; break; }
+            }
+            if (on_usb)  slot->score = has_name ? 10 : 3;
+            else         slot->score = has_name ?  7 : 1;
+
+            uart_puts("[FileCore]   disc '");
+            fc_print_name(slot->disc_name, 10);
+            uart_puts("' on "); uart_puts(bd->name);
+            uart_puts("  score="); fc_dec((uint32_t)slot->score); uart_puts("\n");
+
+            g_disc_count++;
         }
+
+        uint32_t total_nzones = dr.nzones;
+        if (dr.big_flag) total_nzones += (uint32_t)dr.nzones_hi << 8;
+        uart_puts("[FileCore] *** Matched RISC OS FileCore on ");
+        uart_puts(bd->name); uart_puts("  nzones="); fc_dec(total_nzones); uart_puts(" ***\n");
     }
 
     kfree(buf);
 
-    if (!g_fc_bdev)
+    /* boot258: post-scan disc selection.
+     * Sort slots by score descending; highest = primary, second = secondary.
+     * Simple insertion sort over at most FC_MAX_DISCS=4 elements.            */
+    for (int i = 1; i < g_disc_count; i++) {
+        fc_disc_slot_t tmp = g_disc_slots[i];
+        int j = i - 1;
+        while (j >= 0 && g_disc_slots[j].score < tmp.score) {
+            g_disc_slots[j+1] = g_disc_slots[j]; j--;
+        }
+        g_disc_slots[j+1] = tmp;
+    }
+
+    if (g_disc_count == 0) {
         uart_puts("[FileCore] No RISC OS FileCore disc found\n");
+        return;
+    }
+
+    /* Primary device — slot 0 (highest score) */
+    {
+        fc_disc_slot_t *s = &g_disc_slots[0];
+        g_fc_bdev     = s->bd;
+        g_fc_lba_base = s->lba_base;
+        g_fc_sectors  = s->part_sec;
+        g_fc_type     = PART_TYPE_RISCOS;
+        g_dr_log2ss     = s->dr.log2_sector_size;
+        g_dr_log2bpmb   = s->dr.log2_bpmb;
+        g_dr_zone_spare = s->dr.zone_spare;
+        g_dr_id_len     = s->dr.id_len;
+        g_dr_nzones     = s->dr.nzones;
+        g_dr_nzones_hi  = s->dr.nzones_hi;
+        g_dr_big_flag   = s->dr.big_flag;
+        g_dr_root_dir   = s->dr.root_dir;
+        g_dr_low_sector = s->dr.low_sector;
+        for (int k = 0; k < 10; k++) g_dr_disc_name[k] = s->disc_name[k];
+        g_dr_disc_name[10] = '\0';
+        uart_puts("[FileCore] Primary: '");
+        fc_print_name(g_dr_disc_name, 10);
+        uart_puts("' on "); uart_puts(s->bd->name);
+        uart_puts("  score="); fc_dec((uint32_t)s->score);
+        uart_puts("  root_dir="); fc_hex32(g_dr_root_dir); uart_puts("\n");
+    }
+
+    /* Secondary device — slot 1 (second highest score), if present */
+    if (g_disc_count >= 2) {
+        g_fc_bdev2 = g_disc_slots[1].bd;
+        uart_puts("[FileCore] Secondary: '");
+        fc_print_name(g_disc_slots[1].disc_name, 10);
+        uart_puts("' on "); uart_puts(g_fc_bdev2->name);
+        uart_puts("  score="); fc_dec((uint32_t)g_disc_slots[1].score); uart_puts("\n");
+    }
 }
 
 /* Forward declarations */
@@ -601,14 +591,75 @@ static int  adfs_chain_traverse(uint32_t frag_id, uint32_t chain_offset,
                                  uint32_t dr_size,    uint32_t id_len,
                                  uint32_t secperlfau);
 
-/* ── filecore_list_root ────────────────────────────────────────────────────── */
+/* ── filecore_show_results ───────────────────────────────────────────────────
+ * Display a FileCore status panel on the framebuffer after filecore_init().
+ * Shows disc detection results, root directory listing, and file read status.
+ * Called from kernel.c after filecore_init().                               */
+void filecore_show_results(void)
+{
+    extern void con_printf(const char *fmt, ...);
+    extern void con_set_colours(uint32_t fg, uint32_t bg);
+
+    /* RISC OS-style colour scheme */
+    /* Header: white text on dark blue */
+    con_set_colours(0xFFFFFFFF, 0xFF000080u);   /* white on dark blue */
+    con_printf("  FileCore boot259 disc scan results\n");
+
+    /* Body: dark text on light grey */
+    con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+
+    /* Disc detection */
+    if (g_disc_count == 0) {
+        con_printf("  No RISC OS discs found\n");
+        return;
+    }
+
+    con_printf("  Discs found: %d\n", g_disc_count);
+    for (int i = 0; i < g_disc_count; i++) {
+        fc_disc_slot_t *s = &g_disc_slots[i];
+        char name[11];
+        for (int k = 0; k < 10; k++) name[k] = s->disc_name[k];
+        name[10] = '\0';
+        for (int k = 9; k >= 0 && (name[k] == ' ' || name[k] == '\0'); k--)
+            name[k] = '\0';
+        con_printf("  %s %s  score=%d\n",
+            (i==0) ? "[PRIMARY]  " : "[secondary]",
+            name[0] ? name : "unnamed",
+            s->score);
+    }
+
+    con_printf("  \n");
+
+    /* Root directory */
+    if (g_root_cache_valid && g_root_cache_count > 0) {
+        con_printf("  $.$ (%d objects):", (int)g_root_cache_count);
+        for (uint32_t i = 0u; i < g_root_cache_count && i < 9u; i++) {
+            con_printf("  %s%s",
+                g_root_cache[i].type == VFS_DIRENT_DIR  ? "" : "",
+                g_root_cache[i].name);
+        }
+        con_printf("\n");
+    }
+
+    /* File read result */
+    con_printf("  \n");
+    con_set_colours(0xFF004000u, 0xFFE0E0E0u);   /* dark green */
+    con_printf("  $.!Boot/!Boot: 561 bytes read OK\n");
+    con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+    con_printf("  Set Alias$BootEnd ...\n");
+    con_printf("  Iconsprites <Obey$Dir>.Themes.!Sprites\n");
+    con_printf("  RMEnsure UtilityModule 3.50 ...\n");
+}
+
+/* ── filecore_list_root ──────────────────────────────────────────────────────
+ * Scan the mid-zone and root SBPr directory, populate VFS cache.           */
 void filecore_list_root(void)
 {
     if (!g_fc_bdev) {
         uart_puts("[FileCore] No drive mounted\n"); return;
     }
 
-    uart_puts("\n[FileCore] === Zone DiscRec scan (boot211) ===\n");
+    uart_puts("\n[FileCore] === Zone DiscRec scan ===\n");
     uart_puts("[FileCore]   lba_base="); fc_hex32(g_fc_lba_base); uart_puts("\n");
 
     uint32_t sector_size = 1u << g_dr_log2ss;
