@@ -399,7 +399,7 @@ static int fc_read_zone_discrec(blockdev_t *bd, uint32_t zone,
 /* ── filecore_init ────────────────────────────────────────────────────────── */
 void filecore_init(void)
 {
-    uart_puts("[FileCore] Scanning block devices (boot261)...\n");
+    uart_puts("[FileCore] Scanning block devices (boot264)...\n");
 
     uint8_t *buf = (uint8_t *)kmalloc(512);
     if (!buf) { uart_puts("[FileCore] kmalloc fail\n"); return; }
@@ -1183,37 +1183,54 @@ static void adfs_dump_sbpr_dir_with_scan(const uint8_t *dir)
         if (ok) {
             adfs_dump_sbpr_dir(sbuf);
 
-            /* boot260: Try NVMe (slot 1, clean chain) first.
-             * NVMe IDA for $.!Boot/!Boot = 0x0a8ba103 (from Mac bootlog235).
-             * If NVMe chain fails, fall back to Lexar hardcoded LBA.        */
-            uart_puts("[ADFS] === Reading $.!Boot/!Boot (boot260) ===\n");
+            /* boot262: Use the PRIMARY disc's chain for file reads.
+             * g_disc_slots[0] = NVMe (score=10, clean chain).
+             * The !Boot file IDA depends on which disc is primary:
+             *   NVMe:     $.!Boot/!Boot IDA = 0x0a8ba103 (from Mac bootlog235)
+             *   laxarusb: $.!Boot/!Boot IDA = 0x02FAD705 (confirmed boot254)
+             * Use the IDA from the directory entry we just decoded (sbpr listing).
+             * For now, pick IDA based on primary disc name.                 */
+            uart_puts("[ADFS] === Reading $.!Boot/!Boot via primary chain ===\n");
 
-            uint32_t boot_lba  = 0xFFFFFFFFu;
-            uint32_t boot_len  = 561u;
-            blockdev_t *file_bd = NULL;
+            /* Find !Boot file IDA from the g_root_cache (populated during root dir parse) */
+            uint32_t boot_ida = 0u;
+            for (uint32_t ci = 0u; ci < g_root_cache_count; ci++) {
+                /* Look for "!Boot" in the child dir cache — or use hardcoded IDAs */
+                (void)ci;
+            }
+            /* Determine IDA from primary disc name */
+            int is_nvme = (g_dr_disc_name[0]=='N' && g_dr_disc_name[1]=='V' &&
+                           g_dr_disc_name[2]=='M');
+            int is_laxa = (g_dr_disc_name[0]=='l' && g_dr_disc_name[1]=='a' &&
+                           g_dr_disc_name[2]=='x');
+            if (is_nvme)      boot_ida = 0x0a8ba103u;  /* NVMe $.!Boot/!Boot */
+            else if (is_laxa) boot_ida = 0x02FAD705u;  /* Lexar $.!Boot/!Boot */
+            else              boot_ida = 0x02FAD705u;  /* default to Lexar */
 
-            /* Try NVMe first (g_disc_slots[1] if it exists and is USB) */
-            if (g_disc_count >= 2 && g_fc_bdev2 != NULL) {
-                uint32_t nvme_ida = 0x0a8ba103u;
-                uart_puts("[ADFS]   Trying NVMe IDA=0x0a8ba103 on ");
-                uart_puts(g_fc_bdev2->name); uart_puts("\n");
-                boot_lba = adfs_ida_to_data_lba_ctx(nvme_ida,
-                               g_fc_bdev2, &g_disc_slots[1]);
+            uart_puts("[ADFS]   Primary disc: ");
+            fc_print_name(g_dr_disc_name, 10);
+            uart_puts("  IDA="); fc_hex32(boot_ida); uart_puts("\n");
+
+            uint32_t boot_lba = 0xFFFFFFFFu;
+            uint32_t boot_len = 561u;
+            blockdev_t *file_bd = g_fc_bdev;
+
+            /* Traverse chain using primary disc context */
+            if (g_disc_count > 0) {
+                boot_lba = adfs_ida_to_data_lba_ctx(boot_ida,
+                               g_fc_bdev, &g_disc_slots[0]);
                 if (boot_lba != 0xFFFFFFFFu) {
-                    file_bd  = g_fc_bdev2;
-                    boot_len = 561u;
-                    uart_puts("[ADFS]   NVMe chain OK  data_lba=");
+                    uart_puts("[ADFS]   chain OK  data_lba=");
                     fc_hex32(boot_lba); uart_puts("\n");
                 } else {
-                    uart_puts("[ADFS]   NVMe chain failed\n");
+                    uart_puts("[ADFS]   chain failed\n");
                 }
             }
 
-            /* Fall back to Lexar hardcoded LBA (confirmed boot254+) */
-            if (boot_lba == 0xFFFFFFFFu) {
+            /* Lexar fallback only if chain broken AND Lexar is primary */
+            if (boot_lba == 0xFFFFFFFFu && is_laxa) {
                 boot_lba = 0x775AF4u;
-                file_bd  = g_fc_bdev;
-                uart_puts("[ADFS]   Using Lexar hardcoded LBA 0x775AF4\n");
+                uart_puts("[ADFS]   Lexar hardcoded fallback 0x775AF4\n");
             }
 
             uint8_t *fbuf = (uint8_t *)kmalloc(boot_len + 16u);
@@ -1234,17 +1251,17 @@ static void adfs_dump_sbpr_dir_with_scan(const uint8_t *dir)
                     uart_puts("[ADFS] Read "); fc_dec((uint32_t)nr);
                     uart_puts(" bytes of $.!Boot/!Boot:\n");
 
-                    /* boot255: hex dump first 32 bytes to confirm content */
-                    uart_puts("[ADFS] First 32 bytes: ");
-                    for (int h = 0; h < 32 && h < nr; h++) {
-                        fc_hex8(fbuf[h]); uart_puts(h<31?" ":"\n");
-                    }
-
-                    /* Print as text — Obey script is plain ASCII */
+                    /* Print as text — Obey script uses \r line endings.
+                     * RISC OS also uses |m as a newline escape within strings. */
                     for (int i = 0; i < nr; i++) {
                         char c = (char)fbuf[i];
                         if (c == '\r') { uart_puts("\n"); continue; }
                         if (c == '\n') continue;
+                        /* Handle RISC OS |m pipe escape = newline */
+                        if (c == '|' && i+1 < nr &&
+                            (fbuf[i+1]=='m' || fbuf[i+1]=='M')) {
+                            uart_puts("\n"); i++; continue;
+                        }
                         if (c >= 32 && c < 127) {
                             char s2[2] = {c, '\0'}; uart_puts(s2);
                         }
