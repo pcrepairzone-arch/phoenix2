@@ -11,6 +11,8 @@
 #include "uasp.h"
 
 extern void uart_puts(const char *s);
+/* boot297: quiet mode for xHCI timeout log during TUR retries */
+extern void xhci_set_quiet_timeouts(int q);
 
 static void print_hex32(uint32_t v) {
     static const char h[] = "0123456789abcdef";
@@ -443,6 +445,11 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
     uart_puts("[MSC] TEST UNIT READY...\n");
     int tur_ok = 0;
     uint32_t tur_deadline = msc_time_ms() + 5000u;
+    /* boot297: suppress [xHCI] timeout lines during TUR retries — slow devices
+     * (Toshiba Mac stick, cold-start bridges) generate many expected timeouts
+     * before becoming ready.  Quiet mode is cleared on exit whether or not
+     * TUR succeeds, so all subsequent commands log normally.                 */
+    xhci_set_quiet_timeouts(1);
     while (msc_time_ms() < tur_deadline) {
         if (bot_test_unit_ready(drive, 0) == 0) {
             tur_ok = 1;
@@ -450,6 +457,11 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
         }
         msc_delay_ms(100);
     }
+    /* boot298: keep quiet through INQUIRY and READ CAPACITY too —
+     * a stuck device (failed SET_CONFIGURATION, BOT pipe locked up)
+     * floods the log during all three phases.  Quiet mode is cleared
+     * immediately after the RC sequence so the capacity print and all
+     * subsequent operations log normally.                             */
     if (tur_ok)
         uart_puts("[MSC] Device ready\n");
     else
@@ -459,25 +471,24 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
      * Many USB-SATA bridges (RTL9210 etc.) require an INQUIRY to initialise
      * their internal SCSI emulation layer; without it they accept TUR but stall
      * any command that has a data phase (including READ CAPACITY).
-     * We don't use the response data at this point — just ensuring the SCSI
-     * state machine advances past its initial state.                          */
+     * vendor[] / product[] are also used below for media_class scoring.       */
+    char msc_vendor[9]  = {0};
+    char msc_product[17] = {0};
     {
         uint8_t inq_cdb[6] = {0x12, 0, 0, 0, 36, 0};
         uint8_t inq_buf[36] = {0};
         int inq_rc = bot_scsi_cmd(drive, 0, inq_cdb, 6, inq_buf, 36, 1);
         if (inq_rc == 0) {
-            uart_puts("[MSC] INQUIRY OK  vendor='");
-            for (int _i = 8; _i < 16; _i++) {
-                char _c = (char)(inq_buf[_i] & 0x7Fu);
-                if (_c < 0x20) _c = ' ';
-                uart_puts((char[]){_c, '\0'});
+            for (int _i = 0; _i < 8;  _i++) {
+                char _c = (char)(inq_buf[8  + _i] & 0x7Fu);
+                msc_vendor[_i]  = (_c >= 0x20) ? _c : ' ';
             }
-            uart_puts("'  product='");
-            for (int _i = 16; _i < 32; _i++) {
-                char _c = (char)(inq_buf[_i] & 0x7Fu);
-                if (_c < 0x20) _c = ' ';
-                uart_puts((char[]){_c, '\0'});
+            for (int _i = 0; _i < 16; _i++) {
+                char _c = (char)(inq_buf[16 + _i] & 0x7Fu);
+                msc_product[_i] = (_c >= 0x20) ? _c : ' ';
             }
+            uart_puts("[MSC] INQUIRY OK  vendor='"); uart_puts(msc_vendor);
+            uart_puts("'  product='");               uart_puts(msc_product);
             uart_puts("'\n");
         } else {
             uart_puts("[MSC] INQUIRY failed (non-fatal)\n");
@@ -492,18 +503,23 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
      * before attempting any further commands.
      *
      * Sequence: RC(10) → on failure → BOT recover → RC(16)
-     *           → on failure → BOT recover → RC(10) retry → give up        */
-    /* RC(10) first; if it fails the stall is now cleared and CSW drained by
-     * bot_scsi_cmd itself, so RC(16) can follow immediately without a full
-     * bot_recover() cycle.  Only fall back to bot_recover() if RC(16) also
-     * fails (which would suggest a more serious protocol confusion).           */
+     *           → on failure → BOT recover → RC(16) retry → give up        */
+    /* boot291: RC(10) first.  If it stalls, the device's SCSI state machine
+     * is in phase-error (pending CSW, halted bulk-IN).  Attempting RC(16)
+     * while in that state causes the CBW to be interpreted as a phase error
+     * and the device (notably RTL9210 in HS-BOT mode) locks up entirely,
+     * refusing even EP0 for ~8 s.  Correct sequence:
+     *   RC(10) → on stall → bot_recover (BOMSR resets state machine)
+     *          → RC(16)   → on stall → bot_recover → RC(10) last-resort */
     uart_puts("[MSC] READ CAPACITY(10)...\n");
     if (bot_read_capacity(drive, 0) < 0) {
-        uart_puts("[MSC] RC(10) failed — trying RC(16)\n");
+        uart_puts("[MSC] RC(10) failed — BOT recover, then RC(16)\n");
+        bot_recover(drive);
+        msc_delay_ms(200);
         if (bot_read_capacity16(drive, 0) < 0) {
-            uart_puts("[MSC] RC(16) failed — full BOT recover, retry RC(10)\n");
+            uart_puts("[MSC] RC(16) failed — second BOT recover, last RC(10)\n");
             bot_recover(drive);
-            msc_delay_ms(100);
+            msc_delay_ms(200);
             if (bot_read_capacity(drive, 0) < 0) {
                 uart_puts("[MSC] READ CAPACITY failed — registering with 0 blocks\n");
                 drive->capacity[0]   = 0;
@@ -512,6 +528,7 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
         }
     }
 
+    xhci_set_quiet_timeouts(0);   /* boot298: quiet zone ends — all commands log normally from here */
     uart_puts("[MSC] LUN 0: capacity=0x");
     print_hex64(drive->capacity[0]);
     uart_puts(" sectors, block_size=");
@@ -539,6 +556,51 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
     priv->lun   = 0;
     bd->private = priv;
     bd->ops     = &usb_bdev_ops;
+
+    /* ── Media class classification ─────────────────────────────────────────
+     * VID/PID first (definitive); INQUIRY product string as fallback.
+     * Used by FileCore disc scoring: NVMe > SSD > USB-Flash > SD.            */
+    {
+        media_class_t mc   = MEDIA_USB_FLASH;
+        uint16_t      vid  = dev->idVendor;
+        uint16_t      pid  = dev->idProduct;
+
+        /* Known USB-NVMe bridges */
+        if      (vid == 0x0bdau && pid == 0x9210u) mc = MEDIA_NVME; /* RTL9210  */
+        else if (vid == 0x152du && pid == 0x0583u) mc = MEDIA_NVME; /* JMS583   */
+        else if (vid == 0x2109u && pid == 0x0715u) mc = MEDIA_NVME; /* VL716    */
+        /* Known USB-SATA SSD enclosures */
+        else if (vid == 0x174cu && pid == 0x55aau) mc = MEDIA_SSD;  /* ASM1351  */
+        else if (vid == 0x152du && pid == 0x0578u) mc = MEDIA_SSD;  /* JMS580   */
+        else if (vid == 0x0080u && pid == 0x0578u) mc = MEDIA_SSD;  /* Sabrent  */
+        else {
+            /* INQUIRY product string heuristic — simple substring search */
+            static const char * const nvme_keys[] = { "NVMe","NVME","NVM",NULL };
+            static const char * const ssd_keys[]  = { "SSD","M.2",NULL };
+            int matched = 0;
+            for (int _k = 0; nvme_keys[_k] && !matched; _k++) {
+                const char *h = msc_product, *n = nvme_keys[_k];
+                for (int _i = 0; h[_i] && !matched; _i++) {
+                    int _j = 0;
+                    while (n[_j] && h[_i+_j] == n[_j]) _j++;
+                    if (!n[_j]) { mc = MEDIA_NVME; matched = 1; }
+                }
+            }
+            for (int _k = 0; ssd_keys[_k] && !matched; _k++) {
+                const char *h = msc_product, *n = ssd_keys[_k];
+                for (int _i = 0; h[_i] && !matched; _i++) {
+                    int _j = 0;
+                    while (n[_j] && h[_i+_j] == n[_j]) _j++;
+                    if (!n[_j]) { mc = MEDIA_SSD;  matched = 1; }
+                }
+            }
+        }
+        bd->media_class = mc;
+        uart_puts("[MSC] media_class=");
+        uart_puts(mc == MEDIA_NVME ? "NVMe" :
+                  mc == MEDIA_SSD  ? "SSD"  : "USB-Flash");
+        uart_puts("\n");
+    }
 
     drive->bdev[0] = bd;
 

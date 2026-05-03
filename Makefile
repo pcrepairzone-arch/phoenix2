@@ -65,6 +65,10 @@ OBJS = \
     kernel/led_diag.o \
     kernel/periph_base.o \
     kernel/mmio.o \
+    kernel/module.o \
+    kernel/test_module.o \
+    kernel/cursor_module.o \
+    kernel/cursor_module_impl.o \
     drivers/uart/uart.o \
     drivers/gpu/gpu.o \
     drivers/nvme/nvme.o \

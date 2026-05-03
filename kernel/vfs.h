@@ -115,4 +115,8 @@ file_ops_t *get_fs_ops(inode_t *inode);
 /* FileCore VFS entry point — called from kernel_main */
 void        vfs_register_filecore(void);
 
+/* FileCore public API — also callable directly when VFS not needed          */
+int         filecore_find_path(const char *path, vfs_dirent_t *out);
+uint8_t    *filecore_read_file(uint32_t sin, uint32_t size);
+
 #endif /* VFS_H */

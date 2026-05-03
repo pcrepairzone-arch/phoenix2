@@ -593,7 +593,8 @@ int mmc_init(void)
     /* Register with the block device layer — see mmc_bd_* below */
     blockdev_t *bd = blockdev_register("mmc", mmc_host.capacity, 512);
     if (bd) {
-        bd->ops = &mmc_bd_ops;
+        bd->ops         = &mmc_bd_ops;
+        bd->media_class = MEDIA_SD;
         debug_print("MMC: Registered as block device unit %d (%llu blocks)\n",
                     bd->unit, mmc_host.capacity);
     } else {

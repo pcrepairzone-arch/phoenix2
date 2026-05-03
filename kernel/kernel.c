@@ -22,12 +22,13 @@
 #include "kernel.h"
 #include "errno.h"
 #include "error.h"
-#include "../drivers/gpu/framebuffer.h"  /* con_printf() */
+#include "../drivers/gpu/framebuffer.h"  /* con_printf(), con_set_colours() */
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations for subsystem init functions                  */
 /* ------------------------------------------------------------------ */
 extern void uart_init(void);           /* drivers/uart/uart.c     */
+extern void uart_set_quiet(int q);     /* drivers/uart/uart.c     */
 extern int vl805_init(void);		/* drivers/usb/vl805_init.c */
 extern void gpu_init(void);             /* drivers/gpu/gpu.c        */
 extern void device_tree_parse(uint64_t);/* kernel/devicetree.c      */
@@ -43,9 +44,10 @@ extern void pci_init(void);             /* kernel/pci.c             */
 extern int usb_init(void);
 extern int mmc_init(void);              /* drivers/mmc/mmc.c        */
 extern void vfs_init(void);             /* kernel/vfs.c (stub)      */
-extern void filecore_init(void);        /* kernel/filecore.c        */
-extern void filecore_list_root(void);   /* kernel/filecore.c        */
-extern void filecore_show_results(void);/* kernel/filecore.c        */
+extern void filecore_init(void);        /* kernel/filecore.c */
+extern void filecore_list_root(void);   /* kernel/filecore.c */
+extern void filecore_show_results(void);/* kernel/filecore.c */
+extern void module_init_all(void);      /* kernel/module.c   */
 extern void net_init(void);             /* net/tcpip.c (stub)       */
 extern void wimp_init(void);            /* wimp/wimp.c (stub)       */
 extern void register_default_handlers(void); /* kernel/signal.c    */
@@ -74,12 +76,22 @@ void kernel_main(uint64_t dtb_ptr)
     /* CRITICAL: Detect peripheral base address from DTB/hardware */
     extern void detect_peripheral_base(uint64_t dtb_ptr);
     detect_peripheral_base(dtb_ptr);
-    
+
+    /* boot266: Immediately disable the BCM2711 PM watchdog.
+     * The VideoCore firmware arms it (~16 s default timeout) before handing
+     * off to kernel8.img.  Long USB MSC retry loops fire it right as WIMP
+     * starts, causing a hard reboot every time.  Disable before anything else. */
+    extern void wdog_disable(void);
+    wdog_disable();
+
     /* Now we can use GPIO/UART/Mailbox with correct addresses */
     extern void led_signal_boot_ok(void);
     led_signal_boot_ok();
 
     uart_init();
+
+    /* boot266: confirm watchdog was disabled (wdog_disable runs before uart) */
+    debug_print("[WDT] BCM2711 PM watchdog disabled (boot266)\n");
 
     extern void led_signal_kernel_main(void);
     led_signal_kernel_main();
@@ -178,10 +190,13 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("\n[10/10] VFS / Network / Signals...\n");
     vfs_init();
     filecore_init();
+    uart_set_quiet(1);   /* boot256: silence FileCore/IDA verbose scan */
     filecore_list_root();
     filecore_show_results();
+    module_init_all();
     net_init();
     register_default_handlers();
+    uart_set_quiet(0);   /* boot256: re-enable for boot-complete banner */
     debug_print("Subsystems ready\n");
 
     /* Final screen status */
@@ -211,11 +226,22 @@ void init_process(void)
 {
     debug_print("init: launching desktop...\n");
 
-    task_create("Wimp",     wimp_task,    0,  (1ULL << 0));
-    task_create("Paint64",  paint_task,   10, 0);
-    task_create("NetSurf",  netsurf_task, 10, 0);
+    /* Wimp is the primary interactive task — give it higher priority so
+     * pick_next_task always chooses it over Paint/NetSurf.
+     * Paint/NetSurf run cooperatively at low priority.                  */
+    task_create("Wimp",     wimp_task,    10, (1ULL << 0));
+    task_create("Paint64",  paint_task,    1, 0);
+    task_create("NetSurf",  netsurf_task,  1, 0);
 
-    while (1) yield();
+    debug_print("init: tasks spawned, blocking.\n");
+
+    /* Block permanently — init's job is done.  Yielding would keep init
+     * in the READY queue at TASK_MAX_PRIORITY, starving every child.    */
+    extern void task_block(task_state_t state);
+    task_block(TASK_BLOCKED);
+
+    /* Should never reach here */
+    while (1) { __asm__ volatile("wfe"); }
 }
 
 /* ------------------------------------------------------------------ */

@@ -230,6 +230,20 @@ int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
                              uint32_t dev_speed);
 
 /**
+ * @brief Tear down the xHCI slot for a device disconnected from a hub port.
+ *
+ * boot287: Sends Stop Endpoint + Disable Slot commands to the VL805 MCU,
+ * zeros DCBAA[slot], resets all ring-state arrays, and notifies the HID
+ * layer so it stops polling the removed device.  Must be called from
+ * hub_poll_hotplug() whenever a downstream device disconnect is detected.
+ *
+ * @hub_dev   usb_device_t of the hub (hcd_private = hub slot_id)
+ * @hub_port  1-based hub port number (same as passed to xhci_enumerate_hub_port)
+ * @return 0 on success, -1 if no active slot was found for that port
+ */
+int xhci_disconnect_hub_child(usb_device_t *hub_dev, uint8_t hub_port);
+
+/**
  * @brief Re-configure bulk endpoint rings after a transfer failure.
  *
  * Issues RESET ENDPOINT (Halted → Stopped) for each bulk endpoint in @dev,

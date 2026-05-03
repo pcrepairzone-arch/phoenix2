@@ -2,6 +2,7 @@
  * vfs.c – Virtual File System (Simplified stub)
  * Author:  R Andrews  – 05 Feb 2026
  * Updated: 15 Feb 2026 - Stub version for compilation
+ * Updated: boot247, April 2026 – FileCore VFS driver; vfs_dirent_t readdir
  */
 
 #include "kernel.h"
@@ -21,11 +22,78 @@ static file_t files[MAX_FILES];
 static int num_files = 0;
 static spinlock_t file_lock = SPINLOCK_INIT;
 
-/* Stub: Resolve path to inode */
-static inode_t *resolve_path(const char *path) {
-    // TODO: Implement path resolution
-    (void)path;
-    return NULL;
+/* Forward declarations for FileCore public API (defined in filecore.c) */
+extern int      filecore_find_path(const char *path, vfs_dirent_t *out);
+extern uint8_t *filecore_read_file(uint32_t sin, uint32_t size);
+extern void     kfree(void *);
+
+/* ── FileCore file_ops ───────────────────────────────────────────────────── */
+
+static ssize_t fc_vfs_read(file_t *file, void *buf, size_t count)
+{
+    if (!file || !file->f_inode) return -1;
+    uint32_t sin  = file->f_inode->sin;
+    uint32_t size = (uint32_t)file->f_inode->i_size;
+    if (size == 0u || count == 0u) return 0;
+
+    uint8_t *fbuf = filecore_read_file(sin, size);
+    if (!fbuf) return -1;
+
+    uint64_t pos = file->f_pos;
+    if (pos >= (uint64_t)size) { kfree(fbuf); return 0; }
+
+    size_t avail = (size_t)(size - (uint32_t)pos);
+    size_t n     = (count < avail) ? count : avail;
+
+    const uint8_t *src = fbuf + pos;
+          uint8_t *dst = (uint8_t *)buf;
+    for (size_t i = 0u; i < n; i++) dst[i] = src[i];
+
+    file->f_pos += (uint64_t)n;
+    kfree(fbuf);
+    return (ssize_t)n;
+}
+
+static off_t fc_vfs_seek(file_t *file, off_t offset, int whence)
+{
+    if (!file || !file->f_inode) return (off_t)-1;
+    uint64_t size = file->f_inode->i_size;
+    off_t    np;
+    if      (whence == 0) np = offset;                      /* SEEK_SET */
+    else if (whence == 1) np = (off_t)file->f_pos + offset; /* SEEK_CUR */
+    else                  np = (off_t)size + offset;        /* SEEK_END */
+    if (np < 0)              np = 0;
+    if ((uint64_t)np > size) np = (off_t)size;
+    file->f_pos = (uint64_t)np;
+    return np;
+}
+
+static file_ops_t filecore_file_ops = {
+    .read  = fc_vfs_read,
+    .write = NULL,
+    .seek  = fc_vfs_seek,
+    .poll  = NULL,
+    .readdir = NULL,
+    .close = NULL,
+};
+
+/* ── resolve_path ────────────────────────────────────────────────────────── */
+static inode_t *resolve_path(const char *path)
+{
+    vfs_dirent_t ent;
+    if (filecore_find_path(path, &ent) != 0) return NULL;
+
+    inode_t *inode = vfs_alloc_inode();
+    if (!inode) return NULL;
+
+    inode->sin       = ent.sin;
+    inode->i_size    = (uint64_t)ent.size;
+    inode->i_blocks  = (ent.size + 511u) / 512u;
+    inode->load_addr = ent.load_addr;
+    inode->exec_addr = ent.exec_addr;
+    inode->file_type = ent.riscos_type;
+    inode->i_mode    = (ent.type == VFS_DIRENT_DIR) ? S_IFDIR : S_IFREG;
+    return inode;
 }
 
 /* Allocate new inode */
@@ -41,7 +109,7 @@ inode_t *vfs_alloc_inode(void) {
 
     inode_t *inode = &inodes[num_inodes++];
     memset(inode, 0, sizeof(*inode));
-    inode->file_type = 0xFFF;  // Default Text
+    inode->file_type = 0xFFF;  /* Default Text */
 
     spin_unlock_irqrestore(&inode_lock, flags);
     return inode;
@@ -60,7 +128,7 @@ file_t *vfs_open(const char *path, int flags) {
         errno = EINVAL;
         return NULL;
     }
-    
+
     unsigned long fl;
     spin_lock_irqsave(&file_lock, &fl);
 
@@ -129,10 +197,12 @@ int vfs_poll(file_t *file) {
     return file->f_ops->poll(file);
 }
 
-/* Stub: Get filesystem operations */
-file_ops_t *get_fs_ops(inode_t *inode) {
-    // TODO: Implement FS ops lookup based on inode type
-    (void)inode;
+/* Return file_ops for the inode's filesystem type */
+file_ops_t *get_fs_ops(inode_t *inode)
+{
+    if (!inode) return NULL;
+    /* FileCore regular files — directories are not directly read */
+    if (inode->i_mode & S_IFREG) return &filecore_file_ops;
     return NULL;
 }
 
@@ -223,7 +293,8 @@ static const vfs_filesystem_t filecore_fs_driver = {
     .readdir = filecore_vfs_readdir,
 };
 
-/* Called from kernel_main during boot */
+/* Called from kernel_main during boot (optional — kernel.c calls filecore
+ * directly for now; this provides the VFS-layer path for future use).     */
 void vfs_register_filecore(void)
 {
     uart_puts("[VFS] Registering FileCore driver\n");

@@ -31,14 +31,26 @@ typedef struct blockdev_ops {
     void (*close)(blockdev_t *dev);
 } blockdev_ops_t;
 
+/* ── Media class — set by each driver at registration time ───────────────────
+ * Used by FileCore disc scoring to prefer faster / more reliable boot media.
+ * Scoring order (highest to lowest): NVME > SSD > USB_FLASH > SD > UNKNOWN  */
+typedef enum {
+    MEDIA_UNKNOWN   = 0,   /* not classified (treated as USB_FLASH for scoring) */
+    MEDIA_SD        = 1,   /* SD / eMMC / MMC card                              */
+    MEDIA_USB_FLASH = 2,   /* USB thumb drive / flash stick                     */
+    MEDIA_SSD       = 3,   /* USB-attached SATA SSD (ASMedia, JMicron etc.)     */
+    MEDIA_NVME      = 4,   /* USB-NVMe bridge (RTL9210, JMS583 etc.)            */
+} media_class_t;
+
 /* Main block device descriptor */
 struct blockdev {
-    char            name[16];       /* e.g. "nvme", "usb", "sata", "mmc" */
-    uint64_t        size;           /* Total number of blocks */
-    uint32_t        block_size;     /* Usually 512 or 4096 */
-    int             unit;           /* Unit number (for multi-device) */
-    void           *private;        /* Driver private data */
-    blockdev_ops_t *ops;            /* Operations table */
+    char            name[16];       /* e.g. "nvme", "usb", "sata", "mmc"        */
+    uint64_t        size;           /* Total number of blocks                    */
+    uint32_t        block_size;     /* Usually 512 or 4096                       */
+    int             unit;           /* Unit number (for multi-device)            */
+    media_class_t   media_class;    /* Media type — set by registering driver    */
+    void           *private;        /* Driver private data                       */
+    blockdev_ops_t *ops;            /* Operations table                          */
 };
 
 /* Register a new block device */

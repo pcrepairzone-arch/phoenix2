@@ -88,9 +88,9 @@ task_t *task_create(const char *name, void (*entry)(void), int priority, uint64_
     int cpu = (int)__builtin_ctzll(task->cpu_affinity);
     if (cpu >= MAX_CPUS) cpu = 0;   /* guard against affinity=0 or out-of-range */
     cpu_sched_t *sched = &cpu_sched[cpu];
-    spin_lock(&sched->lock);
+    /* enqueue_task() acquires its own lock internally — do NOT hold the
+     * lock here or we deadlock (same-CPU non-reentrant spinlock).       */
     enqueue_task(sched, task);
-    spin_unlock(&sched->lock);
 
     uart_puts("[TC] done\r\n");
 
@@ -144,13 +144,10 @@ int fork(void)
     uint64_t offset = parent->sp_el0 - (parent->stack_top - KERNEL_STACK_SIZE);
     child->sp_el0 = child->stack_top - offset;
 
-    /* Add to scheduler queue */
+    /* Add to scheduler queue — enqueue_task() locks internally */
     int cpu = get_cpu_id();
     cpu_sched_t *sched = &cpu_sched[cpu];
-    unsigned long flags;
-    spin_lock_irqsave(&sched->lock, &flags);
     enqueue_task(sched, child);
-    spin_unlock_irqrestore(&sched->lock, flags);
 
     debug_print("Fork successful: parent PID=%d, child PID=%d\n", parent->pid, child_pid);
     return child_pid;

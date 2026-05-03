@@ -77,3 +77,40 @@ uint64_t get_gpio_base(void)    { return peripheral_base + 0x200000; }
 uint64_t get_uart_base(void)    { return peripheral_base + 0x201000; }
 uint64_t get_mailbox_base(void) { return peripheral_base + 0x00B880; }
 int      get_pi_model(void)     { return pi_model; }
+
+/* boot266: BCM2711 PM watchdog disable.
+ *
+ * The VideoCore firmware arms the hardware watchdog when it loads kernel8.img.
+ * Default timeout is ~16 seconds.  Our USB MSC enumeration spends up to 20 s
+ * on retry loops for slow/stalled devices, which fires the watchdog and causes
+ * a hard reboot exactly as the WIMP task starts.
+ *
+ * Disable immediately after peripheral_base is known, before any long ops.
+ *
+ * BCM2711 PM registers (periph_base + 0x100000):
+ *   PM_RSTC  (+0x1c)  bits[5:4] = WRCFG — 0x00=no-reset 0x20=full-reset
+ *   PM_WDOG  (+0x24)  countdown timer — 0 = stopped
+ *   All writes require the 'password' in bits[31:24] = 0x5A.
+ */
+void wdog_disable(void)
+{
+    volatile uint32_t *pm_rstc =
+        (volatile uint32_t *)(peripheral_base + 0x10001cULL);
+    volatile uint32_t *pm_wdog =
+        (volatile uint32_t *)(peripheral_base + 0x100024ULL);
+    const uint32_t PASSWD = 0x5A000000U;
+
+    uint32_t rstc_before = *pm_rstc;
+    uint32_t wdog_before = *pm_wdog;
+
+    *pm_wdog = PASSWD | 0U;                          /* stop countdown        */
+    *pm_rstc = PASSWD | (rstc_before & ~0x30U);      /* WRCFG = no-reset      */
+    /* memory barrier so writes reach the PMIC before anything else runs */
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    /* Log via uart_puts (UART not yet init'd — but we're called after
+     * detect_peripheral_base, which only reads timers; uart_init() happens
+     * next.  So use debug_print only if uart already works.  Print after
+     * uart_init() instead: kernel.c will print the confirm line.             */
+    (void)wdog_before; /* available for debug if needed */
+}

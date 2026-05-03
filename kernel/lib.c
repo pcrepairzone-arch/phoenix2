@@ -3,6 +3,8 @@
  */
 #include "kernel.h"
 #include <stdarg.h>
+/* boot265: visual heartbeat — draw to framebuffer without fb_mark_ready dependency */
+#include "drivers/gpu/framebuffer.h"
 
 /* Forward declare UART functions */
 extern void uart_putc(char c);
@@ -229,7 +231,12 @@ static inline uint32_t wimp_ms(void) {
 
 void wimp_task(void)
 {
+    /* boot256: guarantee uart_puts is live for WIMP/interrupt diagnostics */
+    extern void uart_set_quiet(int q);
+    uart_set_quiet(0);
+
     extern int  hid_poll_all(void)               __attribute__((weak));
+    extern void hid_poll_mice(void)              __attribute__((weak));
     extern void hub_poll_hotplug(void)           __attribute__((weak));
     extern int  xhci_check_hotplug(void)         __attribute__((weak));
     extern void mouse_get_pos(int16_t *x,
@@ -253,20 +260,81 @@ void wimp_task(void)
     /* keyboard_poll: drain the RISC OS keyboard event ring */
     extern int keyboard_poll(void *ev) __attribute__((weak));
 
+    /* boot267: DWC2 OTG HID poll (mouse/keyboard via hub on USB-C port) */
+    extern void dwc2_hid_poll(void) __attribute__((weak));
+
     /* Print a prompt so the user knows the console is live */
     if (con_puts) con_puts("\n[ESC to stop loop]\n> ");
-    uint32_t last_hotplug = wimp_ms();
+
+    /* boot271: drain UART TX FIFO before entering the loop so we start
+     * with a known-empty FIFO and uart_putc has 16 free slots.       */
+    extern void uart_drain(void);
+    extern volatile uint32_t g_uart_stalls;
+    uart_drain();
+    debug_print("[WIMP] drain done, stalls=%u\n", (unsigned)g_uart_stalls);
+
+    uint32_t last_hotplug  = wimp_ms();
+    uint32_t last_hid      = wimp_ms();
+    uint32_t last_mouse    = wimp_ms(); /* boot285: 4 ms high-frequency mouse poll */
+    uint32_t last_beat     = wimp_ms();
+    uint32_t last_dwc2    = wimp_ms(); /* boot267: DWC2 HID poll timestamp */
+    /* boot265: visual heartbeat — blinks a 16×16 square below the green
+     * corner marker (top-right) at 1 Hz so the user can see WIMP is alive
+     * without needing a serial terminal.  Drawn only when fb.valid is set. */
+    uint32_t last_visual  = wimp_ms();
+    int      visual_on    = 0;
 
     while (1) {
-        /* ── HID input: keyboard + mouse (every loop) ─────────────────── */
-        if (hid_poll_all) hid_poll_all();
+        /* ── Heartbeat: 500 ms — confirms WIMP loop is running ────────── */
+        {
+            uint32_t now_b = wimp_ms();
+            if ((now_b - last_beat) >= 500u) {
+                last_beat = now_b;
+                debug_print("[WIMP] alive t=%dms stalls=%u\n",
+                            (int)now_b, (unsigned)g_uart_stalls);
+            }
+        }
+
+        /* ── Mouse input (xHCI path): ~250 Hz (4 ms), non-blocking.
+         * boot285: High-frequency mouse poll keeps the interrupt TRB
+         * perpetually queued and catches each 7 ms mouse report within
+         * one poll window.  Deltas stay small → smooth cursor tracking.
+         * hid_poll_mice() calls usb_interrupt_transfer(timeout=0) which
+         * does a single event-ring check and returns immediately (<5 µs)
+         * when no data is ready — WIMP is never stalled.                */
+        {
+            uint32_t now_m = wimp_ms();
+            if ((now_m - last_mouse) >= 4u) {
+                last_mouse = now_m;
+                if (hid_poll_mice) hid_poll_mice();
+            }
+        }
+
+        /* ── Keyboard input (xHCI path): ~60 Hz (16 ms), blocking 8 ms.
+         * boot285: hid_poll_all() now skips mice (handled above).
+         * boot275: raised from 10 Hz so brief keypresses are caught.   */
+        uint32_t now_hid = wimp_ms();
+        if ((now_hid - last_hid) >= 16u) {
+            last_hid = now_hid;
+            if (hid_poll_all) hid_poll_all();
+        }
+
+        /* ── DWC2 OTG HID input: ~60 Hz (16 ms) ──────────────────────── */
+        {
+            uint32_t now_d = wimp_ms();
+            if ((now_d - last_dwc2) >= 16u) {
+                last_dwc2 = now_d;
+                if (dwc2_hid_poll) dwc2_hid_poll();
+            }
+        }
 
         /* ── Keyboard events: drain queue, break on ESC ───────────────── */
         if (keyboard_poll) {
-            /* keyboard_event_t is { uint8_t key_code, key_char, modifiers } */
             uint8_t ev[4];
             while (keyboard_poll(ev)) {
-                uint8_t kchar = ev[1];  /* key_char at offset 1 */
+                uint8_t kcode = ev[0];  /* HID key_code */
+                uint8_t kchar = ev[1];  /* ASCII key_char */
+                debug_print("[WIMP] key code=0x%02x char=0x%02x\n", kcode, kchar);
                 if (kchar == 0x1B) {    /* ESC key */
                     if (con_puts) con_puts("\n[Loop stopped by ESC]\n");
                     debug_print("[WIMP] ESC pressed — loop halted\n");
@@ -286,12 +354,31 @@ void wimp_task(void)
             }
         }
 
-        /* ── USB hotplug: rate-limited to once per 500 ms ─────────────── */
-        uint32_t now = wimp_ms();
-        if ((now - last_hotplug) >= 500u) {
-            last_hotplug = now;
-            if (hub_poll_hotplug)   hub_poll_hotplug();
-            if (xhci_check_hotplug) xhci_check_hotplug();
+        /* ── Visual heartbeat: blink 32×32 square at screen centre ──── */
+        {
+            uint32_t now_v = wimp_ms();
+            if ((now_v - last_visual) >= 500u) {
+                last_visual = now_v;
+                visual_on   = !visual_on;
+                if (fb.valid && fb.base) {
+                    int bx = (int)(fb.width  / 2u) - 16;
+                    int by = (int)(fb.height / 2u) - 16;
+                    pixel_t col = visual_on
+                        ? RGB(30, 220, 30)
+                        : RGB(48,  48, 48);
+                    fb_fill_rect(bx, by, 32, 32, col);
+                }
+            }
+        }
+
+        /* ── USB hotplug: 500 ms ───────────────────────────────────────── */
+        {
+            uint32_t now = wimp_ms();
+            if ((now - last_hotplug) >= 500u) {
+                last_hotplug = now;
+                if (hub_poll_hotplug)   hub_poll_hotplug();
+                if (xhci_check_hotplug) xhci_check_hotplug();
+            }
         }
 
         yield();
@@ -301,8 +388,8 @@ loop_exit:
     while (1) { __asm__ volatile("wfe"); }
 }
 
-void paint_task(void)    { while(1) { __asm__ volatile("wfe"); } }
-void netsurf_task(void)  { while(1) { __asm__ volatile("wfe"); } }
+void paint_task(void)    { while(1) { yield(); } }
+void netsurf_task(void)  { while(1) { yield(); } }
 
 void mmu_free_pagetable(task_t *task) { (void)task; }
 void mmu_free_usermemory(task_t *task) { (void)task; }

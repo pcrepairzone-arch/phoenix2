@@ -357,10 +357,13 @@ static int dwc2_hc_xfer(int ch, uint32_t hcchar, uint32_t hctsiz,
             return 0;
         }
 
-        /* Fatal errors */
+        /* Fatal errors — halt channel before returning so ch0 is not
+         * left in CHENA=1 state (boot268 fix: TXERR left ch enabled). */
         if (ints & HCINT_ALL_ERR) {
             debug_print("[DWC2] hc_xfer error: HCINT=0x%08x HCCHAR=0x%08x\n",
                         (unsigned)ints, (unsigned)dwc2_rd(HCCHAR(ch)));
+            dwc2_wr(HCCHAR(ch), HCCHAR_CHDIS | HCCHAR_CHENA);
+            dwc2_delay_ms(1);  /* wait for CHH */
             return -1;
         }
 
@@ -509,8 +512,11 @@ typedef struct {
 /* dwc2_enumerate_device() — send GET_DESCRIPTOR(Device) at address 0
  * and identify the device class from the response.
  *
- * speed: 0=HS, 1=FS, 2=LS (from HPRT_SPD field)                     */
-static int dwc2_enumerate_device(int speed)
+ * speed:   0=HS, 1=FS, 2=LS (from HPRT_SPD field)
+ * out_mps: receives bMaxPacketSize0 (caller's initial MPS for EP0)
+ *
+ * Returns: device class byte (>=0) on success, -1 on error.           */
+static int dwc2_enumerate_device(int speed, int *out_mps)
 {
     int is_ls = (speed == 2);
     /* Use MPS=8 for LS (spec-mandated), 64 for FS/HS (safe default)  */
@@ -570,12 +576,554 @@ static int dwc2_enumerate_device(int speed)
     uart_puts(class_str);
     uart_puts("\n");
 
+    /* Pass back bMaxPacketSize0 so the caller can set up control transfers */
+    if (out_mps) *out_mps = (int)dd->bMaxPacketSize0;
+
     /* If HID class or composite (HID likely in interface), note next step */
     if (cls == 0x03 || cls == 0x00) {
-        uart_puts("[DWC2] HID device detected — EP0 GET_DESCRIPTOR(Config) next\n");
+        uart_puts("[DWC2] HID device detected — will enumerate config\n");
+    } else if (cls == 0x09) {
+        uart_puts("[DWC2] Hub class device detected — will enumerate ports\n");
     }
 
+    return (int)cls;   /* caller uses class to decide next step */
+}
+
+/* ══════════════════════════════════════════════════════════════════ *
+ *  HUB ENUMERATION + HID POLLING  (boot267)                         *
+ * ══════════════════════════════════════════════════════════════════ *
+ *                                                                    *
+ * When the DWC2 OTG port has a USB hub attached (VID=0x1a40, the    *
+ * Terminus hub seen in bootlog266), this code:                       *
+ *   1. Assigns the hub a USB address (SET_ADDRESS → addr 1)         *
+ *   2. Reads the hub class descriptor to find port count            *
+ *   3. Powers and resets each port                                  *
+ *   4. For each connected child device:                             *
+ *      a. Assigns a USB address (2, 3, …)                          *
+ *      b. Reads its device + config descriptor                      *
+ *      c. If HID boot-protocol keyboard or mouse:                  *
+ *         registers it in dwc2_hid[] for polling                   *
+ *   5. dwc2_hid_poll() is called from the WIMP loop every 16 ms    *
+ *      and issues GET_REPORT (class request, EP0) for each device,  *
+ *      feeding data into mouse_event() / keyboard_event().          *
+ *                                                                    *
+ * All transfers use dwc2_ctrl_xfer() (channel 0, polling mode).     *
+ * No interrupt-IN endpoint is required — GET_REPORT works reliably  *
+ * on any properly configured HID device.                            *
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* ── Static DMA buffer for large descriptor reads ────────────────── *
+ * dwc2_data_buf (256 B, defined above) is used for all DATA-IN DMA. *
+ * An additional aligned scratch buffer holds the full config desc.   */
+static uint8_t __attribute__((aligned(64))) dwc2_scratch[256];
+
+/* ── DWC2 HID device registry ────────────────────────────────────── */
+
+#define DWC2_MAX_HID        2
+#define DWC2_PROTO_KBD      1
+#define DWC2_PROTO_MOUSE    2
+
+typedef struct {
+    uint8_t  active;
+    uint8_t  dev_addr;   /* USB address assigned during enumeration */
+    uint8_t  if_num;     /* HID interface number                    */
+    uint8_t  protocol;   /* DWC2_PROTO_KBD / DWC2_PROTO_MOUSE      */
+    uint8_t  is_ls;      /* 1 = Low Speed device                    */
+    uint16_t ep0_mps;    /* EP0 Max Packet Size                     */
+    uint8_t  last_report[8]; /* for debounce                        */
+} dwc2_hid_t;
+
+static dwc2_hid_t dwc2_hid[DWC2_MAX_HID];
+static int        dwc2_hid_cnt = 0;
+static uint32_t   dwc2_last_poll_ms[DWC2_MAX_HID]; /* per-device poll stamp */
+
+/* ── ARM system counter → milliseconds (same formula as WIMP) ───── */
+static inline uint32_t dwc2_ms(void) {
+    uint64_t cnt, freq;
+    asm volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    return (uint32_t)(cnt / (freq / 1000ULL));
+}
+
+/* ── Standard USB control helpers ────────────────────────────────── *
+ * All use dwc2_ctrl_xfer() which handles DMA, NAK retry, and cache. */
+
+/* GET_DESCRIPTOR(Configuration, len) */
+static int dwc2_get_config_desc(int addr, void *buf, int len, int mps, int is_ls)
+{
+    uint8_t s[8] = { 0x80, 0x06, 0x00, 0x02, 0x00, 0x00,
+                     (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    return dwc2_ctrl_xfer(addr, s, 1, buf, len, mps, is_ls);
+}
+
+/* GET_DESCRIPTOR(Device, len) at any address */
+static int dwc2_get_dev_desc(int addr, void *buf, int len, int mps, int is_ls)
+{
+    uint8_t s[8] = { 0x80, 0x06, 0x00, 0x01, 0x00, 0x00,
+                     (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    return dwc2_ctrl_xfer(addr, s, 1, buf, len, mps, is_ls);
+}
+
+/* SET_ADDRESS */
+static int dwc2_set_address(int cur_addr, int new_addr, int mps, int is_ls)
+{
+    uint8_t s[8] = { 0x00, 0x05,
+                     (uint8_t)(new_addr & 0x7F), 0x00,
+                     0x00, 0x00, 0x00, 0x00 };
+    return dwc2_ctrl_xfer(cur_addr, s, 0, NULL, 0, mps, is_ls);
+}
+
+/* SET_CONFIGURATION */
+static int dwc2_set_configuration(int addr, int cfg, int mps, int is_ls)
+{
+    uint8_t s[8] = { 0x00, 0x09,
+                     (uint8_t)(cfg & 0xFF), 0x00,
+                     0x00, 0x00, 0x00, 0x00 };
+    return dwc2_ctrl_xfer(addr, s, 0, NULL, 0, mps, is_ls);
+}
+
+/* ── Hub class helpers ────────────────────────────────────────────── */
+
+/* Hub class GET_DESCRIPTOR (type=0x29) */
+static int dwc2_hub_get_class_desc(int hub_addr, void *buf, int len, int mps)
+{
+    uint8_t s[8] = { 0xA0, 0x06, 0x00, 0x29, 0x00, 0x00,
+                     (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    return dwc2_ctrl_xfer(hub_addr, s, 1, buf, len, mps, 0 /*hub=FS*/);
+}
+
+/* Hub class GET_PORT_STATUS: returns wPortStatus and wPortChange */
+static int dwc2_hub_get_port_status(int hub_addr, int port,
+                                     uint16_t *status, uint16_t *change,
+                                     int mps)
+{
+    uint8_t s[8] = { 0xA3, 0x00,           /* IN|Class|Other, GET_STATUS */
+                     0x00, 0x00,            /* wValue = 0                 */
+                     (uint8_t)port, 0x00,   /* wIndex = port              */
+                     0x04, 0x00 };          /* wLength = 4                */
+    uint8_t data[4] = {0};
+    int got = dwc2_ctrl_xfer(hub_addr, s, 1, data, 4, mps, 0);
+    if (got < 4) return -1;
+    if (status) *status = (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
+    if (change) *change = (uint16_t)(data[2] | ((uint16_t)data[3] << 8));
     return 0;
+}
+
+/* Hub class SET_FEATURE on a port */
+static int dwc2_hub_set_feature(int hub_addr, int port, int feature, int mps)
+{
+    uint8_t s[8] = { 0x23, 0x03,           /* OUT|Class|Other, SET_FEATURE */
+                     (uint8_t)(feature & 0xFF), (uint8_t)(feature >> 8),
+                     (uint8_t)port, 0x00,
+                     0x00, 0x00 };
+    return dwc2_ctrl_xfer(hub_addr, s, 0, NULL, 0, mps, 0);
+}
+
+/* Hub class CLEAR_FEATURE on a port */
+static int dwc2_hub_clear_feature(int hub_addr, int port, int feature, int mps)
+{
+    uint8_t s[8] = { 0x23, 0x01,           /* OUT|Class|Other, CLEAR_FEATURE */
+                     (uint8_t)(feature & 0xFF), (uint8_t)(feature >> 8),
+                     (uint8_t)port, 0x00,
+                     0x00, 0x00 };
+    return dwc2_ctrl_xfer(hub_addr, s, 0, NULL, 0, mps, 0);
+}
+
+/* ── HID class helpers ────────────────────────────────────────────── */
+
+/* HID SET_PROTOCOL 0 = boot protocol */
+static int dwc2_hid_set_protocol(int addr, int if_num, int mps, int is_ls)
+{
+    uint8_t s[8] = { 0x21, 0x0B,           /* OUT|Class|Interface, SET_PROTOCOL */
+                     0x00, 0x00,            /* wValue = 0 (boot protocol)        */
+                     (uint8_t)if_num, 0x00,
+                     0x00, 0x00 };
+    return dwc2_ctrl_xfer(addr, s, 0, NULL, 0, mps, is_ls);
+}
+
+/* HID GET_REPORT (class request on EP0) — used for polling */
+static int dwc2_hid_get_report(int addr, int if_num,
+                                void *buf, int len, int mps, int is_ls)
+{
+    uint8_t s[8] = { 0xA1, 0x01,           /* IN|Class|Interface, GET_REPORT */
+                     0x00, 0x01,            /* wValue = Input(1), ID=0        */
+                     (uint8_t)if_num, 0x00,
+                     (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    return dwc2_ctrl_xfer(addr, s, 1, buf, len, mps, is_ls);
+}
+
+/* ── Config descriptor parser ────────────────────────────────────── *
+ * Walk the descriptor chain and find the first HID boot-protocol     *
+ * interface (class=0x03, subclass=0x01, proto=1 keyboard or 2 mouse).*
+ * Returns 0 on success, fills out_if_num, out_proto, out_cfg_val.    */
+static int dwc2_parse_hid_config(const uint8_t *cfg, int total_len,
+                                  uint8_t *out_if_num, uint8_t *out_proto,
+                                  uint8_t *out_cfg_val)
+{
+    if (total_len < 9) return -1;
+    *out_cfg_val = cfg[5];  /* bConfigurationValue from config header */
+
+    int off = 0;
+    while (off < total_len - 1) {
+        uint8_t dlen  = cfg[off];
+        uint8_t dtype = cfg[off + 1];
+        if (dlen < 2 || off + dlen > total_len) break;
+
+        if (dtype == 0x04) {  /* Interface descriptor */
+            uint8_t iclass = cfg[off + 5];
+            uint8_t isub   = cfg[off + 6];
+            uint8_t iproto = cfg[off + 7];
+
+            /* HID boot protocol: class=0x03, subclass=0x01, proto=1 or 2 */
+            if (iclass == 0x03 && isub == 0x01 &&
+                (iproto == DWC2_PROTO_KBD || iproto == DWC2_PROTO_MOUSE)) {
+                *out_if_num = cfg[off + 2];
+                *out_proto  = iproto;
+                return 0;
+            }
+        }
+        off += dlen;
+    }
+    return -1;  /* no HID boot-protocol interface found */
+}
+
+/* ── Child device enumerator ─────────────────────────────────────── *
+ * Called after a hub port has been reset and the child device is     *
+ * in "Default" state at USB address 0.                               *
+ *  new_addr  : USB address to assign (hub_addr+1, then +2 for more)  *
+ *  child_is_ls : 1 if port status says LOW_SPEED                     */
+static void dwc2_enum_child(int new_addr, int child_is_ls)
+{
+    int mps = child_is_ls ? 8 : 64;
+    uint8_t desc[18] = {0};
+
+    /* Step 1: GET_DESCRIPTOR(Device, 8) at addr 0 to get bMaxPacketSize0 */
+    int got = dwc2_get_dev_desc(0, desc, 8, mps, child_is_ls);
+    if (got < 8) {
+        debug_print("[DWC2] Child@0: GET_DESCRIPTOR failed (got=%d)\n", got);
+        return;
+    }
+    mps = (int)desc[7];  /* update from bMaxPacketSize0 */
+    if (mps == 0) mps = child_is_ls ? 8 : 64;
+
+    uint8_t dev_class = desc[4];
+    debug_print("[DWC2] Child@0: class=0x%02x mps=%d is_ls=%d\n",
+                dev_class, mps, child_is_ls);
+
+    /* Step 2: SET_ADDRESS */
+    if (dwc2_set_address(0, new_addr, mps, child_is_ls) < 0) {
+        uart_puts("[DWC2] Child: SET_ADDRESS failed\n");
+        return;
+    }
+    dwc2_delay_ms(5);  /* device needs ~2ms to switch address */
+
+    /* Step 3: GET_DESCRIPTOR(Device, 18) at new_addr */
+    got = dwc2_get_dev_desc(new_addr, desc, 18, mps, child_is_ls);
+    if (got >= 18) {
+        dev_class = desc[4];
+        uint16_t vid = (uint16_t)(desc[8]  | ((uint16_t)desc[9]  << 8));
+        uint16_t pid = (uint16_t)(desc[10] | ((uint16_t)desc[11] << 8));
+        debug_print("[DWC2] Child@%d: class=0x%02x VID=0x%04x PID=0x%04x\n",
+                    new_addr, dev_class, (unsigned)vid, (unsigned)pid);
+    } else {
+        debug_print("[DWC2] Child@%d: partial desc (%d B)\n", new_addr, got);
+    }
+
+    /* Only proceed for HID (class=0x03) or composite (class=0x00, may have HID if) */
+    if (dev_class != 0x03 && dev_class != 0x00) {
+        debug_print("[DWC2] Child@%d: not HID (skipping)\n", new_addr);
+        return;
+    }
+
+    /* Step 4: GET_DESCRIPTOR(Config, 9) — read header to get wTotalLength */
+    uint8_t cfghdr[9] = {0};
+    got = dwc2_get_config_desc(new_addr, cfghdr, 9, mps, child_is_ls);
+    if (got < 4) {
+        debug_print("[DWC2] Child@%d: config header failed\n", new_addr);
+        return;
+    }
+    int total_len = (int)(cfghdr[2] | ((int)cfghdr[3] << 8));
+    if (total_len > (int)sizeof(dwc2_scratch)) total_len = (int)sizeof(dwc2_scratch);
+    if (total_len < 9) total_len = 9;
+
+    /* Step 5: GET_DESCRIPTOR(Config, total_len) — full descriptor */
+    got = dwc2_get_config_desc(new_addr, dwc2_scratch, total_len, mps, child_is_ls);
+    if (got < 9) {
+        debug_print("[DWC2] Child@%d: full config failed\n", new_addr);
+        return;
+    }
+
+    /* Step 6: Find HID boot-protocol interface */
+    uint8_t if_num = 0, protocol = 0, cfg_val = 1;
+    if (dwc2_parse_hid_config(dwc2_scratch, got, &if_num, &protocol, &cfg_val) < 0) {
+        debug_print("[DWC2] Child@%d: no HID boot-protocol interface\n", new_addr);
+        return;
+    }
+    const char *ps = (protocol == DWC2_PROTO_KBD)   ? "keyboard" :
+                     (protocol == DWC2_PROTO_MOUSE)  ? "mouse"    : "?";
+    debug_print("[DWC2] Child@%d: HID %s (if=%d cfg=%d)\n",
+                new_addr, ps, if_num, cfg_val);
+
+    /* Step 7: SET_CONFIGURATION */
+    dwc2_set_configuration(new_addr, cfg_val, mps, child_is_ls);
+    dwc2_delay_ms(10);
+
+    /* Step 8: SET_PROTOCOL 0 (boot protocol) */
+    dwc2_hid_set_protocol(new_addr, if_num, mps, child_is_ls);
+
+    /* Step 9: Register for polling */
+    if (dwc2_hid_cnt < DWC2_MAX_HID) {
+        dwc2_hid_t *h = &dwc2_hid[dwc2_hid_cnt];
+        __builtin_memset(h, 0, sizeof(*h));
+        h->active   = 1;
+        h->dev_addr = (uint8_t)new_addr;
+        h->if_num   = if_num;
+        h->protocol = protocol;
+        h->is_ls    = (uint8_t)child_is_ls;
+        h->ep0_mps  = (uint16_t)mps;
+        dwc2_hid_cnt++;
+        debug_print("[DWC2] HID %s registered at USB addr %d\n", ps, new_addr);
+        uart_puts("[DWC2] HID device registered — polling will start in WIMP task\n");
+    }
+}
+
+/* ── Hub enumerator ───────────────────────────────────────────────── *
+ * Called from dwc2_start() when the device at address 0 is a hub.   *
+ *  hub_mps  : bMaxPacketSize0 from the hub's device descriptor       *
+ *  hub_speed: speed detected from HPRT_SPD (0=HS, 1=FS, 2=LS)       */
+static void dwc2_enum_hub(int hub_mps, int hub_speed)
+{
+    (void)hub_speed;  /* currently assumed FS; extend if needed */
+
+    uart_puts("[DWC2] Hub enumeration starting\n");
+
+    /* ── Assign hub USB address 1 ──────────────────────────────── */
+    if (dwc2_set_address(0, 1, hub_mps, 0) < 0) {
+        uart_puts("[DWC2] Hub SET_ADDRESS failed\n");
+        return;
+    }
+    dwc2_delay_ms(5);
+    int hub_addr = 1;
+    debug_print("[DWC2] Hub assigned address %d\n", hub_addr);
+
+    /* ── GET_DESCRIPTOR(Config, 9) — get bConfigurationValue ───── */
+    uint8_t cfghdr[9] = {0};
+    int got = dwc2_get_config_desc(hub_addr, cfghdr, 9, hub_mps, 0);
+    if (got < 5) {
+        uart_puts("[DWC2] Hub: config descriptor header failed\n");
+        return;
+    }
+    uint8_t cfg_val = cfghdr[5];
+    debug_print("[DWC2] Hub: cfg_val=%d wTotalLen=%d\n",
+                cfg_val, (int)(cfghdr[2] | ((int)cfghdr[3] << 8)));
+
+    /* ── SET_CONFIGURATION ─────────────────────────────────────── */
+    dwc2_set_configuration(hub_addr, cfg_val, hub_mps, 0);
+    dwc2_delay_ms(20);
+
+    /* ── GET_DESCRIPTOR(Hub, 0x29) — hub class descriptor ──────── *
+     * Layout: [0]=bLength [1]=0x29 [2]=bNbrPorts [3-4]=wHubChar   *
+     *         [5]=bPwrOn2PwrGood (×2ms) [6]=bHubContrCurrent       */
+    uint8_t hubdesc[16] = {0};
+    got = dwc2_hub_get_class_desc(hub_addr, hubdesc, 16, hub_mps);
+    int n_ports    = (got >= 3) ? (int)hubdesc[2] : 4;
+    int pwr_delay  = (got >= 6) ? (int)hubdesc[5] * 2 : 100;
+    if (n_ports < 1 || n_ports > 8) n_ports = 4;  /* sanity */
+    if (pwr_delay < 100) pwr_delay = 100;
+    debug_print("[DWC2] Hub: %d port(s), power delay=%dms\n", n_ports, pwr_delay);
+
+    /* ── PORT_POWER each port, then wait ──────────────────────── */
+    for (int p = 1; p <= n_ports; p++)
+        dwc2_hub_set_feature(hub_addr, p, 8 /*PORT_POWER*/, hub_mps);
+    dwc2_delay_ms(pwr_delay);
+
+    /* ── Scan each port for connected devices ─────────────────── */
+    int next_addr = 2;   /* hub=1, children start at 2 */
+
+    for (int p = 1; p <= n_ports; p++) {
+        uint16_t pstatus = 0, pchange = 0;
+        if (dwc2_hub_get_port_status(hub_addr, p, &pstatus, &pchange, hub_mps) < 0) {
+            debug_print("[DWC2] Port %d: GET_PORT_STATUS failed\n", p);
+            continue;
+        }
+        debug_print("[DWC2] Port %d: status=0x%04x change=0x%04x\n",
+                    p, (unsigned)pstatus, (unsigned)pchange);
+
+        /* bit 0 = PORT_CONNECTION */
+        if (!(pstatus & 0x0001)) {
+            debug_print("[DWC2] Port %d: empty\n", p);
+            continue;
+        }
+
+        uart_puts("[DWC2] Device detected on hub port — resetting\n");
+
+        /* PORT_RESET (feature=4) */
+        dwc2_hub_set_feature(hub_addr, p, 4 /*PORT_RESET*/, hub_mps);
+        dwc2_delay_ms(100);
+
+        /* Re-read port status after reset */
+        if (dwc2_hub_get_port_status(hub_addr, p, &pstatus, &pchange, hub_mps) < 0)
+            continue;
+        debug_print("[DWC2] Port %d post-reset: status=0x%04x\n",
+                    p, (unsigned)pstatus);
+
+        /* bit 1 = PORT_ENABLE — must be set after reset */
+        if (!(pstatus & 0x0002)) {
+            debug_print("[DWC2] Port %d: not enabled after reset\n", p);
+            continue;
+        }
+
+        /* Clear C_PORT_RESET change bit (feature=0x14=20) */
+        dwc2_hub_clear_feature(hub_addr, p, 0x14, hub_mps);
+
+        /* Determine child speed: bit 9 = PORT_LOW_SPEED */
+        int child_ls = (pstatus & (1U << 9)) ? 1 : 0;
+        debug_print("[DWC2] Port %d: child is %s-speed\n",
+                    p, child_ls ? "Low" : "Full");
+
+        /* Enumerate the child device */
+        if (next_addr < 10)
+            dwc2_enum_child(next_addr++, child_ls);
+    }
+
+    debug_print("[DWC2] Hub enumeration done: %d HID device(s) registered\n",
+                dwc2_hid_cnt);
+}
+
+/* ── dwc2_hid_poll() — called from WIMP task every ~16 ms ────────── *
+ *                                                                     *
+ * Issues HID GET_REPORT (class EP0 request) for each registered HID  *
+ * device and forwards the decoded report to mouse_event() /          *
+ * keyboard_event() in the input layer.                               *
+ *                                                                     *
+ * GET_REPORT reliably returns current device state — no periodic      *
+ * schedule or interrupt-IN endpoint required.                        */
+
+/* Forward declarations for the input layer (defined in input_stub.c) */
+extern void mouse_event(const void *ev);
+extern void keyboard_event(const void *ev);
+extern void con_putc(char c);
+
+/* Process a mouse boot-protocol report: [buttons, dx, dy, wheel?] */
+static void dwc2_proc_mouse(dwc2_hid_t *h, const uint8_t *data, int len)
+{
+    if (len < 3) return;
+
+    int8_t  dx  = (int8_t)data[1];
+    int8_t  dy  = -(int8_t)data[2];  /* USB Y-down → RISC OS Y-up */
+    int8_t  wh  = (len >= 4) ? (int8_t)data[3] : 0;
+    uint8_t btn = data[0];
+
+    /* Only post if something changed */
+    if (!dx && !dy && !wh && btn == h->last_report[0]) return;
+
+    /* Inline mouse_event_t (mirrors drivers/input/mouse.h) */
+    struct { int16_t x, y, dx, dy; uint8_t buttons; int8_t wheel; } ev;
+    __builtin_memset(&ev, 0, sizeof(ev));
+    ev.dx = dx; ev.dy = dy; ev.wheel = wh;
+    if (btn & 0x01) ev.buttons |= 0x04;  /* left   → SELECT */
+    if (btn & 0x04) ev.buttons |= 0x02;  /* middle → MENU   */
+    if (btn & 0x02) ev.buttons |= 0x01;  /* right  → ADJUST */
+
+    if (dx || dy || ev.buttons || wh)
+        debug_print("[DWC2-MOUSE] dx=%d dy=%d btn=0x%02x\n",
+                    (int)dx, (int)dy, (unsigned)ev.buttons);
+
+    __builtin_memcpy(h->last_report, data,
+                     (size_t)((len < 8) ? len : 8));
+    mouse_event(&ev);
+}
+
+/* Minimal scancode→ASCII tables for keyboard boot reports */
+static const char dwc2_sc2asc[] = {
+    0,0,0,0,'a','b','c','d','e','f','g','h','i','j','k','l',  /* 00-0F */
+    'm','n','o','p','q','r','s','t','u','v','w','x','y','z',  /* 10-1D */
+    '1','2','3','4','5','6','7','8','9','0',                  /* 1E-27 */
+    '\n',0x1B,'\b','\t',' ','-','=','[',']','\\','#',';',    /* 28-33 */
+    '\'','`',',','.','/'}; /* 34-38 */
+
+static const char dwc2_sc2asc_s[] = {
+    0,0,0,0,'A','B','C','D','E','F','G','H','I','J','K','L',
+    'M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+    '!','@','#','$','%','^','&','*','(',')',
+    '\n',0x1B,'\b','\t',' ','_','+','{','}','|','~',':',
+    '"','~','<','>','?'};
+
+/* Process a keyboard boot-protocol report */
+static void dwc2_proc_keyboard(dwc2_hid_t *h, const uint8_t *data, int len)
+{
+    if (len < 3) return;
+    int shift = (data[0] & 0x22) != 0;  /* any Shift key held */
+
+    /* Inline keyboard_event_t (mirrors drivers/input/keyboard.h) */
+    struct { uint8_t key_code, key_char, modifiers, pad; } kev;
+    __builtin_memset(&kev, 0, sizeof(kev));
+    if (data[0] & 0x22) kev.modifiers |= 0x01;  /* MOD_SHIFT */
+    if (data[0] & 0x11) kev.modifiers |= 0x02;  /* MOD_CTRL  */
+    if (data[0] & 0x44) kev.modifiers |= 0x04;  /* MOD_ALT   */
+
+    for (int i = 2; i < 8 && i < len; i++) {
+        uint8_t code = data[i];
+        if (code == 0 || code > 0xE7) continue;
+
+        /* Debounce: skip if key was already down in last report */
+        int seen = 0;
+        for (int j = 2; j < 8; j++) {
+            if (h->last_report[j] == code) { seen = 1; break; }
+        }
+        if (seen) continue;
+
+        /* ESC (code=0x29) always maps to 0x1B */
+        char ch = 0;
+        if (code == 0x29) {
+            ch = 0x1B;
+        } else if (code < (uint8_t)sizeof(dwc2_sc2asc)) {
+            ch = shift ? dwc2_sc2asc_s[code] : dwc2_sc2asc[code];
+        }
+
+        kev.key_char = (uint8_t)ch;
+        kev.key_code = (uint8_t)ch;
+
+        if (kev.key_code || kev.key_char) {
+            debug_print("[DWC2-KBD] code=0x%02x char='%c' mod=0x%02x\n",
+                        code,
+                        (ch >= 0x20 && ch < 0x7F) ? ch : '.',
+                        kev.modifiers);
+            keyboard_event(&kev);
+            if (ch >= 0x20) con_putc(ch);
+        }
+    }
+
+    __builtin_memcpy(h->last_report, data,
+                     (size_t)((len < 8) ? len : 8));
+}
+
+/* Public: called from WIMP task at ~60 Hz (rate-limited inside) */
+void dwc2_hid_poll(void)
+{
+    if (!dwc2_hid_cnt) return;
+
+    uint32_t now = dwc2_ms();
+
+    for (int i = 0; i < dwc2_hid_cnt; i++) {
+        dwc2_hid_t *h = &dwc2_hid[i];
+        if (!h->active) continue;
+
+        /* Per-device 16ms gate (≈60 Hz max poll rate) */
+        if ((now - dwc2_last_poll_ms[i]) < 16u) continue;
+        dwc2_last_poll_ms[i] = now;
+
+        uint8_t report[8] = {0};
+        int got = dwc2_hid_get_report(h->dev_addr, h->if_num,
+                                       report, 8,
+                                       (int)h->ep0_mps, h->is_ls);
+        if (got > 0) {
+            if (h->protocol == DWC2_PROTO_MOUSE)
+                dwc2_proc_mouse(h, report, got);
+            else if (h->protocol == DWC2_PROTO_KBD)
+                dwc2_proc_keyboard(h, report, got);
+        }
+    }
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
@@ -671,14 +1219,29 @@ int dwc2_start(void) {
     uint32_t hprt  = dwc2_rd(HPRT);
     int      speed = (int)((hprt & HPRT_SPD) >> 17);
 
-    /* EP0 enumeration: read device descriptor */
-    if (dwc2_enumerate_device(speed) < 0) {
+    /* EP0 enumeration: read device descriptor, get class + MPS */
+    int dev_mps = 64;
+    int dev_cls = dwc2_enumerate_device(speed, &dev_mps);
+    if (dev_cls < 0) {
         uart_puts("[DWC2] Device enumeration failed\n");
         return -1;
     }
 
-    uart_puts("[DWC2] boot139: EP0 enumeration complete\n");
-    uart_puts("[DWC2] Next: GET_DESCRIPTOR(Config) → HID interrupt-IN poll\n");
+    uart_puts("[DWC2] EP0 enumeration complete\n");
+
+    /* boot267: act on device class */
+    if (dev_cls == 0x09) {
+        /* USB Hub — enumerate its ports to find keyboards / mice */
+        dwc2_enum_hub(dev_mps, speed);
+    } else if (dev_cls == 0x03 || dev_cls == 0x00) {
+        /* HID or composite device directly on OTG port — rare but handle it */
+        uart_puts("[DWC2] Direct HID on OTG port — enumerating as child@1\n");
+        /* Treat as "child at addr 0, assign addr 1" */
+        dwc2_enum_child(1, (speed == 2) ? 1 : 0);
+    } else {
+        debug_print("[DWC2] Device class 0x%02x — no further action\n", dev_cls);
+    }
+
     return 0;
 }
 

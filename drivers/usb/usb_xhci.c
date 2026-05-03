@@ -190,10 +190,12 @@ static int evt_ring_poll(uint32_t ev[4]);
 #define TRB_CYCLE           (1U <<  0)
 #define TRB_TC              (1U <<  1)
 #define TRB_TYPE_SHIFT      10
-#define TRB_TYPE_LINK        6
-#define TRB_TYPE_ENABLE_SLOT 9
-#define TRB_TYPE_NOOP_CMD   23  /* xHCI §6.4.3.9 Command No-op — MCU keepalive ping */
-#define TRB_TYPE_RESET_EP   14  /* xHCI §6.4.3.8 Reset Endpoint — Halted → Stopped  */
+#define TRB_TYPE_LINK          6
+#define TRB_TYPE_ENABLE_SLOT   9
+#define TRB_TYPE_DISABLE_SLOT 10  /* xHCI §6.4.3.2 Disable Slot Command               */
+#define TRB_TYPE_NOOP_CMD     23  /* xHCI §6.4.3.9 Command No-op — MCU keepalive ping */
+#define TRB_TYPE_RESET_EP     14  /* xHCI §6.4.3.8 Reset Endpoint — Halted → Stopped  */
+#define TRB_TYPE_STOP_EP      15  /* xHCI §6.4.3.7 Stop Endpoint Command              */
 #define TRB_TYPE_PORT_CHNG_EVT 34
 
 #define CC_SUCCESS          1
@@ -257,6 +259,15 @@ static uint32_t cmd_enqueue = 0;
  * Printed in the xhci_wait_event timeout block and in the handler itself.
  */
 static volatile uint32_t msi_fire_count = 0;
+
+/* boot297: TUR quiet mode — suppresses [xHCI] timeout lines during the
+ * TEST UNIT READY retry loop so slow devices (Toshiba, cold-start bridges)
+ * don't flood the log.  Set/cleared by xhci_set_quiet_timeouts().
+ * All other timeout paths (No-op, Enable Slot, RC, data TRBs) are unaffected
+ * because the flag is only set for the duration of the TUR loop.            */
+static int xhci_quiet_timeouts = 0;
+
+void xhci_set_quiet_timeouts(int q) { xhci_quiet_timeouts = q; }
 
 static uint64_t cmd_ring_dma  = 0;
 static uint64_t evt_ring_dma  = 0;
@@ -1982,11 +1993,25 @@ int xhci_init(void *base_addr) {
 #define BULK_DATA_OFF        0x800
 #define BULK_RING_TRBS       64
 #define BULK_MAX_XFER        6144u   /* max single transfer through bounce buf */
+
+/* boot253: per-slot interrupt endpoint rings (HID keyboard + mouse).
+ * Placed immediately after the bulk area (0x3A000).
+ * Each slot gets INT_STRIDE = 0x400 (1KB), supporting up to 2 interrupt
+ * IN endpoints (ring0 + data0 at +0x000, ring1 + data1 at +0x200).
+ * 8 slots × 0x400 = 0x2000B; ends at 0x3C000 < 0x52000 DMA budget.   */
+#define DMA_INT_BASE_OFF     0x3A000
+#define INT_STRIDE           0x400
+#define INT_RING_OFF(idx)    ((uint32_t)(idx) * 0x200u + 0x000u)
+#define INT_DATA_OFF(idx)    ((uint32_t)(idx) * 0x200u + 0x100u)
+#define INT_RING_TRBS        16    /* 16 × 16B = 256B per ring           */
+#define INT_REPORT_SIZE      64    /* max HID report (boot protocol = 8) */
+#define MAX_INT_EPS          2     /* interrupt endpoints per slot        */
 /* boot149: CTX_SIZE is no longer a compile-time constant.
  * CSZ bit in HCCPARAMS1 determines whether entries are 32 or 64 bytes.
  * read_caps() populates xhci_ctrl.csz; this macro reads it at runtime.  */
 #define CTX_SIZE  (xhci_ctrl.csz ? 64U : 32U)
 
+#define TRB_TYPE_NORMAL    1
 #define TRB_TYPE_SETUP     2
 #define TRB_TYPE_DATA      3
 #define TRB_TYPE_STATUS    4
@@ -1995,8 +2020,9 @@ int xhci_init(void *base_addr) {
 #define TRB_TYPE_CMD_CMPL       33
 #define TRB_TYPE_XFER_EVT       32
 
-#define TRB_IDT   (1U << 6)
-#define TRB_IOC   (1U << 5)
+#define TRB_IDT    (1U << 6)
+#define TRB_IOC    (1U << 5)
+#define TRB_CHAIN  (1U << 4)   /* xHCI §6.4.1.2 DW3[4]: Chain — link to next TRB in same TD */
 #define TRB_DIR_IN (1U << 16)
 
 #define CC_SHORT_PKT  13
@@ -2023,8 +2049,125 @@ static uint8_t  bulk_out_cycle[MAX_SLOTS_ALLOC + 1] = {0};
 static uint32_t bulk_out_enq[MAX_SLOTS_ALLOC + 1]   = {0};
 static uint8_t  bulk_in_cycle[MAX_SLOTS_ALLOC + 1]  = {0};
 static uint32_t bulk_in_enq[MAX_SLOTS_ALLOC + 1]    = {0};
-static uint8_t  g_slot_ids[16] = {0};   /* indexed by port (0-based)        */
+
+/* boot253: per-slot interrupt IN endpoint state.
+ * [slot][idx] where idx = 0 or 1 (up to MAX_INT_EPS per slot).
+ * int_ep_dci[s][i]       — DCI of the i-th interrupt IN endpoint.
+ * int_ep_cycle[s][i]     — current producer cycle bit for its ring.
+ * int_ep_enq[s][i]       — next TRB write index (0..INT_RING_TRBS-2).
+ * int_ep_submitted[s][i] — 1 if a TRB is currently in flight.
+ * int_ep_count[s]        — how many interrupt IN endpoints this slot has. */
+static uint8_t  int_ep_dci[MAX_SLOTS_ALLOC + 1][MAX_INT_EPS];
+static uint8_t  int_ep_cycle[MAX_SLOTS_ALLOC + 1][MAX_INT_EPS];
+static uint32_t int_ep_enq[MAX_SLOTS_ALLOC + 1][MAX_INT_EPS];
+static uint8_t  int_ep_submitted[MAX_SLOTS_ALLOC + 1][MAX_INT_EPS];
+static int      int_ep_count[MAX_SLOTS_ALLOC + 1];
+
+/* ── Interrupt Transfer Event Stash ──────────────────────────────────────
+ * When polling for endpoint A, a Transfer Event for endpoint B (same slot)
+ * can arrive first.  evt_ring_poll() consumes it (advances ERDP) — if we
+ * discard it, the next poll for B finds the ring empty.  We stash stolen
+ * Transfer Events here and return them to the right caller.               */
+#define EVT_STASH_SIZE 8
+static struct {
+    uint8_t  valid;
+    uint8_t  slot;
+    uint8_t  dci;
+    uint32_t ev[4];
+} evt_stash[EVT_STASH_SIZE];
+
+static void evt_stash_put(uint8_t slot, uint8_t dci, const uint32_t ev[4])
+{
+    /* Update in place if already stashed for same (slot,dci) */
+    for (int i = 0; i < EVT_STASH_SIZE; i++) {
+        if (evt_stash[i].valid && evt_stash[i].slot == slot && evt_stash[i].dci == dci) {
+            evt_stash[i].ev[0] = ev[0]; evt_stash[i].ev[1] = ev[1];
+            evt_stash[i].ev[2] = ev[2]; evt_stash[i].ev[3] = ev[3];
+            return;
+        }
+    }
+    for (int i = 0; i < EVT_STASH_SIZE; i++) {
+        if (!evt_stash[i].valid) {
+            evt_stash[i].valid = 1;
+            evt_stash[i].slot  = slot;
+            evt_stash[i].dci   = dci;
+            evt_stash[i].ev[0] = ev[0]; evt_stash[i].ev[1] = ev[1];
+            evt_stash[i].ev[2] = ev[2]; evt_stash[i].ev[3] = ev[3];
+            return;
+        }
+    }
+    /* Stash full — drop the event (rare, 8 slots should be enough) */
+}
+
+static int evt_stash_get(uint8_t slot, uint8_t dci, uint32_t ev[4])
+{
+    for (int i = 0; i < EVT_STASH_SIZE; i++) {
+        if (evt_stash[i].valid && evt_stash[i].slot == slot && evt_stash[i].dci == dci) {
+            ev[0] = evt_stash[i].ev[0]; ev[1] = evt_stash[i].ev[1];
+            ev[2] = evt_stash[i].ev[2]; ev[3] = evt_stash[i].ev[3];
+            evt_stash[i].valid = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+static uint8_t  g_slot_ids[16] = {0};   /* root-hub: indexed by port0 (0-based) */
 static usb_device_t g_devs[MAX_SLOTS_ALLOC + 1];  /* indexed by slot_id     */
+
+/* ── Hub-child port→slot registry ───────────────────────────────────────────
+ * Maps (hub_slot_id, hub_port) → device slot_id for every device sitting
+ * behind ANY downstream hub.  Replaces the old g_slot_ids[hub_port] overload
+ * which broke when a second hub was present (port-1 collision).
+ * Supports hubs nested to arbitrary depth: each hub has its own slot_id key. */
+typedef struct {
+    uint8_t hub_slot;   /* slot_id of the parent hub                   */
+    uint8_t hub_port;   /* 1-based port number on that hub              */
+    uint8_t dev_slot;   /* xHCI slot assigned to this downstream device */
+} hub_child_t;
+
+#define MAX_HUB_CHILDREN  16
+static hub_child_t g_hub_children[MAX_HUB_CHILDREN];
+static int         g_hub_child_count = 0;
+
+static void hc_reg(uint8_t hub_slot, uint8_t hub_port, uint8_t dev_slot)
+{
+    /* Update existing entry if present */
+    for (int i = 0; i < g_hub_child_count; i++) {
+        if (g_hub_children[i].hub_slot == hub_slot &&
+            g_hub_children[i].hub_port == hub_port) {
+            g_hub_children[i].dev_slot = dev_slot;
+            return;
+        }
+    }
+    if (g_hub_child_count < MAX_HUB_CHILDREN) {
+        g_hub_children[g_hub_child_count].hub_slot = hub_slot;
+        g_hub_children[g_hub_child_count].hub_port = hub_port;
+        g_hub_children[g_hub_child_count].dev_slot = dev_slot;
+        g_hub_child_count++;
+    }
+}
+
+static uint8_t hc_lookup(uint8_t hub_slot, uint8_t hub_port)
+{
+    for (int i = 0; i < g_hub_child_count; i++) {
+        if (g_hub_children[i].hub_slot == hub_slot &&
+            g_hub_children[i].hub_port == hub_port)
+            return g_hub_children[i].dev_slot;
+    }
+    return 0;
+}
+
+static void hc_remove(uint8_t hub_slot, uint8_t hub_port)
+{
+    for (int i = 0; i < g_hub_child_count; i++) {
+        if (g_hub_children[i].hub_slot == hub_slot &&
+            g_hub_children[i].hub_port == hub_port) {
+            /* Compact: overwrite with last entry */
+            g_hub_children[i] = g_hub_children[--g_hub_child_count];
+            return;
+        }
+    }
+}
 
 /* Slot DMA region helpers (slot_id is 1-based, 1..MAX_SLOTS_ALLOC)         */
 static inline volatile uint8_t *slot_input_ctx(uint8_t s) {
@@ -2063,6 +2206,18 @@ static inline volatile uint8_t *slot_bulk_data(uint8_t s) {
     return (volatile uint8_t *)(xhci_dma_buf + DMA_BULK_BASE_OFF
                                 + (uint32_t)(s - 1) * BULK_STRIDE
                                 + BULK_DATA_OFF);
+}
+
+/* boot253: interrupt endpoint ring and data buffer helpers (idx = 0 or 1) */
+static inline volatile uint32_t *slot_int_ring(uint8_t s, int idx) {
+    return (volatile uint32_t *)(xhci_dma_buf + DMA_INT_BASE_OFF
+                                  + (uint32_t)(s - 1) * INT_STRIDE
+                                  + INT_RING_OFF(idx));
+}
+static inline volatile uint8_t *slot_int_data(uint8_t s, int idx) {
+    return (volatile uint8_t *)(xhci_dma_buf + DMA_INT_BASE_OFF
+                                 + (uint32_t)(s - 1) * INT_STRIDE
+                                 + INT_DATA_OFF(idx));
 }
 
 /* boot147: ep0_ring_init now takes slot_id (1-based) so each slot gets its
@@ -2358,6 +2513,7 @@ static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len) {
     /* boot147: per-slot ep0_data; active_slot already set by caller */
     volatile uint8_t *ep0_data = slot_ep0_data(slot_id);
     dma_zero(ep0_data, 512);
+    asm volatile("dsb sy" ::: "memory");   /* ensure zero visible to DMA  */
 
     uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
 
@@ -2370,17 +2526,86 @@ static int ep0_get_device_descriptor(uint8_t slot_id, uint8_t *buf, int len) {
 
     ep0_doorbell(slot_id);
 
+    /*
+     * Wait for a Transfer Completion Event (type=TRB_TYPE_XFER_EVT=32) for
+     * THIS slot_id.  Stale events from previously enumerated devices (e.g.
+     * the MSC device on slot 2) can pollute the ring between hub-port
+     * enumerations and would otherwise be mistaken for our DATA-stage TRB
+     * completion, leaving the DMA buffer filled with zeroes from dma_zero().
+     *
+     * Filter loop: discard any event whose type != 32 or slot != slot_id.
+     * Use a 250ms outer deadline — FS/LS split transactions via a TT hub
+     * take longer than HS direct transfers (bus speed 12 Mbps vs 480 Mbps).
+     *
+     * Residual field: Transfer Event DW2[23:0] = bytes NOT transferred.
+     * actual = len - residual.  For an FS device with MPS=8 the DATA stage
+     * sends 8 bytes then SHORT_PKT fires with residual=10 (18-8=10).
+     */
     uint32_t ev[4];
-    if (xhci_wait_event(ev, 100) != 0) return -1;
-    uint8_t cc = (ev[2] >> 24) & 0xFF;
-    if (cc != CC_SUCCESS && cc != CC_SHORT_PKT) return -1;
+    uint8_t  cc = 0;
+    int      actual = 0;
+    int      found  = 0;
+    uint32_t deadline = get_time_ms() + 250U;
 
+    while (get_time_ms() < deadline) {
+        if (xhci_wait_event(ev, 10) != 0) continue;
+        uint8_t etype = (ev[3] >> 10) & 0x3FU;
+        uint8_t eslot = (ev[3] >> 24) & 0xFFU;
+        if (etype == TRB_TYPE_XFER_EVT && eslot == slot_id) {
+            cc      = (ev[2] >> 24) & 0xFF;
+            uint32_t residual = ev[2] & 0x00FFFFFFu;
+            actual  = len - (int)residual;
+            if (actual < 0) actual = 0;
+            if (actual > len) actual = len;
+            found = 1;
+            break;
+        }
+        /* Non-matching event (stale from other slot or command event) —
+         * it has been consumed from the ring by xhci_wait_event, discard. */
+        uart_puts("[xHCI] ep0_get_desc: discarded event type=");
+        print_hex32(etype);
+        uart_puts(" slot="); print_hex32(eslot);
+        uart_puts(" (expected slot "); print_hex32(slot_id); uart_puts(")\n");
+    }
+
+    if (!found) {
+        uart_puts("[xHCI] ep0_get_desc: timeout waiting for slot ");
+        print_hex32(slot_id); uart_puts("\n");
+        return -1;
+    }
+    if (cc != CC_SUCCESS && cc != CC_SHORT_PKT) {
+        uart_puts("[xHCI] ep0_get_desc: bad CC="); print_hex32(cc); uart_puts("\n");
+        return -1;
+    }
+
+    /* Drain the STATUS-stage TRB event (don't wait long — not critical). */
     uint32_t ev2[4];
     xhci_wait_event(ev2, 20);
 
-    int copy = len < 18 ? len : 18;
-    for (int i = 0; i < copy; i++) buf[i] = ep0_data[i];
-    return copy;
+    asm volatile("dsb sy; isb" ::: "memory");  /* DMA barrier before CPU read */
+
+    /* Primary: use residual-derived byte count. */
+    if (actual >= 8) {
+        int copy = actual < 18 ? actual : 18;
+        for (int i = 0; i < copy; i++) buf[i] = ep0_data[i];
+        return copy;
+    }
+
+    /* Fallback: residual says < 8 bytes but check DMA buffer directly —
+     * some FS devices send exactly MPS=8 bytes then SHORT_PKT, and the
+     * residual should be 10; if the controller mis-reports residual=len,
+     * we still accept valid data identified by bDescriptorType==1.        */
+    asm volatile("dsb sy; isb" ::: "memory");
+    if (ep0_data[1] == 0x01u) {   /* bDescriptorType = Device Descriptor */
+        for (int i = 0; i < 18; i++) buf[i] = ep0_data[i];
+        uart_puts("[xHCI] ep0_get_desc: fallback DMA read (bDescType=1 OK)\n");
+        return 18;
+    }
+
+    uart_puts("[xHCI] ep0_get_desc: actual="); print_hex32((uint32_t)actual);
+    uart_puts(" DMA[0]="); print_hex32(ep0_data[0]);
+    uart_puts(" DMA[1]="); print_hex32(ep0_data[1]); uart_puts("\n");
+    return actual;
 }
 
 static void enumerate_port(int port) {
@@ -2671,32 +2896,91 @@ static void enumerate_port(int port) {
         dma_zero(ep0_data, 256);
         uint64_t data_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ep0_data));
 
-        /* First fetch 9 bytes to get wTotalLength */
+        /* First fetch 9 bytes to get wTotalLength.
+         * Use slot-filtered event wait: the MSC on slot 2 may be generating
+         * bulk Transfer Events concurrently — discard any event whose slot_id
+         * field (DW3[31:24]) does not match our slot.                         */
         ep0_enq(setup_lo, setup_hi, 8, TRB_TYPE_SETUP, TRB_IDT | (3U << 16));
         ep0_enq((uint32_t)data_dma, (uint32_t)(data_dma >> 32), 9, TRB_TYPE_DATA, TRB_IOC | TRB_DIR_IN);
         ep0_enq(0, 0, 0, TRB_TYPE_STATUS, TRB_IOC);
         ep0_doorbell(slot_id);
-        if (xhci_wait_event(ev, 100) != 0) {
-            uart_puts("[xHCI] GET_DESCRIPTOR(Config,9) timeout\n");
-            goto probe;
+
+        /* Slot-filtered wait: data stage */
+        {
+            int cfg9_found = 0;
+            uint32_t cfg9_deadline = get_time_ms() + 250U;
+            while (get_time_ms() < cfg9_deadline) {
+                if (xhci_wait_event(ev, 10) != 0) continue;
+                uint8_t etype = (ev[3] >> 10) & 0x3FU;
+                uint8_t eslot = (ev[3] >> 24) & 0xFFU;
+                if (etype == TRB_TYPE_XFER_EVT && eslot == (uint8_t)slot_id) {
+                    cfg9_found = 1; break;
+                }
+                /* stale event from another slot — discard and keep waiting */
+            }
+            if (!cfg9_found) {
+                uart_puts("[xHCI] GET_DESCRIPTOR(Config,9) timeout\n");
+                goto probe;
+            }
         }
-        xhci_wait_event(ev, 20); /* drain Status event */
+        /* Drain status stage (slot-filtered, short timeout) */
+        {
+            uint32_t cfg9s_deadline = get_time_ms() + 50U;
+            while (get_time_ms() < cfg9s_deadline) {
+                if (xhci_wait_event(ev, 10) != 0) break;
+                uint8_t etype = (ev[3] >> 10) & 0x3FU;
+                uint8_t eslot = (ev[3] >> 24) & 0xFFU;
+                if (etype == TRB_TYPE_XFER_EVT && eslot == (uint8_t)slot_id) break;
+            }
+        }
 
         total_len = (uint16_t)(ep0_data[2] | ((uint16_t)ep0_data[3] << 8));
+        uart_puts("[xHCI] Config hdr: wTotalLength="); print_hex32(total_len);
+        uart_puts(" bNumInterfaces="); print_hex32(ep0_data[4]); uart_puts("\n");
         if (total_len < 9 || total_len > 255) total_len = 9;
 
-        /* Fetch full config descriptor */
+        /* Fetch full config descriptor (slot-filtered) */
         dma_zero(ep0_data, 256);
         setup_hi = (uint32_t)total_len << 16;
         ep0_enq(setup_lo, setup_hi, 8, TRB_TYPE_SETUP, TRB_IDT | (3U << 16));
         ep0_enq((uint32_t)data_dma, (uint32_t)(data_dma >> 32), total_len, TRB_TYPE_DATA, TRB_IOC | TRB_DIR_IN);
         ep0_enq(0, 0, 0, TRB_TYPE_STATUS, TRB_IOC);
         ep0_doorbell(slot_id);
-        if (xhci_wait_event(ev, 100) != 0) {
-            uart_puts("[xHCI] GET_DESCRIPTOR(Config,full) timeout\n");
-            goto probe;
+
+        /* Slot-filtered wait: data stage */
+        {
+            int cfgf_found = 0;
+            uint32_t cfgf_deadline = get_time_ms() + 500U;  /* FS split = up to ~500ms */
+            while (get_time_ms() < cfgf_deadline) {
+                if (xhci_wait_event(ev, 10) != 0) continue;
+                uint8_t etype = (ev[3] >> 10) & 0x3FU;
+                uint8_t eslot = (ev[3] >> 24) & 0xFFU;
+                if (etype == TRB_TYPE_XFER_EVT && eslot == (uint8_t)slot_id) {
+                    cfgf_found = 1; break;
+                }
+            }
+            if (!cfgf_found) {
+                uart_puts("[xHCI] GET_DESCRIPTOR(Config,full) timeout\n");
+                goto probe;
+            }
         }
-        xhci_wait_event(ev, 20);
+        /* Drain status stage */
+        {
+            uint32_t cfgfs_deadline = get_time_ms() + 50U;
+            while (get_time_ms() < cfgfs_deadline) {
+                if (xhci_wait_event(ev, 10) != 0) break;
+                uint8_t etype = (ev[3] >> 10) & 0x3FU;
+                uint8_t eslot = (ev[3] >> 24) & 0xFFU;
+                if (etype == TRB_TYPE_XFER_EVT && eslot == (uint8_t)slot_id) break;
+            }
+        }
+
+        /* Diagnostic: dump first 16 bytes of config descriptor */
+        uart_puts("[xHCI] CfgDesc raw:");
+        for (int _d = 0; _d < 16 && _d < total_len; _d++) {
+            uart_puts(" "); print_hex32(ep0_data[_d]);
+        }
+        uart_puts("\n");
 
         for (int i = 0; i < total_len; i++) cfgbuf[i] = ep0_data[i];
     } /* end real-path config fetch */
@@ -2834,13 +3118,15 @@ int xhci_configure_endpoints(usb_device_t *dev)
     uint32_t add_flags = (1u << 0);/* bit0 = always include Slot context   */
     uint32_t max_dci   = 1;
 
-    /* Scan all interfaces for bulk endpoints */
+    /* Scan all interfaces for bulk and interrupt IN endpoints */
     for (int ii = 0; ii < dev->num_interfaces; ii++) {
         usb_interface_t *intf = &dev->interfaces[ii];
         for (int ei = 0; ei < intf->endpoint_count; ei++) {
             usb_endpoint_t *ep = &intf->endpoints[ei];
+            uint8_t xfer_type = ep->bmAttributes & 0x03u;
 
-            if ((ep->bmAttributes & 0x03) != 0x02) continue;  /* bulk only */
+            /* ── Bulk endpoints ─────────────────────────────────────────── */
+            if (xfer_type == 0x02u) {
 
             uint8_t ep_num = ep->bEndpointAddress & 0x0F;
             uint8_t dir_in = (ep->bEndpointAddress & 0x80) ? 1u : 0u;
@@ -2910,10 +3196,75 @@ int xhci_configure_endpoints(usb_device_t *dev)
             uart_puts(" ring="); print_hex32((uint32_t)ring_dma);
             uart_puts(" DW1="); print_hex32(ep_ctx[1]);
             uart_puts("\n");
-        }
-    }
+            } /* ── end bulk ─── */
 
-    if (add_flags == (1u << 0)) return 0;   /* no bulk endpoints — skip */
+            /* ── Interrupt IN endpoints (HID keyboard / mouse) ──────────── */
+            if (xfer_type == 0x03u && (ep->bEndpointAddress & 0x80u)) {
+                uint8_t i_epnum = ep->bEndpointAddress & 0x0Fu;
+                uint8_t i_dci   = (uint8_t)(i_epnum * 2u + 1u); /* IN: dir_in=1 */
+                int     i_idx   = int_ep_count[slot_id];
+                if (i_dci >= 2u && i_dci <= 31u
+                    && !(configured_mask & (1u << i_dci))
+                    && i_idx < MAX_INT_EPS) {
+                    configured_mask |= (1u << i_dci);
+                    ep->slot_id = slot_id;
+                    add_flags |= (1u << i_dci);
+                    if (i_dci > max_dci) max_dci = i_dci;
+
+                    /* Initialise the interrupt transfer ring */
+                    volatile uint32_t *iring = slot_int_ring(slot_id, i_idx);
+                    dma_zero(iring, INT_RING_TRBS * 16);
+                    uint64_t ird = phys_to_dma((uint64_t)virt_to_phys((void *)iring));
+                    uint32_t ili = (INT_RING_TRBS - 1u) * 4u;
+                    iring[ili + 0] = (uint32_t)(ird);
+                    iring[ili + 1] = (uint32_t)(ird >> 32);
+                    iring[ili + 2] = 0u;
+                    iring[ili + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | 1u;
+                    int_ep_dci[slot_id][i_idx]       = i_dci;
+                    int_ep_cycle[slot_id][i_idx]     = 1u;
+                    int_ep_enq[slot_id][i_idx]       = 0u;
+                    int_ep_submitted[slot_id][i_idx] = 0u;
+
+                    /* xHCI §6.2.3 EP Context — Interrupt IN (EP Type = 7)
+                     *   DW0[23:16] = Interval (polling period as 2^n × 125μs)
+                     *     FS/LS: Interval = ceil(log2(bInterval_ms × 8))
+                     *     HS/SS: Interval = bInterval − 1
+                     *   DW1: MPS | EP_Type=7 (Int IN) | CErr=3
+                     *
+                     * boot263: xHCI speed codes (stored in dev->speed from hub port status):
+                     *   1=Full Speed  2=Low Speed  3=High Speed  4=SuperSpeed
+                     * These differ from USB_SPEED_* (0=LS,1=FS,2=HS,3=SS).
+                     * LS (xHCI code 2) and FS (xHCI code 1) both use the
+                     * ceil(log2()) formula. HS/SS (codes 3/4) use bInterval-1.  */
+                    uint8_t i_intv;
+                    if (dev->speed <= 2u) {  /* xHCI LS (2) or FS (1): ms-based */
+                        uint32_t p = (uint32_t)ep->bInterval << 3u; /* ms→μframes */
+                        i_intv = 0u;
+                        while (i_intv < 15u && (1u << i_intv) < p) i_intv++;
+                    } else {                  /* xHCI HS (3) or SS (4): bInterval-1 */
+                        i_intv = (ep->bInterval >= 1u) ? ep->bInterval - 1u : 3u;
+                        if (i_intv > 15u) i_intv = 15u;
+                    }
+                    uint32_t i_mps = ep->wMaxPacketSize & 0x7FFu;
+                    volatile uint32_t *iep =
+                        (volatile uint32_t *)(in_ctx + (uint32_t)(i_dci + 1u) * cs);
+                    iep[0] = (uint32_t)i_intv << 16;
+                    iep[1] = (i_mps << 16) | (7u << 3) | (3u << 1);
+                    iep[2] = (uint32_t)(ird) | 1u;
+                    iep[3] = (uint32_t)(ird >> 32);
+                    iep[4] = 8u; /* Average TRB Length — HID boot report = 8B */
+
+                    int_ep_count[slot_id]++;
+                    uart_puts("[xHCI] IntEP:  addr="); print_hex32(ep->bEndpointAddress);
+                    uart_puts(" dci="); print_hex32(i_dci);
+                    uart_puts(" mps="); print_hex32(i_mps);
+                    uart_puts(" intv="); print_hex32(i_intv); uart_puts("\n");
+                }
+            } /* ── end interrupt IN ─── */
+        } /* inner for (ei) */
+    } /* outer for (ii) */
+
+    if (add_flags == (1u << 0)) return 0;   /* no endpoints to configure — skip */
 
     /* Update MaxContextEntries (Slot Context DW0 bits[31:27]) */
     in_slot[0] = (in_slot[0] & ~(0x1Fu << 27)) | (max_dci << 27);
@@ -3059,7 +3410,7 @@ int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
     if (slot_id == 0) { uart_puts("[xHCI] HubPort: Enable Slot failed\n"); return -1; }
     uart_puts("[xHCI] HubPort: slot="); print_hex32(slot_id); uart_puts("\n");
 
-    g_slot_ids[hub_port] = slot_id;   /* reuse g_slot_ids for downstream slots */
+    hc_reg(hub_slot, hub_port, slot_id);  /* register in hub-child registry */
     active_slot = slot_id;
 
     /* ── Address Device ─────────────────────────────────────────────── */
@@ -3104,18 +3455,41 @@ int xhci_enumerate_hub_port(usb_device_t *hub_dev, uint8_t hub_port,
     uart_puts(" class="); print_hex32(dev->bDeviceClass); uart_puts("\n");
 
     /* ── Parse Configuration Descriptor ─────────────────────────────── */
+    /*
+     * Step 1: fetch first 9 bytes to learn wTotalLength, then fetch the
+     * full descriptor.  Using cfgbuf directly (xhci_control_transfer's
+     * dma_copy_from fills it) — do NOT re-read slot_ep0_data, which can
+     * race with DMA and return stale zeros.
+     */
     uint8_t cfgbuf[256];
     memset(cfgbuf, 0, sizeof(cfgbuf));
     active_slot = slot_id;
-    usb_control_transfer(dev, 0x80, 0x06, (0x02 << 8) | 0, 0,
-                         cfgbuf, sizeof(cfgbuf), 200);
-    asm volatile("dsb sy" ::: "memory");
+
+    /* First fetch: 9 bytes to get wTotalLength */
+    int cfg_rc1 = usb_control_transfer(dev, 0x80, 0x06, (0x02 << 8) | 0, 0,
+                                       cfgbuf, 9, 500);
+    uart_puts("[xHCI] HubPort cfg hdr rc="); print_hex32((uint32_t)cfg_rc1);
+    uart_puts(" tlen="); print_hex32((uint32_t)(cfgbuf[2] | (cfgbuf[3] << 8)));
+    uart_puts("\n");
+
+    int tlen_full = (int)(cfgbuf[2] | ((int)cfgbuf[3] << 8));
+    if (tlen_full < 9)  tlen_full = 9;
+    if (tlen_full > 255) tlen_full = 255;
+
+    /* Second fetch: full descriptor */
+    memset(cfgbuf, 0, sizeof(cfgbuf));
+    int cfg_rc2 = usb_control_transfer(dev, 0x80, 0x06, (0x02 << 8) | 0, 0,
+                                       cfgbuf, (uint16_t)tlen_full, 500);
+    uart_puts("[xHCI] HubPort cfg full rc="); print_hex32((uint32_t)cfg_rc2);
+    uart_puts(": ");
+    for (int _d = 0; _d < 16 && _d < tlen_full; _d++) {
+        print_hex32(cfgbuf[_d]); uart_puts(" ");
+    }
+    uart_puts("\n");
+
     /* Parse interfaces from config descriptor */
     {
-        volatile uint8_t *rd = slot_ep0_data(slot_id);
-        int tlen = (int)(rd[2] | ((int)rd[3] << 8));
-        if (tlen > 256) tlen = 256;
-        for (int i = 0; i < tlen; i++) cfgbuf[i] = rd[i];
+        int tlen = tlen_full;
         /* boot158: parse both Interface AND Endpoint descriptors.
          * Previously only Interface descriptors were parsed here, leaving
          * endpoint_count=0 on every downstream device — the MSC probe
@@ -3239,9 +3613,45 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
     ep0_enq(setup_lo, setup_hi, 8, TRB_TYPE_SETUP, TRB_IDT | (xfer_type << 16));
 
     if (length > 0) {
-        uint32_t data_flags = TRB_IOC | (dir_in ? TRB_DIR_IN : 0);
-        ep0_enq((uint32_t)data_dma, (uint32_t)(data_dma >> 32),
-                (uint32_t)length, TRB_TYPE_DATA, data_flags);
+        if (dir_in && length > 8U) {
+            /*
+             * Build 252: two-TRB chained DATA stage — VL805 FS TT split workaround.
+             *
+             * Root cause: for Full-Speed devices behind a Transaction Translator
+             * the VL805 firmware fires CC=13 (Short Packet) after the very first
+             * IN token response, which carries exactly EP0-MPS (8) bytes.
+             * A packet that is exactly MPS bytes is a FULL packet (not short), so
+             * the VL805 is wrong to fire SHORT_PKT here — but it does so anyway.
+             *
+             * Fix: split the DATA stage into two chained TRBs:
+             *   TRB1 — requests exactly 8 bytes (= EP0 MPS for FS), CHAIN, no IOC.
+             *           When the first IN token returns 8 bytes, 8 == TRB1 requested,
+             *           so no short-packet condition is possible.  VL805 silently
+             *           commits those 8 bytes to DMA and advances to TRB2.
+             *   TRB2 — requests (length−8) bytes, IOC.  VL805 continues issuing IN
+             *           tokens until the device sends a short packet or all bytes
+             *           arrive, then fires a single Transfer Event covering the
+             *           whole TD.  The event's residual field is the TD residual
+             *           (length − actual_received), so the existing computation
+             *           actual = length − last_residual stays correct.
+             */
+            uart_puts("[xHCI] ctrl: 2-TRB chain slot="); print_hex32(slot_id);
+            uart_puts(" len="); print_hex32(length); uart_puts("\n");
+            ep0_enq((uint32_t)data_dma,
+                    (uint32_t)(data_dma >> 32),
+                    8U,
+                    TRB_TYPE_DATA,
+                    TRB_DIR_IN | TRB_CHAIN);              /* TRB1: 8 bytes, chain on */
+            ep0_enq((uint32_t)(data_dma + 8ULL),
+                    (uint32_t)((data_dma + 8ULL) >> 32),
+                    (uint32_t)(length - 8U),
+                    TRB_TYPE_DATA,
+                    TRB_DIR_IN | TRB_IOC);                /* TRB2: remainder, event here */
+        } else {
+            uint32_t data_flags = TRB_IOC | (dir_in ? TRB_DIR_IN : 0);
+            ep0_enq((uint32_t)data_dma, (uint32_t)(data_dma >> 32),
+                    (uint32_t)length, TRB_TYPE_DATA, data_flags);
+        }
     }
 
     /* Status TRB direction is opposite to data phase */
@@ -3250,24 +3660,75 @@ int xhci_control_transfer(usb_device_t *dev, uint8_t req_type, uint8_t request,
 
     ep0_doorbell(slot_id);
 
-    uint32_t ev[4];
-    if (xhci_wait_event(ev, timeout ? timeout : 100) != 0) {
-        uart_puts("[xHCI] control_transfer: TIMEOUT\n");
+    /*
+     * Wait for Transfer Event(s) for THIS slot.
+     *
+     * With the two-TRB split above, TRB1 has no IOC so no event fires for it.
+     * Only TRB2 (or the single TRB for short/OUT transfers) fires an event:
+     *   CC=13 (Short Packet) — device sent a short final packet (done), OR
+     *   CC=1  with residual=0 — all requested bytes received (done).
+     *
+     * The VL805 may still fire per-packet CC=1/residual≠0 intermediate events
+     * for non-split HS transfers; we consume those and keep waiting.
+     * Events for other slots are silently discarded.
+     */
+    uint32_t ev[4]    = {0,0,0,0};
+    uint8_t  cc       = 0;
+    int      ct_ok    = 0;
+    uint32_t last_residual = (uint32_t)length;
+    uint32_t ct_deadline = get_time_ms() + (uint32_t)(timeout > 0 ? timeout : 500);
+
+    while (get_time_ms() < ct_deadline) {
+        if (xhci_wait_event(ev, 10) != 0) continue;
+        uint8_t etype = (ev[3] >> 10) & 0x3FU;
+        uint8_t eslot = (ev[3] >> 24) & 0xFFU;
+        if (etype != TRB_TYPE_XFER_EVT || eslot != slot_id) continue; /* discard */
+
+        cc           = (ev[2] >> 24) & 0xFF;
+        last_residual = ev[2] & 0x00FFFFFFu;   /* bits[23:0] = bytes NOT xferred */
+
+        if (cc == CC_SHORT_PKT) {
+            ct_ok = 1; break;                  /* short packet → device done */
+        }
+        if (cc == CC_SUCCESS) {
+            if (last_residual == 0) {
+                ct_ok = 1; break;              /* all bytes received */
+            }
+            /* last_residual != 0: VL805 intermediate per-packet event.
+             * Update residual and keep waiting for the next packet event.  */
+            continue;
+        }
+        /* Any other CC is an error */
+        break;
+    }
+
+    if (!ct_ok) {
+        if (cc != 0 && cc != CC_SUCCESS && cc != CC_SHORT_PKT) {
+            uart_puts("[xHCI] control_transfer: bad CC="); print_hex32(cc); uart_puts("\n");
+        } else {
+            uart_puts("[xHCI] control_transfer: TIMEOUT slot=");
+            print_hex32(slot_id); uart_puts("\n");
+        }
         return -1;
     }
-    uint8_t cc = (ev[2] >> 24) & 0xFF;
-    if (cc != CC_SUCCESS && cc != CC_SHORT_PKT) return -1;
 
-    /* Drain Status event if data phase was issued */
+    /* Drain the STATUS-phase event (slot-filtered, short window).
+     * For FS split transactions the STATUS may arrive up to ~5ms late.  */
     if (length > 0) {
         uint32_t ev2[4];
-        xhci_wait_event(ev2, 20);
+        uint32_t drain_dl = get_time_ms() + 50U;
+        while (get_time_ms() < drain_dl) {
+            if (xhci_wait_event(ev2, 10) != 0) break;
+            uint8_t et2 = (ev2[3] >> 10) & 0x3FU;
+            uint8_t es2 = (ev2[3] >> 24) & 0xFFU;
+            if (et2 == TRB_TYPE_XFER_EVT && es2 == slot_id) break; /* consumed */
+            /* Stale event from another slot — keep draining */
+        }
     }
 
     /* IN: copy DMA buffer to caller */
     if (dir_in && data && length) {
-        int got = (int)(ev[2] & 0xFFFF); /* residue in low 17 bits of dword 2 */
-        int actual = length - got;
+        int actual = (int)((uint32_t)length - last_residual);
         if (actual < 0) actual = 0;
         dma_copy_from(data, ep0_data, (size_t)actual);
         return actual;
@@ -3334,13 +3795,8 @@ int xhci_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout)
     ring[b + 3] = TRB_IOC | (1u << TRB_TYPE_SHIFT) | (*cycle_p);
     asm volatile("dsb sy" ::: "memory");
 
-    uart_puts("[xHCI] bulk_xfer: slot="); print_hex32(slot_id);
-    uart_puts(" dci="); print_hex32(dci);
-    uart_puts(" dir="); uart_puts(dir_in ? "IN" : "OUT");
-    uart_puts(" len="); print_hex32((uint32_t)len);
-    uart_puts(" buf="); print_hex32((uint32_t)buf_dma);
-    uart_puts(" TRB3="); print_hex32(ring[b + 3]);
-    uart_puts("\n");
+    /* bulk_xfer chatty log suppressed — path is proven stable (boot254).
+     * Re-enable by restoring uart_puts calls if bulk issues recur.      */
 
     (*enq_p)++;
     if (*enq_p >= BULK_RING_TRBS - 1) {
@@ -3384,22 +3840,219 @@ int xhci_bulk_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout)
 }
 
 /*
- * xhci_interrupt_transfer — poll an HID interrupt IN endpoint.
+ * xhci_interrupt_transfer — poll an HID interrupt IN endpoint (Build 253).
  *
- * Implemented as GET_REPORT over EP0 (boot protocol fallback).
- * Works for any boot-protocol HID device without needing a separate
- * interrupt ring. Full interrupt ring support is a future enhancement.
+ * Uses the interrupt transfer rings configured by xhci_configure_endpoints.
+ * Protocol:
+ *   1. If no TRB is in flight, enqueue a Normal TRB on the endpoint's ring
+ *      and ring the doorbell.
+ *   2. Poll the event ring for a Transfer Event matching this slot + DCI.
+ *   3. On CC_SUCCESS or CC_SHORT_PKT: copy data from DMA buffer, return
+ *      actual byte count, and clear the submitted flag so the next call
+ *      re-arms the ring.
+ *   4. On timeout (NAK — device has nothing yet): return 0.  This is NOT
+ *      an error; the HID driver treats 0 as "no new report."
+ *   5. Return -1 only for hard errors (unconfigured endpoint, bad slot).
+ *
+ * Thread safety: single-CPU polling loop — no locking needed.
  */
-int xhci_interrupt_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout) {
-    (void)ep;
-    /* We need the device to call control_transfer — but interrupt_transfer
-     * only receives the endpoint, not the device.  The HID driver falls
-     * back to usb_control_transfer(dev, ...) when int_in probe succeeds,
-     * which routes here correctly.  This path is only hit if called
-     * directly with just the endpoint, which we cannot service without the
-     * slot_id.  Return -1 so HID driver uses the control fallback path. */
-    (void)data; (void)len; (void)timeout;
-    return -1;
+int xhci_interrupt_transfer(usb_endpoint_t *ep, void *data, size_t len, int timeout)
+{
+    if (!ep || !data || len == 0) return -1;
+
+    uint8_t slot_id = ep->slot_id;
+    if (slot_id == 0 || slot_id > MAX_SLOTS_ALLOC) return -1;
+
+    uint8_t ep_num = ep->bEndpointAddress & 0x0Fu;
+    uint8_t dci    = (uint8_t)(ep_num * 2u + 1u);  /* interrupt IN: dir_in=1 */
+
+    /* Find the matching interrupt endpoint index for this slot */
+    int i_idx = -1;
+    for (int k = 0; k < int_ep_count[slot_id]; k++) {
+        if (int_ep_dci[slot_id][k] == dci) { i_idx = k; break; }
+    }
+    if (i_idx < 0) {
+        /* Endpoint not configured via xhci_configure_endpoints — not an xHCI ring */
+        return -1;
+    }
+
+    /* ── Submit Normal TRB if none is currently in flight ───────────────── *
+     *
+     * boot285: Submit TRB whenever the endpoint is not already armed,
+     * regardless of timeout.  Previously (boot261) we required timeout > 0
+     * to avoid consuming the delta accumulator before GET_REPORT could read
+     * it.  We no longer use GET_REPORT for mice — interrupt IN is the sole
+     * path.  Allowing timeout=0 ("fire-and-forget") means hid_poll_mice()
+     * can call us non-blocking at 4 ms and keep the TRB perpetually queued,
+     * eliminating the 16 ms re-arm gap that caused delta accumulation and
+     * cursor jerkiness.                                                      */
+    if (int_ep_submitted[slot_id][i_idx] == 0u) {
+        volatile uint32_t *iring = slot_int_ring(slot_id, i_idx);
+        volatile uint8_t  *ibuf  = slot_int_data(slot_id, i_idx);
+        uint32_t req_len = (uint32_t)(len > INT_REPORT_SIZE ? INT_REPORT_SIZE : len);
+
+        /* First-arm diagnostic: log once per slot/endpoint (enq==0 on first call) */
+        if (int_ep_enq[slot_id][i_idx] == 0u) {
+            uart_puts("[xHCI] int_arm: slot="); print_hex32(slot_id);
+            uart_puts(" dci="); print_hex32(dci);
+            uart_puts(" idx="); print_hex32((uint32_t)i_idx);
+            uart_puts("\n");
+        }
+
+        dma_zero(ibuf, req_len);
+        uint64_t buf_dma = phys_to_dma((uint64_t)virt_to_phys((void *)ibuf));
+
+        uint32_t b   = int_ep_enq[slot_id][i_idx] * 4u;
+        uint8_t  cyc = int_ep_cycle[slot_id][i_idx];
+
+        iring[b + 0] = (uint32_t)buf_dma;
+        iring[b + 1] = (uint32_t)(buf_dma >> 32);
+        iring[b + 2] = req_len;
+        iring[b + 3] = TRB_IOC | (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | cyc;
+        asm volatile("dsb sy" ::: "memory");
+
+        /* Advance enqueue pointer; wrap with Link TRB if needed */
+        int_ep_enq[slot_id][i_idx]++;
+        if (int_ep_enq[slot_id][i_idx] >= INT_RING_TRBS - 1u) {
+            uint32_t li = (INT_RING_TRBS - 1u) * 4u;
+            iring[li + 3] = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | cyc;
+            asm volatile("dsb sy" ::: "memory");
+            int_ep_enq[slot_id][i_idx]   = 0u;
+            int_ep_cycle[slot_id][i_idx] ^= 1u;
+        }
+
+        /* Ring the doorbell for this slot's interrupt endpoint */
+        volatile uint32_t *db = (volatile uint32_t *)xhci_ctrl.doorbell_regs;
+        asm volatile("dsb sy" ::: "memory");
+        db[slot_id] = (uint32_t)dci;
+        asm volatile("dsb sy" ::: "memory");
+
+        int_ep_submitted[slot_id][i_idx] = 1u;
+    }
+
+    /* ── Poll event ring for Transfer Event for this slot/endpoint ───────── */
+    uint32_t ev[4];
+
+    /* Check stash first — a previous poll for a sibling endpoint may have
+     * consumed our event and saved it here.                                */
+    int found = evt_stash_get(slot_id, dci, ev);
+
+    if (!found) {
+        if (timeout == 0) {
+            /* boot261: Non-blocking path — single immediate event ring check.
+             * Returns at once with found=0 if nothing is there.  The HID
+             * driver calls us with timeout=0 so WIMP is never stalled.       */
+            asm volatile("dsb sy; isb" ::: "memory");
+            if (evt_ring_poll(ev)) {
+                uint32_t ev_type  = (ev[3] >> 10) & 0x3Fu;
+                uint8_t  ev_slot  = (uint8_t)((ev[3] >> 24) & 0xFFu);
+                uint8_t  ev_ep_id = (uint8_t)((ev[3] >> 16) & 0x1Fu);
+                if (ev_type == 0x20u) {
+                    if (ev_slot == slot_id && ev_ep_id == dci) {
+                        found = 1;
+                    } else {
+                        /* Transfer Event for sibling endpoint — stash it */
+                        uart_puts("[xHCI] int_steal: slot="); print_hex32(ev_slot);
+                        uart_puts(" dci="); print_hex32(ev_ep_id);
+                        uart_puts(" cc="); print_hex32((ev[2] >> 24) & 0xFFu);
+                        uart_puts("\n");
+                        evt_stash_put(ev_slot, ev_ep_id, ev);
+                    }
+                }
+            }
+        } else {
+            /* Blocking path — wait up to timeout ms for our Transfer Event */
+            uint32_t ms       = (timeout < 5000) ? (uint32_t)timeout : 10U;
+            uint32_t deadline = get_time_ms() + ms;
+            while (get_time_ms() < deadline) {
+                asm volatile("dsb sy; isb" ::: "memory");
+                if (!evt_ring_poll(ev)) continue;
+
+                uint32_t ev_type  = (ev[3] >> 10) & 0x3Fu;
+                uint8_t  ev_slot  = (uint8_t)((ev[3] >> 24) & 0xFFu);
+                uint8_t  ev_ep_id = (uint8_t)((ev[3] >> 16) & 0x1Fu);
+
+                if (ev_type == 0x20u) {
+                    if (ev_slot == slot_id && ev_ep_id == dci) {
+                        found = 1; break;      /* our event — process below */
+                    }
+                    /* Transfer Event for a different endpoint: stash for its caller */
+                    uart_puts("[xHCI] int_steal: slot="); print_hex32(ev_slot);
+                    uart_puts(" dci="); print_hex32(ev_ep_id);
+                    uart_puts(" cc="); print_hex32((ev[2] >> 24) & 0xFFu);
+                    uart_puts("\n");
+                    evt_stash_put(ev_slot, ev_ep_id, ev);
+                }
+                /* Non-Transfer Events (CCE, PSCE) already logged by evt_ring_poll */
+            }
+        }
+    }
+
+    if (!found) {
+        /* boot262 diagnostic: read DMA buffer directly on timeout.
+         * If ibuf is non-zero, data arrived but no Transfer Event was
+         * generated (event ring problem).  If ibuf is all zero, the TRB
+         * was not processed at all (DMA address / cycle-bit / EP-state issue).
+         * Only log for blocking calls (timeout>0) to avoid spam.             */
+        if (timeout > 0) {
+            volatile uint8_t *ibuf = slot_int_data(slot_id, i_idx);
+            asm volatile("dsb sy; isb" ::: "memory");
+            uint8_t b0 = ibuf[0], b1 = ibuf[1], b2 = ibuf[2], b3 = ibuf[3];
+            uint8_t b4 = ibuf[4], b5 = ibuf[5], b6 = ibuf[6], b7 = ibuf[7];
+            /* Only log + attempt DMA fallback when buffer is non-zero.
+             * All-zeros = normal idle NAK (no key/movement) — stay silent
+             * to avoid flooding the log at 60 Hz poll rate.               */
+            if (b0|b1|b2|b3|b4|b5|b6|b7) {
+                uart_puts("[xHCI] int_timeout dma=");
+                print_hex32(b0); uart_puts(",");
+                print_hex32(b1); uart_puts(",");
+                print_hex32(b2); uart_puts(",");
+                print_hex32(b3); uart_puts(",");
+                print_hex32(b4); uart_puts(",");
+                print_hex32(b5); uart_puts(",");
+                print_hex32(b6); uart_puts(",");
+                print_hex32(b7); uart_puts(" slot=");
+                print_hex32(slot_id); uart_puts(" dci=");
+                print_hex32(dci); uart_puts("\n");
+                uart_puts("[xHCI] int_dma_fallback: using buffer data directly\n");
+                int_ep_submitted[slot_id][i_idx] = 0u;  /* re-arm next call */
+                uint32_t req_len = (uint32_t)(len > INT_REPORT_SIZE ? INT_REPORT_SIZE : len);
+                if (req_len > (uint32_t)len) req_len = (uint32_t)len;
+                uint8_t *out = (uint8_t *)data;
+                for (uint32_t k = 0; k < req_len; k++) out[k] = ibuf[k];
+                return (int)req_len;
+            }
+        }
+        return 0;
+    }
+
+    /* Process the matched Transfer Event */
+    {
+        uint8_t  cc        = (uint8_t)((ev[2] >> 24) & 0xFFu);
+        uint32_t remaining = ev[2] & 0x00FFFFFFu;
+        uint32_t req_len   = (uint32_t)(len > INT_REPORT_SIZE ? INT_REPORT_SIZE : len);
+
+        int_ep_submitted[slot_id][i_idx] = 0u;  /* re-arm next call */
+
+        if (cc == CC_SUCCESS || cc == CC_SHORT_PKT) {
+            uint32_t actual = (remaining < req_len) ? (req_len - remaining) : req_len;
+            if (actual == 0u) actual = req_len;
+            if (actual > len) actual = (uint32_t)len;
+            volatile uint8_t *ibuf = slot_int_data(slot_id, i_idx);
+            dma_copy_from(data, ibuf, actual);
+            uart_puts("[xHCI] int_got: slot="); print_hex32(slot_id);
+            uart_puts(" dci="); print_hex32(dci);
+            uart_puts(" bytes="); print_hex32(actual);
+            uart_puts(" data="); print_hex32(((uint8_t *)data)[0]);
+            uart_puts(","); print_hex32(((uint8_t *)data)[1]);
+            uart_puts(","); print_hex32(((uint8_t *)data)[2]);
+            uart_puts("\n");
+            return (int)actual;
+        }
+        /* Other CC (stall, overrun, babble) — clear submitted, not fatal */
+        uart_puts("[xHCI] int_xfer: CC="); print_hex32(cc); uart_puts("\n");
+        return 0;
+    }
 }
 
 static usb_hc_ops_t g_xhci_hc_ops = {
@@ -3438,11 +4091,17 @@ static int evt_ring_poll(uint32_t ev[4]) {
         return 0;
     }
 
-    /* Event consumed — log type for tracing, then advance consumer state */
+    /* Event consumed — advance consumer state.
+     * boot254: Transfer Events (0x20) are now silent to prevent UART flooding
+     * during bulk I/O.  All other types (CCE=0x21, PSCE=0x22, etc.) still log
+     * so unexpected events remain visible.  Interrupt-IN Transfer Events for
+     * HID keypresses also log via the int_xfer path, not here.            */
     uint32_t trb_type = (slot[3] >> 10) & 0x3FU;
-    uart_puts("[xHCI] event type="); print_hex32(trb_type);
-    uart_puts(" cc="); print_hex32((slot[2] >> 24) & 0xFF);
-    uart_puts(" deq="); print_hex32(evt_dequeue); uart_puts("\n");
+    if (trb_type != 0x20U) {                    /* non-Transfer Event: log it */
+        uart_puts("[xHCI] event type="); print_hex32(trb_type);
+        uart_puts(" cc="); print_hex32((slot[2] >> 24) & 0xFF);
+        uart_puts(" deq="); print_hex32(evt_dequeue); uart_puts("\n");
+    }
 
     ev[0] = slot[0];
     ev[1] = slot[1];
@@ -3524,13 +4183,17 @@ static int xhci_wait_event(uint32_t ev[4], int timeout_ms) {
         }
     }
 
-    /* Timeout — single consolidated line to keep the log readable */
-    uart_puts("[xHCI] timeout("); print_hex32((uint32_t)timeout_ms);
-    uart_puts("ms) USBSTS="); print_hex32(readl(_op + OP_USBSTS));
-    uart_puts(" INTR2="); print_hex32(readl(pcie_base + 0x4300U));
-    uart_puts(" TRB0=["); print_hex32(((volatile uint32_t *)evt_ring)[0]);
-    uart_puts(","); print_hex32(((volatile uint32_t *)evt_ring)[3]);
-    uart_puts("]\n");
+    /* Timeout — single consolidated line to keep the log readable.
+     * Suppressed during TUR retry loop (xhci_quiet_timeouts != 0) because
+     * slow devices generate many expected timeouts before becoming ready.    */
+    if (!xhci_quiet_timeouts) {
+        uart_puts("[xHCI] timeout("); print_hex32((uint32_t)timeout_ms);
+        uart_puts("ms) USBSTS="); print_hex32(readl(_op + OP_USBSTS));
+        uart_puts(" INTR2="); print_hex32(readl(pcie_base + 0x4300U));
+        uart_puts(" TRB0=["); print_hex32(((volatile uint32_t *)evt_ring)[0]);
+        uart_puts(","); print_hex32(((volatile uint32_t *)evt_ring)[3]);
+        uart_puts("]\n");
+    }
     return -1;
 }
 
@@ -3556,6 +4219,158 @@ uint64_t xhci_dma_phys(void) {
 }
 
 /*
+ * xhci_slot_teardown — boot287: core xHCI slot retirement (steps 1–5).
+ *
+ * Private helper shared by xhci_disconnect_slot() (root-hub PSCE path) and
+ * xhci_disconnect_hub_child() (downstream hub port path).
+ *
+ * Sequence (xHCI spec §4.6.5 Stop Endpoint, §4.6.2 Disable Slot):
+ *   1. Stop Endpoint command for each active interrupt endpoint → await CCE
+ *      cc=5 (Context State Error) is expected when the endpoint's last TRB
+ *      had already completed before the device disappeared.
+ *   2. Disable Slot command → await CCE
+ *   3. Zero DCBAA[slot_id] so the VL805 MCU no longer dereferences this slot
+ *   4. Reset all ring-state arrays (int_ep_*, ep0_*, bulk_*) for this slot
+ *   5. Notify HID layer via weak-linked hid_device_disconnect(slot_id)
+ *
+ * The caller is responsible for clearing the port→slot mapping in g_slot_ids.
+ */
+static void xhci_slot_teardown(uint8_t slot_id)
+{
+    uart_puts("[USB] Slot teardown: slot="); print_hex32(slot_id); uart_puts("\n");
+
+    /* ── 1. Stop each active interrupt endpoint ──────────────────────────── */
+    int n_eps = int_ep_count[slot_id];
+    for (int i = 0; i < n_eps; i++) {
+        uint8_t dci = int_ep_dci[slot_id][i];
+        uart_puts("[USB] Stop Endpoint: slot="); print_hex32(slot_id);
+        uart_puts(" dci="); print_hex32(dci); uart_puts("\n");
+
+        /* Stop Endpoint TRB: DW3[31:24]=Slot DW3[20:16]=DCI (xHCI §6.4.3.7) */
+        cmd_ring_submit(0, 0, 0, TRB_TYPE_STOP_EP,
+                        ((uint32_t)slot_id << 24) | ((uint32_t)dci << 16));
+
+        /* Await Command Completion Event (CCE, TRB type 33 = 0x21) */
+        uint32_t deadline = get_time_ms() + 500U;
+        int got = 0;
+        while (get_time_ms() < deadline) {
+            uint32_t ev[4];
+            if (xhci_wait_event(ev, 20) != 0) break;   /* ring empty for 20ms */
+            if (((ev[3] >> 10) & 0x3FU) == 0x21U) {    /* CCE */
+                uint8_t cc = (ev[2] >> 24) & 0xFF;
+                uart_puts("[USB] Stop Endpoint CCE: cc="); print_hex32(cc);
+                if (cc != CC_SUCCESS && cc != 5 /*Context State Error*/)
+                    uart_puts(" (unexpected)");
+                uart_puts("\n");
+                got = 1; break;
+            }
+            /* Not a CCE — stale Transfer Event or PSCE; discard and keep waiting */
+        }
+        if (!got) uart_puts("[USB] Stop Endpoint: no CCE (timeout)\n");
+    }
+
+    /* ── 2. Disable Slot ─────────────────────────────────────────────────── */
+    uart_puts("[USB] Disable Slot: slot="); print_hex32(slot_id); uart_puts("\n");
+
+    /* Disable Slot TRB: DW3[31:24]=Slot (xHCI §6.4.3.2) */
+    cmd_ring_submit(0, 0, 0, TRB_TYPE_DISABLE_SLOT, (uint32_t)slot_id << 24);
+
+    {
+        uint32_t deadline = get_time_ms() + 500U;
+        int got = 0;
+        while (get_time_ms() < deadline) {
+            uint32_t ev[4];
+            if (xhci_wait_event(ev, 20) != 0) break;
+            if (((ev[3] >> 10) & 0x3FU) == 0x21U) {    /* CCE */
+                uint8_t cc = (ev[2] >> 24) & 0xFF;
+                uart_puts("[USB] Disable Slot CCE: cc="); print_hex32(cc);
+                if (cc != CC_SUCCESS) uart_puts(" (unexpected)");
+                uart_puts("\n");
+                got = 1; break;
+            }
+        }
+        if (!got) uart_puts("[USB] Disable Slot: no CCE (timeout)\n");
+    }
+
+    /* ── 3. Zero DCBAA entry ─────────────────────────────────────────────── */
+    dcbaa[slot_id] = 0ULL;
+    asm volatile("dsb sy" ::: "memory");
+
+    /* ── 4. Reset all ring-state arrays for this slot ────────────────────── */
+    for (int i = 0; i < MAX_INT_EPS; i++) {
+        int_ep_submitted[slot_id][i] = 0u;
+        int_ep_enq[slot_id][i]       = 0u;
+        int_ep_cycle[slot_id][i]     = 1u;   /* ICS=1 ready for next enumeration */
+        int_ep_dci[slot_id][i]       = 0u;
+    }
+    int_ep_count[slot_id]   = 0;
+    ep0_cycle_s[slot_id]    = 1u;
+    ep0_enqueue_s[slot_id]  = 0u;
+    bulk_out_cycle[slot_id] = 1u;
+    bulk_out_enq[slot_id]   = 0u;
+    bulk_in_cycle[slot_id]  = 1u;
+    bulk_in_enq[slot_id]    = 0u;
+
+    /* ── 5. Notify HID layer ─────────────────────────────────────────────── */
+    extern void hid_device_disconnect(uint8_t sid) __attribute__((weak));
+    if (hid_device_disconnect) hid_device_disconnect(slot_id);
+
+    uart_puts("[USB] Slot teardown complete.\n");
+}
+
+/*
+ * xhci_disconnect_slot — root-hub PSCE path: tear down the slot for a device
+ * that disconnected directly from the VL805 root hub.
+ *
+ * Calls xhci_slot_teardown() then clears the root-hub port's slot mapping.
+ */
+static void xhci_disconnect_slot(int port0, uint8_t slot_id)
+{
+    uart_puts("[USB] Root-hub disconnect: port=");
+    print_hex32((uint32_t)(port0 + 1));
+    uart_puts(" slot="); print_hex32(slot_id); uart_puts("\n");
+
+    xhci_slot_teardown(slot_id);
+    g_slot_ids[(uint8_t)port0] = 0u;   /* free root-hub port for re-enumeration */
+}
+
+/*
+ * xhci_disconnect_hub_child — boot287/boot289: tear down the slot for a device
+ * that disconnected from a downstream USB hub port.
+ *
+ * Called from hub_poll_hotplug() (usb_hub.c) when a C_PORT_CONNECTION change
+ * indicates a device was removed.  hub_dev->hcd_private holds the hub slot_id
+ * (set during xhci_enumerate_hub_port).  The (hub_slot, hub_port) pair is used
+ * to look up the child device slot in g_hub_children[], supporting any number
+ * of downstream hubs without the old g_slot_ids[] overloading.
+ *
+ * @hub_dev   usb_device_t of the hub (hcd_private = hub slot_id)
+ * @hub_port  1-based hub port number
+ * Returns 0 on success, -1 if no active slot was found for that port.
+ */
+int xhci_disconnect_hub_child(usb_device_t *hub_dev, uint8_t hub_port)
+{
+    if (!hub_dev || hub_port == 0 || hub_port >= 16u) return -1;
+
+    uint8_t hub_slot = (uint8_t)(uintptr_t)hub_dev->hcd_private;
+    uint8_t sid      = hc_lookup(hub_slot, hub_port);
+    if (sid == 0u || sid > (uint8_t)MAX_SLOTS_ALLOC) {
+        uart_puts("[USB] HubChild disconnect: no active slot for hub_slot=");
+        print_hex32(hub_slot); uart_puts(" port="); print_hex32(hub_port);
+        uart_puts("\n");
+        return -1;
+    }
+
+    uart_puts("[USB] HubChild disconnect: hub_slot="); print_hex32(hub_slot);
+    uart_puts(" hub_port="); print_hex32(hub_port);
+    uart_puts(" slot="); print_hex32(sid); uart_puts("\n");
+
+    xhci_slot_teardown(sid);
+    hc_remove(hub_slot, hub_port);   /* free entry for re-enumeration */
+    return 0;
+}
+
+/*
  * xhci_check_hotplug — drain the event ring for Port Status Change Events.
  *
  * Called from the wimp_task main loop (boot178) when no bulk/control
@@ -3568,7 +4383,7 @@ uint64_t xhci_dma_phys(void) {
  *   – Read PORTSC to see whether a device connected or disconnected
  *   – Clear the change bits (W1C via PORTSC_WIC)
  *   – On connect: call enumerate_port() to enumerate the new device
- *   – On disconnect: log (full slot teardown is future work)
+ *   – On disconnect: boot287: xhci_disconnect_slot() for full slot teardown
  *
  * Returns number of PSCE events processed.
  */
@@ -3606,7 +4421,14 @@ int xhci_check_hotplug(void)
         } else {
             uart_puts("[USB] Root-hub hotplug: device disconnected from port ");
             print_hex32(port1); uart_puts("\n");
-            /* TODO: Disable Slot + free device resources (future work) */
+
+            /* boot287: Full slot teardown — Stop Endpoints, Disable Slot,
+             * clear ring state, notify HID layer.                          */
+            uint8_t sid = g_slot_ids[(uint8_t)port0];
+            if (sid > 0u && sid <= (uint8_t)MAX_SLOTS_ALLOC)
+                xhci_disconnect_slot(port0, sid);
+            else
+                uart_puts("[USB] No active slot for this port — nothing to tear down.\n");
         }
         found++;
     }

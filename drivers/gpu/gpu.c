@@ -58,7 +58,7 @@ void gpu_init(void)
                           COL_WHITE, RGB(0, 0, 160), 3);
 
     /* Version tag — right-aligned, 2× scale */
-    fb_draw_string_scaled(fb.width - 120, 10, "v0.184",
+    fb_draw_string_scaled(fb.width - 120, 10, "v0.205",
                           RGB(180, 220, 255), RGB(0, 0, 160), 2);
 
     /* Divider line under title */

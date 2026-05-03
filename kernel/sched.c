@@ -65,7 +65,11 @@ void sched_init_cpu(int cpu_id) {
 /* Idle task function */
 static void idle_task_fn(void) {
     while (1) {
-        __asm__ volatile ("wfe");  // Wait for event
+        __asm__ volatile ("wfe");  /* Wait for event */
+        /* boot273: always yield after wfe so WIMP (priority 10) gets
+         * rescheduled immediately when it is the highest-priority ready
+         * task.  Without this yield, once we land in idle we never escape.*/
+        schedule();
     }
 }
 
@@ -142,8 +146,13 @@ static task_t *pick_next_task(cpu_sched_t *sched) {
     return best ? best : sched->idle_task;
 }
 
-/* Context switch implementation */
-static void context_switch(task_t *prev, task_t *next) {
+/* Context switch implementation.
+ * boot273: noinline — prevents GCC from merging this into schedule() and
+ * accidentally inserting a function prologue (stp x29,x30 / sub sp,#N)
+ * between the schedule() call and the register-save asm.  Any prologue
+ * would shift SP so that the saved stack_top is wrong, corrupting the
+ * frame when the "ret" path restores the previous task.                  */
+static __attribute__((noinline)) void context_switch(task_t *prev, task_t *next) {
     if (prev == next) return;
 
     /* ── Save previous task ─────────────────────────────────────────
@@ -204,28 +213,42 @@ static void context_switch(task_t *prev, task_t *next) {
 void schedule(void) {
     int cpu_id = get_cpu_id();
     cpu_sched_t *sched = &cpu_sched[cpu_id];
-    
-    spin_lock(&sched->lock);
-    
+
+    /* boot273: use irqsave variant — plain spin_lock is unsafe once the
+     * ARM Generic Timer IRQ fires (timer_tick → schedule → deadlock).    */
+    unsigned long flags;
+    spin_lock_irqsave(&sched->lock, &flags);
+
     task_t *prev = sched->current;
-    task_t *next = pick_next_task(sched);
-    
+
+    /* boot273: mark prev READY *before* pick_next_task so that if WIMP is
+     * the highest-priority runnable task it re-selects itself rather than
+     * falling through to the idle task (which never yields back).         */
     if (prev && prev->state == TASK_RUNNING) {
         prev->state = TASK_READY;
     }
-    
+
+    task_t *next = pick_next_task(sched);
+
     if (next) {
         next->state = TASK_RUNNING;
         sched->current = next;
         current_task = next;
     }
-    
+
     sched->schedule_count++;
-    
-    spin_unlock(&sched->lock);
-    
+
+    spin_unlock_irqrestore(&sched->lock, flags);
+
     if (prev != next) {
+        /* boot275: only log actual context switches (not same-task re-selects).
+         * "eret" = first-time launch of a task; "ret" = resume saved context. */
+        debug_print("[SCHED] cs %s→%s (%s)\n",
+                    prev ? prev->name : "null",
+                    next ? next->name : "null",
+                    (next && next->started) ? "ret" : "eret");
         context_switch(prev, next);
+        /* Only the "ret" (resume) path reaches here — eret does not return. */
     }
 }
 

@@ -201,15 +201,30 @@ exc_irq_handler:
  * Uses x10=UART_BASE (caller sets it), preserves x0.
  * Pi 4 UART base = 0xFE201000 (identity mapped after mmu_init).
  * Before mmu_init the UART still works since identity map is 1:1.
+ *
+ * boot272: added TXFF timeout so a full/stalled FIFO does NOT hang
+ * the exception handler silently.  If the FIFO is still full after
+ * ~7 M iterations (~5 ms at 1.5 GHz) we force-reinit UART_CR and
+ * write the character unconditionally so the banner always appears.
  */
 exc_uart_putc:
-    /* Load UART base into x10 if not already set */
     ldr  x10, =0xFE201000
-    /* Wait for TX FIFO not full (FR bit 5) */
-1:  ldr  w11, [x10, #0x18]
-    tst  w11, #(1 << 5)
-    b.ne 1b
-    str  w0, [x10, #0x00]
+    /* Save timeout counter in x12 (caller does not expect x12 preserved) */
+    mov  x12, #0x00700000        /* ~7.3 M iterations */
+.Ltxff_wait:
+    ldr  w11, [x10, #0x18]       /* read UART_FR */
+    tst  w11, #(1 << 5)          /* test TXFF (bit 5) */
+    b.eq .Ltxff_ok               /* FIFO not full — go write */
+    subs x12, x12, #1
+    b.ne .Ltxff_wait
+    /* Timed out: FIFO still full.
+     * Force-reinit UART_CR (UARTEN|TXE|RXE) so the UART starts
+     * draining again, then write the character anyway.  A few chars
+     * at the start of the banner may be lost, but ESR/ELR come through. */
+    mov  w11, #0x301             /* bits 0+8+9 = UARTEN|TXE|RXE */
+    str  w11, [x10, #0x30]      /* UART_CR = 0x301 */
+.Ltxff_ok:
+    str  w0,  [x10, #0x00]      /* UART_DR — write character */
     ret
 
 /* exc_uart_str: print null-terminated string pointed to by x10 */

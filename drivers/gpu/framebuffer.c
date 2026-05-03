@@ -198,6 +198,11 @@ void con_printf(const char *fmt,...){
                   char b[16];int n=0;while(v>0){b[n++]='0'+v%10;v/=10;}
                   for(int k=n-1;k>=0;k--) con_putc(b[k]);
                   break;}
+        case 'u':{unsigned v=va_arg(ap,unsigned);
+                  if(v==0){con_putc('0');break;}
+                  char b[16];int n=0;while(v>0){b[n++]='0'+v%10;v/=10;}
+                  for(int k=n-1;k>=0;k--) con_putc(b[k]);
+                  break;}
         case 'x':{unsigned v=va_arg(ap,unsigned);const char*h="0123456789abcdef";
                   con_puts("0x");for(int s=28;s>=0;s-=4)con_putc(h[(v>>s)&0xF]);break;}
         case 'c':con_putc((char)va_arg(ap,int));break;
@@ -215,8 +220,9 @@ pixel_t fb_get_pixel(int x, int y) {
 
 /* ── Mouse cursor sprite (boot179) ──────────────────────────────────────────
  *
- * 8×10 solid arrow, top-left hotspot.  White 1-pixel halo drawn first so the
- * cursor is legible on any background colour.
+ * 8×10 arrow bitmap, rendered at 2× scale (16×20 screen pixels).
+ * boot276: was 1× (8×10 px) — barely visible on 1080p.  2× is the
+ * minimum size where the arrow reads clearly at normal viewing distance.
  *
  *   Row  Bits (MSB=col0)   Shape
  *    0   0x80  #.......    hotspot
@@ -233,8 +239,11 @@ pixel_t fb_get_pixel(int x, int y) {
 
 #define CURSOR_BITS_W   8
 #define CURSOR_BITS_H  10
-#define CURSOR_SAVE_W  10   /* fill area + 1px halo each side */
-#define CURSOR_SAVE_H  12
+#define CURSOR_SCALE    2              /* render each bitmap pixel as NxN screen pixels */
+#define CURSOR_PX_W    (CURSOR_BITS_W * CURSOR_SCALE)   /* 16 screen pixels wide  */
+#define CURSOR_PX_H    (CURSOR_BITS_H * CURSOR_SCALE)   /* 20 screen pixels tall  */
+#define CURSOR_SAVE_W  (CURSOR_PX_W + 2)  /* fill area + 1px halo each side */
+#define CURSOR_SAVE_H  (CURSOR_PX_H + 2)
 
 static const uint8_t cursor_fill_bits[CURSOR_BITS_H] = {
     0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC,   /* arrowhead triangle */
@@ -254,7 +263,7 @@ static void cursor_restore(void) {
 }
 
 static void cursor_blit(int x, int y) {
-    /* Save the pixels under the cursor (including halo band) */
+    /* Save the screen pixels under the cursor area (scaled + halo) */
     int sx = x - 1, sy = y - 1;
     for (int r = 0; r < CURSOR_SAVE_H; r++)
         for (int c = 0; c < CURSOR_SAVE_W; c++)
@@ -262,33 +271,44 @@ static void cursor_blit(int x, int y) {
     cursor_sx = sx;
     cursor_sy = sy;
 
-    /* Pass 1 — white halo: every transparent pixel adjacent to a fill pixel */
-    for (int r = -1; r <= CURSOR_BITS_H; r++) {
-        for (int c = -1; c <= CURSOR_BITS_W; c++) {
-            /* Skip if this is a fill pixel itself */
-            int self_fill = ((unsigned)r < (unsigned)CURSOR_BITS_H &&
-                             (unsigned)c < (unsigned)CURSOR_BITS_W)
-                            && ((cursor_fill_bits[r] >> (7 - c)) & 1u);
+    /* Pass 1 — white halo (1 screen-pixel border around the scaled shape).
+     * Iterate over screen pixels in the save area, skip fill pixels,
+     * check if any neighbour is a fill pixel. */
+    for (int sr = -1; sr <= CURSOR_PX_H; sr++) {
+        for (int sc = -1; sc <= CURSOR_PX_W; sc++) {
+            /* Bitmap pixel this screen pixel belongs to */
+            int br = sr / CURSOR_SCALE;
+            int bc = sc / CURSOR_SCALE;
+            int self_fill = ((unsigned)sr < (unsigned)CURSOR_PX_H &&
+                             (unsigned)sc < (unsigned)CURSOR_PX_W)
+                            && ((unsigned)br < (unsigned)CURSOR_BITS_H)
+                            && ((unsigned)bc < (unsigned)CURSOR_BITS_W)
+                            && ((cursor_fill_bits[br] >> (7 - bc)) & 1u);
             if (self_fill) continue;
-            /* Check all 8 neighbours for a fill pixel */
+            /* Check 8 screen-pixel neighbours */
             int border = 0;
-            for (int dr = -1; dr <= 1 && !border; dr++)
+            for (int dr = -1; dr <= 1 && !border; dr++) {
                 for (int dc = -1; dc <= 1 && !border; dc++) {
-                    int nr = r + dr, nc = c + dc;
-                    if ((unsigned)nr < (unsigned)CURSOR_BITS_H &&
-                        (unsigned)nc < (unsigned)CURSOR_BITS_W)
-                        if ((cursor_fill_bits[nr] >> (7 - nc)) & 1u)
+                    int nr = sr + dr, nc = sc + dc;
+                    int nbr = nr / CURSOR_SCALE, nbc = nc / CURSOR_SCALE;
+                    if ((unsigned)nr < (unsigned)CURSOR_PX_H &&
+                        (unsigned)nc < (unsigned)CURSOR_PX_W &&
+                        (unsigned)nbr < (unsigned)CURSOR_BITS_H &&
+                        (unsigned)nbc < (unsigned)CURSOR_BITS_W)
+                        if ((cursor_fill_bits[nbr] >> (7 - nbc)) & 1u)
                             border = 1;
                 }
-            if (border) fb_set_pixel(x + c, y + r, COL_WHITE);
+            }
+            if (border) fb_set_pixel(x + sc, y + sr, COL_WHITE);
         }
     }
 
-    /* Pass 2 — black fill */
+    /* Pass 2 — black fill (scaled) */
     for (int r = 0; r < CURSOR_BITS_H; r++)
         for (int c = 0; c < CURSOR_BITS_W; c++)
             if ((cursor_fill_bits[r] >> (7 - c)) & 1u)
-                fb_set_pixel(x + c, y + r, COL_BLACK);
+                fb_fill_rect(x + c * CURSOR_SCALE, y + r * CURSOR_SCALE,
+                             CURSOR_SCALE, CURSOR_SCALE, COL_BLACK);
 }
 
 void cursor_init(void) {
@@ -298,13 +318,14 @@ void cursor_init(void) {
 
 void cursor_update(int x, int y) {
     if (!fb.valid || !cursor_visible) return;
-    /* Clamp so save area (1px outside fill) stays within framebuffer */
-    if (x < 1) x = 1;
-    if (y < 1) y = 1;
-    if (x + CURSOR_BITS_W + 1 > (int)fb.width)
-        x = (int)fb.width  - CURSOR_BITS_W - 1;
-    if (y + CURSOR_BITS_H + 1 > (int)fb.height)
-        y = (int)fb.height - CURSOR_BITS_H - 1;
+    /* Clamp hotspot to framebuffer edges.  fb_set_pixel() clips out-of-bounds
+     * pixels silently, so the cursor can reach all four edges even when the
+     * scaled sprite partially overflows.  Only the minimum clamp is applied
+     * so the cursor "hugs" the border rather than stopping short. */
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= (int)fb.width)  x = (int)fb.width  - 1;
+    if (y >= (int)fb.height) y = (int)fb.height - 1;
     /* Don't redraw if position unchanged */
     if (cursor_sx == x - 1 && cursor_sy == y - 1) return;
     cursor_restore();
