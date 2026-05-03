@@ -257,6 +257,43 @@ void wimp_task(void)
     debug_print("[WIMP] task running — cursor at (%d,%d)\n",
                 (int)last_mx, (int)last_my);
 
+    /* boot301: startup splash — welcome panel drawn directly on the
+     * framebuffer before the main loop starts.  Uses fb.width/height so
+     * it centres correctly on any resolution the GPU has set up.        */
+    if (fb.valid) {
+        /* Panel geometry — centred, slightly above mid-screen */
+        int pw = 560, ph = 180;
+        int px = (int)((fb.width  - (uint32_t)pw) / 2u);
+        int py = (int)((fb.height - (uint32_t)ph) / 2u) - 60;
+
+        /* Dark background with double border */
+        fb_fill_rect(px,   py,   pw,   ph,   COL_DARK_GREY);
+        fb_draw_rect(px,   py,   pw,   ph,   COL_RISCOS_GREY);
+        fb_draw_rect(px+2, py+2, pw-4, ph-4, COL_GREY);
+
+        /* Title: "Phoenix OS" — scale 4 → each char is 32×32 px */
+        int title_w = 10 * 8 * 4;          /* 10 chars × 8px × scale */
+        int tx = px + (pw - title_w) / 2;
+        int ty = py + 22;
+        fb_draw_string_scaled(tx, ty, "Phoenix OS", COL_WHITE, COL_DARK_GREY, 4);
+
+        /* Thin divider below title */
+        fb_draw_line(px + 24, ty + 42, px + pw - 24, ty + 42, COL_RISCOS_GREY);
+
+        /* Subtitle: "Bare-metal AArch64" — scale 2 → 16px tall */
+        int sub_w = 18 * 8 * 2;
+        int sx = px + (pw - sub_w) / 2;
+        int sy = ty + 54;
+        fb_draw_string_scaled(sx, sy, "Bare-metal AArch64", COL_CYAN, COL_DARK_GREY, 2);
+
+        /* Small build tag — scale 1 (8px) */
+        int tag_w = 29 * 8;
+        int bx = px + (pw - tag_w) / 2;
+        int by = sy + 30;
+        fb_draw_string(bx, by, "boot301  BCM2711 / Cortex-A72",
+                       COL_GREY, COL_DARK_GREY);
+    }
+
     /* keyboard_poll: drain the RISC OS keyboard event ring */
     extern int keyboard_poll(void *ev) __attribute__((weak));
 
