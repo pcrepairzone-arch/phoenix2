@@ -49,6 +49,7 @@ extern void filecore_list_root(void);   /* kernel/filecore.c */
 extern void filecore_show_results(void);/* kernel/filecore.c */
 extern void module_init_all(void);      /* kernel/module.c   */
 extern void net_init(void);             /* net/tcpip.c (stub)       */
+extern void genet_init(void);           /* drivers/net/genet.c      */
 extern void wimp_init(void);            /* wimp/wimp.c (stub)       */
 extern void register_default_handlers(void); /* kernel/signal.c    */
 
@@ -195,6 +196,7 @@ void kernel_main(uint64_t dtb_ptr)
     filecore_show_results();
     module_init_all();
     net_init();
+    genet_init();           /* boot302: BCM2711 GENETv5 Ethernet */
     register_default_handlers();
     uart_set_quiet(0);   /* boot256: re-enable for boot-complete banner */
     debug_print("Subsystems ready\n");

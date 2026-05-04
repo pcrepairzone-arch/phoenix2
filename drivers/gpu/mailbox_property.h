@@ -107,6 +107,7 @@ uint32_t mbox_get_board_revision(void);
 uint64_t mbox_get_board_serial(void);
 void     mbox_get_arm_memory(uint32_t *base, uint32_t *size);
 void     mbox_get_vc_memory(uint32_t *base, uint32_t *size);
+int      mbox_get_mac_address(uint8_t mac[6]);
 
 /* ============================================================
  * Power management
@@ -158,5 +159,8 @@ int mbox_power_on_usb(void);
  * LED / diagnostics
  * ============================================================ */
 int mbox_set_led_state(uint32_t gpio_pin, int on);
+
+#endif /* MAILBOX_PROPERTY_H */
+pin, int on);
 
 #endif /* MAILBOX_PROPERTY_H */

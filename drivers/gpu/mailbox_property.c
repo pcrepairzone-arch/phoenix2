@@ -97,6 +97,27 @@ uint64_t mbox_get_board_serial(void)
     return ((uint64_t)v[1] << 32) | v[0];
 }
 
+/* mbox_get_mac_address — retrieve the board EUI-48 from the VideoCore OTP.
+ * The firmware returns 6 bytes packed into two 32-bit words (LSB-first):
+ *   v[0] = mac[0] | mac[1]<<8 | mac[2]<<16 | mac[3]<<24
+ *   v[1] = mac[4] | mac[5]<<8
+ * Returns 0 on success, -1 on failure (mac[] is zeroed).              */
+int mbox_get_mac_address(uint8_t mac[6])
+{
+    volatile uint32_t v[2] = { 0, 0 };
+    if (mbox_simple(MBOX_TAG_GET_MAC_ADDRESS, 8, 0, v, 2) < 0) {
+        for (int i = 0; i < 6; i++) mac[i] = 0;
+        return -1;
+    }
+    mac[0] = (uint8_t)((v[0] >>  0) & 0xff);
+    mac[1] = (uint8_t)((v[0] >>  8) & 0xff);
+    mac[2] = (uint8_t)((v[0] >> 16) & 0xff);
+    mac[3] = (uint8_t)((v[0] >> 24) & 0xff);
+    mac[4] = (uint8_t)((v[1] >>  0) & 0xff);
+    mac[5] = (uint8_t)((v[1] >>  8) & 0xff);
+    return 0;
+}
+
 void mbox_get_arm_memory(uint32_t *base, uint32_t *size)
 {
     volatile uint32_t v[2] = { 0, 0 };

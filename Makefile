@@ -89,6 +89,7 @@ OBJS = \
     drivers/gpu/framebuffer.o \
     drivers/gpu/font8x8.o \
     drivers/mmc/mmc.o \
+    drivers/net/genet.o \
     net/tcpip.o \
     net/socket.o \
     net/ipv4.o \
