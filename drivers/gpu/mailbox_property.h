@@ -161,6 +161,3 @@ int mbox_power_on_usb(void);
 int mbox_set_led_state(uint32_t gpio_pin, int on);
 
 #endif /* MAILBOX_PROPERTY_H */
-pin, int on);
-
-#endif /* MAILBOX_PROPERTY_H */
