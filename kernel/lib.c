@@ -3,8 +3,11 @@
  */
 #include "kernel.h"
 #include <stdarg.h>
+#include <string.h>
 /* boot265: visual heartbeat — draw to framebuffer without fb_mark_ready dependency */
 #include "drivers/gpu/framebuffer.h"
+/* boot303: Ethernet link + ARP */
+#include "drivers/net/genet.h"
 
 /* Forward declare UART functions */
 extern void uart_putc(char c);
@@ -290,8 +293,58 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot301  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot303  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
+    }
+
+    /* boot303: wait up to 3 s for GENETv5 PHY autoneg, then send a
+     * gratuitous ARP to announce ourselves on the local network.
+     * Gratuitous ARP = ARP reply where sender IP == target IP == our IP.
+     * Any host running Wireshark will see it, confirming TX works.      */
+    {
+        /* Our test IPv4 address — change to match your LAN if needed */
+        const uint8_t our_ip[4] = { 192, 168, 1, 100 };
+
+        /* Poll link up with 3 s timeout (~10 ms steps) */
+        int link = 0;
+        uint32_t t0 = wimp_ms();
+        while ((wimp_ms() - t0) < 3000u) {
+            if (genet_link_up()) { link = 1; break; }
+            /* tiny pause — avoid hammering MDIO */
+            for (volatile int d = 0; d < 50000; d++) {}
+        }
+
+        if (link) {
+            debug_print("[WIMP] GENET link UP after %u ms\n",
+                        (unsigned)(wimp_ms() - t0));
+            if (con_puts) con_puts("[NET] Link up\n");
+
+            /* Build gratuitous ARP packet (42 bytes) */
+            static uint8_t arp[42];
+            /* Ethernet header */
+            for (int i = 0; i < 6; i++) arp[i] = 0xff;   /* dst: broadcast */
+            for (int i = 0; i < 6; i++) arp[6+i] = g_genet_mac[i]; /* src */
+            arp[12] = 0x08; arp[13] = 0x06;               /* EtherType: ARP */
+            /* ARP payload */
+            arp[14] = 0x00; arp[15] = 0x01; /* htype: Ethernet */
+            arp[16] = 0x08; arp[17] = 0x00; /* ptype: IPv4     */
+            arp[18] = 6;                     /* hlen            */
+            arp[19] = 4;                     /* plen            */
+            arp[20] = 0x00; arp[21] = 0x02; /* oper: reply     */
+            for (int i = 0; i < 6; i++) arp[22+i] = g_genet_mac[i]; /* SHA */
+            for (int i = 0; i < 4; i++) arp[28+i] = our_ip[i];      /* SPA */
+            arp[32]=0xff; arp[33]=0xff; arp[34]=0xff;                /* THA */
+            arp[35]=0xff; arp[36]=0xff; arp[37]=0xff;
+            for (int i = 0; i < 4; i++) arp[38+i] = our_ip[i];      /* TPA */
+
+            int r = genet_send(arp, 42);
+            debug_print("[WIMP] gratuitous ARP send %s (IP %u.%u.%u.%u)\n",
+                        r == 0 ? "OK" : "FAIL",
+                        our_ip[0], our_ip[1], our_ip[2], our_ip[3]);
+        } else {
+            debug_print("[WIMP] GENET link still DOWN after 3 s\n");
+            if (con_puts) con_puts("[NET] No link\n");
+        }
     }
 
     /* keyboard_poll: drain the RISC OS keyboard event ring */
@@ -315,6 +368,10 @@ void wimp_task(void)
     uint32_t last_mouse    = wimp_ms(); /* boot285: 4 ms high-frequency mouse poll */
     uint32_t last_beat     = wimp_ms();
     uint32_t last_dwc2    = wimp_ms(); /* boot267: DWC2 HID poll timestamp */
+    uint32_t last_net      = wimp_ms(); /* boot303: GENET RX poll */
+    int      net_link_prev = -1;        /* track link state changes */
+    static uint8_t g_rx_frame[GENET_MAX_FRAME]; /* RX frame buffer */
+    uint32_t g_rx_count = 0;           /* total frames received */
     /* boot265: visual heartbeat — blinks a 16×16 square below the green
      * corner marker (top-right) at 1 Hz so the user can see WIMP is alive
      * without needing a serial terminal.  Drawn only when fb.valid is set. */
@@ -327,127 +384,44 @@ void wimp_task(void)
             uint32_t now_b = wimp_ms();
             if ((now_b - last_beat) >= 500u) {
                 last_beat = now_b;
-                debug_print("[WIMP] alive t=%dms stalls=%u\n",
-                            (int)now_b, (unsigned)g_uart_stalls);
+                debug_print("[WIMP] alive t=%dms stalls=%u rx=%u\n",
+                            (int)now_b, (unsigned)g_uart_stalls,
+                            (unsigned)g_rx_count);
+                /* boot303: log link state changes */
+                int lnk = genet_link_up();
+                if (lnk != net_link_prev) {
+                    net_link_prev = lnk;
+                    debug_print("[NET] link %s\n", lnk ? "UP" : "DOWN");
+                }
+            }
+        }
+
+        /* ── GENET RX poll: 4 ms — non-blocking frame receive ─────────── */
+        {
+            uint32_t now_n = wimp_ms();
+            if ((now_n - last_net) >= 4u) {
+                last_net = now_n;
+                int flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME);
+                if (flen > 13) {
+                    g_rx_count++;
+                    /* Log first 8 frames in detail, then count-only */
+                    if (g_rx_count <= 8u) {
+                        uint16_t etype = (uint16_t)
+                            ((g_rx_frame[12] << 8) | g_rx_frame[13]);
+                        debug_print("[NET] rx#%u len=%d "
+                            "dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                            "src=%02x:%02x:%02x:%02x:%02x:%02x "
+                            "type=0x%04x\n",
+                            (unsigned)g_rx_count, flen,
+                            g_rx_frame[0],g_rx_frame[1],g_rx_frame[2],
+                            g_rx_frame[3],g_rx_frame[4],g_rx_frame[5],
+                            g_rx_frame[6],g_rx_frame[7],g_rx_frame[8],
+                            g_rx_frame[9],g_rx_frame[10],g_rx_frame[11],
+                            (unsigned)etype);
+                    }
+                }
             }
         }
 
         /* ── Mouse input (xHCI path): ~250 Hz (4 ms), non-blocking.
-         * boot285: High-frequency mouse poll keeps the interrupt TRB
-         * perpetually queued and catches each 7 ms mouse report within
-         * one poll window.  Deltas stay small → smooth cursor tracking.
-         * hid_poll_mice() calls usb_interrupt_transfer(timeout=0) which
-         * does a single event-ring check and returns immediately (<5 µs)
-         * when no data is ready — WIMP is never stalled.                */
-        {
-            uint32_t now_m = wimp_ms();
-            if ((now_m - last_mouse) >= 4u) {
-                last_mouse = now_m;
-                if (hid_poll_mice) hid_poll_mice();
-            }
-        }
-
-        /* ── Keyboard input (xHCI path): ~60 Hz (16 ms), blocking 8 ms.
-         * boot285: hid_poll_all() now skips mice (handled above).
-         * boot275: raised from 10 Hz so brief keypresses are caught.   */
-        uint32_t now_hid = wimp_ms();
-        if ((now_hid - last_hid) >= 16u) {
-            last_hid = now_hid;
-            if (hid_poll_all) hid_poll_all();
-        }
-
-        /* ── DWC2 OTG HID input: ~60 Hz (16 ms) ──────────────────────── */
-        {
-            uint32_t now_d = wimp_ms();
-            if ((now_d - last_dwc2) >= 16u) {
-                last_dwc2 = now_d;
-                if (dwc2_hid_poll) dwc2_hid_poll();
-            }
-        }
-
-        /* ── Keyboard events: drain queue, break on ESC ───────────────── */
-        if (keyboard_poll) {
-            uint8_t ev[4];
-            while (keyboard_poll(ev)) {
-                uint8_t kcode = ev[0];  /* HID key_code */
-                uint8_t kchar = ev[1];  /* ASCII key_char */
-                debug_print("[WIMP] key code=0x%02x char=0x%02x\n", kcode, kchar);
-                if (kchar == 0x1B) {    /* ESC key */
-                    if (con_puts) con_puts("\n[Loop stopped by ESC]\n");
-                    debug_print("[WIMP] ESC pressed — loop halted\n");
-                    goto loop_exit;
-                }
-            }
-        }
-
-        /* ── Mouse cursor: update position if moved ───────────────────── */
-        if (mouse_get_pos && cursor_update) {
-            int16_t mx, my;
-            mouse_get_pos(&mx, &my);
-            if (mx != last_mx || my != last_my) {
-                last_mx = mx;
-                last_my = my;
-                cursor_update((int)mx, (int)my);
-            }
-        }
-
-        /* ── Visual heartbeat: blink 32×32 square at screen centre ──── */
-        {
-            uint32_t now_v = wimp_ms();
-            if ((now_v - last_visual) >= 500u) {
-                last_visual = now_v;
-                visual_on   = !visual_on;
-                if (fb.valid && fb.base) {
-                    int bx = (int)(fb.width  / 2u) - 16;
-                    int by = (int)(fb.height / 2u) - 16;
-                    pixel_t col = visual_on
-                        ? RGB(30, 220, 30)
-                        : RGB(48,  48, 48);
-                    fb_fill_rect(bx, by, 32, 32, col);
-                }
-            }
-        }
-
-        /* ── USB hotplug: 500 ms ───────────────────────────────────────── */
-        {
-            uint32_t now = wimp_ms();
-            if ((now - last_hotplug) >= 500u) {
-                last_hotplug = now;
-                if (hub_poll_hotplug)   hub_poll_hotplug();
-                if (xhci_check_hotplug) xhci_check_hotplug();
-            }
-        }
-
-        yield();
-    }
-loop_exit:
-    /* Cursor stays at current position; system idles in WFE */
-    while (1) { __asm__ volatile("wfe"); }
-}
-
-void paint_task(void)    { while(1) { yield(); } }
-void netsurf_task(void)  { while(1) { yield(); } }
-
-void mmu_free_pagetable(task_t *task) { (void)task; }
-void mmu_free_usermemory(task_t *task) { (void)task; }
-
-/* Dummy symbols - declared in kernel.c */
-extern int nr_cpus;
-extern task_t *current_task;
-extern char exception_vectors[];
-
-/* Atomic operations stub */
-int __aarch64_ldadd4_acq_rel(int val, int *ptr) {
-    int old = *ptr;
-    *ptr += val;
-    return old;
-}
-
-/* Get current CPU ID from MPIDR_EL1 */
-int get_cpu_id(void) {
-    uint64_t mpidr;
-    __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
-    return (int)(mpidr & 0xFF);
-}
-
-/* strncpy_safe is defined as a static inline in kernel/error.h */
+         * boot285: High-frequenc
