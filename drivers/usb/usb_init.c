@@ -20,6 +20,7 @@
 #include "kernel.h"
 #include "usb_xhci.h"
 #include "usb_dwc2.h"
+#include "blockdriver.h"
 
 extern usb_hc_ops_t g_dwc2_hc_ops;
 extern void uart_puts(const char *s);
@@ -64,6 +65,11 @@ int usb_init(void)
     } else {
         uart_puts("[USB] DWC2 initialization failed\n");
     }
+
+    /* boot335: print all registered block devices with their FileCore
+     * priority scores — gives a clear picture of what the system found
+     * and which device FileCore will prefer for booting.               */
+    blockdev_print_all();
 
     return 0;
 }

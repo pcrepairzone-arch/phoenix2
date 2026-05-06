@@ -16,6 +16,11 @@
 #define HEAP_SIZE   (128 * 1024 * 1024)   /* 128 MB */
 #define ALIGN       16
 #define HDR_MAGIC   0xFEEDC0DEUL
+/* TAIL_MAGIC is written in the last 4 bytes of each in-use block's payload
+ * region (the alignment-padding bytes between user data and the next header).
+ * kfree checks it on free and on every coalesce so buffer overruns are
+ * diagnosed at the overflowing allocation's free rather than the victim's.  */
+#define TAIL_MAGIC  0xDEADC0DEUL
 
 #define ALIGN_UP(n)  (((n) + (ALIGN - 1)) & ~(size_t)(ALIGN - 1))
 #define MIN_PAYLOAD  (ALIGN_UP(sizeof(block_hdr_t)) + ALIGN)
@@ -28,6 +33,13 @@ typedef struct block_hdr {
     struct block_hdr  *next_free;
     struct block_hdr  *prev_free;
 } block_hdr_t;
+
+/* Returns pointer to the tail-canary word inside block b.
+ * Sits in the last sizeof(uint32_t) bytes of b's total extent.          */
+static inline uint32_t *tail_canary(block_hdr_t *b)
+{
+    return (uint32_t *)((char *)b + b->size - sizeof(uint32_t));
+}
 
 static char heap[HEAP_SIZE] __attribute__((aligned(ALIGN)));
 static block_hdr_t *free_list_head = NULL;
@@ -91,7 +103,11 @@ void *kmalloc(size_t size)
     if (size == 0) return NULL;
     if (!free_list_head) malloc_init();
 
-    size_t need = ALIGN_UP(sizeof(block_hdr_t)) + ALIGN_UP(size);
+    /* Always reserve sizeof(uint32_t) bytes AFTER the aligned user data for
+     * the tail canary.  Without this extra room, exact-power-of-ALIGN
+     * allocations (512, 2048, 4096 …) have zero padding and the canary
+     * falls inside the user's valid range → false-positive OVERFLOW reports.*/
+    size_t need = ALIGN_UP(sizeof(block_hdr_t)) + ALIGN_UP(size) + sizeof(uint32_t);
 
     block_hdr_t *b = free_list_head;
     while (b && b->size < need)
@@ -121,6 +137,10 @@ void *kmalloc(size_t size)
     free_list_remove(b);
     b->free = 0;
     heap_allocated += b->size;
+    /* Plant tail canary in the last 4 bytes of this block's extent.
+     * Checked on kfree — detects off-the-end writes before they corrupt
+     * the next block's header magic.                                    */
+    *tail_canary(b) = TAIL_MAGIC;
 
     return (void *)((char *)b + ALIGN_UP(sizeof(block_hdr_t)));
 }
@@ -130,12 +150,36 @@ void kfree(void *ptr)
     if (!ptr) return;
     block_hdr_t *b = (block_hdr_t *)((char *)ptr - ALIGN_UP(sizeof(block_hdr_t)));
     if (b->magic != HDR_MAGIC) {
-        debug_print("[kfree] Corrupt header at %p\n", ptr);
+        debug_print("[kfree] Corrupt header at %p (found 0x%x)\n",
+                    ptr, b->magic);
+        /* Walk the heap from the start to find which block precedes this
+         * address — its overflow is the likely culprit.                 */
+        block_hdr_t *cur = (block_hdr_t *)heap;
+        char *heap_end   = heap + HEAP_SIZE;
+        while ((char *)cur < (char *)b && cur->magic == HDR_MAGIC &&
+               (char *)cur < heap_end) {
+            block_hdr_t *nx = next_phys(cur);
+            if ((char *)nx >= (char *)b) {
+                debug_print("[kfree] Preceding block: %p size=%zu free=%u\n",
+                            (void *)cur, cur->size, cur->free);
+                break;
+            }
+            cur = nx;
+        }
         return;
     }
     if (b->free) {
         debug_print("[kfree] Double-free at %p\n", ptr);
         return;
+    }
+    /* Check tail canary — fires at the overflowing allocation's kfree,
+     * before the overflow reaches the victim block's header.            */
+    if (*tail_canary(b) != TAIL_MAGIC) {
+        debug_print("[kfree] OVERFLOW: tail canary at %p corrupted"
+                    " (found 0x%x) — block %p size=%zu\n",
+                    (void *)tail_canary(b), *tail_canary(b),
+                    (void *)b, b->size);
+        /* Don't abort — free the block so the heap stays usable.       */
     }
     heap_allocated -= b->size;
     b->free = 1;

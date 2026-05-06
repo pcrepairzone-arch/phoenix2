@@ -13,6 +13,8 @@
 extern void uart_puts(const char *s);
 /* boot297: quiet mode for xHCI timeout log during TUR retries */
 extern void xhci_set_quiet_timeouts(int q);
+/* boot335: endpoint ring recovery — reset xHCI ring pointers after CLEAR_HALT */
+extern int xhci_ep_recover(usb_device_t *dev);
 
 static void print_hex32(uint32_t v) {
     static const char h[] = "0123456789abcdef";
@@ -153,10 +155,25 @@ static int bot_scsi_cmd(usb_storage_t *drive, int lun,
     /* Phase 3: Status */
     if (usb_bulk_transfer(drive->bulk_in, &csw, 13, USB_TIMEOUT) < 0) {
         uart_puts("[MSC] BOT: CSW recv failed\n");
+        /* boot335: pipe is dirty — clear both endpoints so the next CBW
+         * succeeds.  Without this, bulk-OUT stays HALTED and every
+         * subsequent CBW send fails immediately ("CBW send failed").    */
+        usb_control_transfer(drive->dev, 0x02u, 0x01u, 0x0000u,
+            drive->bulk_in->bEndpointAddress,  NULL, 0, 200);
+        usb_control_transfer(drive->dev, 0x02u, 0x01u, 0x0000u,
+            drive->bulk_out->bEndpointAddress, NULL, 0, 200);
+        xhci_ep_recover(drive->dev);
         return -1;
     }
     if (csw.signature != CSW_SIGNATURE) {
         uart_puts("[MSC] BOT: bad CSW signature\n");
+        /* boot335: device may have halted both endpoints in error response.
+         * Clear ENDPOINT_HALT + rebuild xHCI rings before the next command. */
+        usb_control_transfer(drive->dev, 0x02u, 0x01u, 0x0000u,
+            drive->bulk_in->bEndpointAddress,  NULL, 0, 200);
+        usb_control_transfer(drive->dev, 0x02u, 0x01u, 0x0000u,
+            drive->bulk_out->bEndpointAddress, NULL, 0, 200);
+        xhci_ep_recover(drive->dev);
         return -1;
     }
 
@@ -435,6 +452,29 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
      * hit them cold with READ CAPACITY.                                      */
     msc_delay_ms(500);
 
+    /* boot335: BOT Mass Storage Reset before TUR loop.
+     * Flushes any stale pipe state left by the bootloader or by a previous
+     * OS session.  The RTL9210 sometimes has a residual CSW/data fragment
+     * queued in its bulk-IN pipe; the first TUR then reads stale bytes as its
+     * CSW → "bad CSW signature" → all subsequent CBW sends fail because
+     * bulk-OUT ends up HALTED.  A full reset here clears both pipes cleanly.
+     * wIndex = interface number (BOT spec §3.1).                            */
+    uart_puts("[MSC] BOT reset (pre-TUR flush)...\n");
+    usb_control_transfer(drive->dev,
+        0x21u,           /* bmRequestType: class | interface | host→dev */
+        0xFFu,           /* bRequest: Bulk-Only Mass Storage Reset       */
+        0x0000u,         /* wValue: 0                                    */
+        drive->intf_num, /* wIndex: interface number                     */
+        NULL, 0, 500);
+    msc_delay_ms(50);
+    /* Clear ENDPOINT_HALT on both bulk endpoints after the reset */
+    usb_control_transfer(drive->dev, 0x02u, 0x01u, 0x0000u,
+        drive->bulk_in->bEndpointAddress,  NULL, 0, 200);
+    usb_control_transfer(drive->dev, 0x02u, 0x01u, 0x0000u,
+        drive->bulk_out->bEndpointAddress, NULL, 0, 200);
+    xhci_ep_recover(drive->dev);
+    msc_delay_ms(100);
+
     /* boot168: TEST UNIT READY retry loop.
      * Standard SCSI init order: TUR (until GOOD) → READ CAPACITY.
      * TUR has no data phase — failures come back as CSW status=1 (CHECK
@@ -495,36 +535,78 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
         }
     }
 
-    /* READ CAPACITY: try RC(10) first, fall back to RC(16) if stalled.
+    /* boot319: READ CAPACITY — RC(10) first, then RC(16) polling loop.
      *
-     * USB-SATA bridges (RTL9210, etc.) often stall the bulk-IN pipe on
-     * RC(10) to signal "use the 16-byte variant instead".  After the stall
-     * the IN endpoint is halted — we must call bot_recover() to clear it
-     * before attempting any further commands.
+     * RTL9210 USB-NVMe bridges stall RC(10) and may continue to stall RC(16)
+     * while the NVMe drive behind them is still initializing.  The bridge
+     * accepts TUR (bridge up) but stalls READ CAPACITY (NVMe not ready yet).
      *
-     * Sequence: RC(10) → on failure → BOT recover → RC(16)
-     *           → on failure → BOT recover → RC(16) retry → give up        */
-    /* boot291: RC(10) first.  If it stalls, the device's SCSI state machine
-     * is in phase-error (pending CSW, halted bulk-IN).  Attempting RC(16)
-     * while in that state causes the CBW to be interpreted as a phase error
-     * and the device (notably RTL9210 in HS-BOT mode) locks up entirely,
-     * refusing even EP0 for ~8 s.  Correct sequence:
-     *   RC(10) → on stall → bot_recover (BOMSR resets state machine)
-     *          → RC(16)   → on stall → bot_recover → RC(10) last-resort */
+     * After each RC stall, bot_scsi_cmd internally does CLEAR_HALT(bulk-IN) +
+     * CSW-TIMEOUT.  This sequence corrupts the xHCI bulk-OUT ring (cycle-bit
+     * desync after the timeout).  We MUST call xhci_ep_recover() to rebuild
+     * both rings before the next command — otherwise the next CBW bulk-OUT
+     * TRB times out immediately.
+     *
+     * We do NOT issue BOMSR (bot_recover) — the BOMSR control transfer fails
+     * CC=4 on RTL9210 (bridge doesn't respond to EP0 after a bulk stall) and
+     * resets the SCSI state machine unnecessarily.
+     *
+     * Poll RC(16) up to 10 times with 500 ms gaps (≤5 s total) — enough for
+     * any NVMe drive to complete its internal initialization.               */
     uart_puts("[MSC] READ CAPACITY(10)...\n");
     if (bot_read_capacity(drive, 0) < 0) {
-        uart_puts("[MSC] RC(10) failed — BOT recover, then RC(16)\n");
-        bot_recover(drive);
-        msc_delay_ms(200);
-        if (bot_read_capacity16(drive, 0) < 0) {
-            uart_puts("[MSC] RC(16) failed — second BOT recover, last RC(10)\n");
-            bot_recover(drive);
-            msc_delay_ms(200);
-            if (bot_read_capacity(drive, 0) < 0) {
-                uart_puts("[MSC] READ CAPACITY failed — registering with 0 blocks\n");
-                drive->capacity[0]   = 0;
-                drive->block_size[0] = 512;
+        uart_puts("[MSC] RC(10) stalled — bridge NVMe may be initialising\n");
+        /* Rebuild xHCI rings after CLEAR_HALT+CSW_TIMEOUT in bot_scsi_cmd   */
+        xhci_ep_recover(drive->dev);
+        msc_delay_ms(300);
+
+        int rc_ok = 0;
+        for (int attempt = 0; attempt < 10 && !rc_ok; attempt++) {
+            /* boot320: fix attempt counter — '1'+9 = ':' in ASCII.
+             * Use a lookup table so attempt 10 prints "10" not ":". */
+            static const char *const rc_attempt_str[10] = {
+                "1","2","3","4","5","6","7","8","9","10"
+            };
+            uart_puts("[MSC] RC(16) attempt ");
+            uart_puts(rc_attempt_str[attempt]);
+            uart_puts("...\n");
+            if (bot_read_capacity16(drive, 0) == 0) {
+                rc_ok = 1;
+            } else {
+                /* RC(16) stalled — the device has halted its bulk-OUT endpoint.
+                 * boot319 showed CC=6 on the CBW TRB itself (bulk-OUT), meaning
+                 * the device-side endpoint is in HALT state.  xhci_ep_recover()
+                 * alone resets only the xHCI ring-side — the device still sees
+                 * the endpoint as halted and will stall the next CBW too.
+                 *
+                 * boot320: issue USB-level CLEAR_FEATURE(ENDPOINT_HALT) for
+                 * both bulk-OUT and bulk-IN via EP0, then rebuild the xHCI rings.
+                 * This clears the device-side halt before the next CBW attempt. */
+                uart_puts("[MSC] RC(16) stalled — USB CLEAR_HALT + ring recover\n");
+                /* CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT — clears device stall */
+                usb_control_transfer(drive->dev,
+                    0x02u,   /* bmRequestType: standard | endpoint | host→dev */
+                    0x01u,   /* bRequest: CLEAR_FEATURE                        */
+                    0x0000u, /* wValue: ENDPOINT_HALT                          */
+                    drive->bulk_out->bEndpointAddress,
+                    NULL, 0, 200);
+                /* CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN — may also be halted */
+                usb_control_transfer(drive->dev,
+                    0x02u,
+                    0x01u,
+                    0x0000u,
+                    drive->bulk_in->bEndpointAddress,
+                    NULL, 0, 200);
+                /* Reset xHCI endpoint ring contexts (cycle bits, dequeue ptr) */
+                xhci_ep_recover(drive->dev);
+                msc_delay_ms(500);
             }
+        }
+        if (!rc_ok) {
+            uart_puts("[MSC] READ CAPACITY: all attempts exhausted\n");
+            uart_puts("[MSC] READ CAPACITY failed — registering with 0 blocks\n");
+            drive->capacity[0]   = 0;
+            drive->block_size[0] = 512;
         }
     }
 

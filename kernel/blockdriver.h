@@ -59,6 +59,9 @@ blockdev_t *blockdev_register(const char *name, uint64_t size, uint32_t block_si
 /* Get block device by name and unit */
 blockdev_t *blockdev_get(const char *name, int unit);
 
+/* Print all registered devices with their type, size, and FileCore score */
+void blockdev_print_all(void);
+
 /* Global list of registered block devices */
 extern blockdev_t *blockdev_list[];
 extern int blockdev_count;
