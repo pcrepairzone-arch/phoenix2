@@ -341,11 +341,17 @@ void genet_init(void)
     /* Select external RGMII-ID PHY mode (Pi 4 BCM54213PE) */
     GW4(GENET_SYS_PORT_CTRL, GENET_SYS_PORT_MODE_EXT_GPHY);
 
-    /* Configure RGMII OOB signalling */
+    /* Configure RGMII OOB signalling.
+     * boot308/339: BCM54213PE operates in RGMII-ID mode — the PHY adds
+     * clock delay on both TX and RX.  The MAC must NOT add its own delay,
+     * so ID_MODE_DISABLE must be SET (= disable internal MAC clock delay).
+     * Clearing ID_MODE_DISABLE (the boot302 mistake) causes double delay:
+     * PHY delay + MAC delay → RGMII RX clock misalignment → UMAC CRC
+     * fails on every received frame → RDMA sees nothing → pidx stays 0.
+     * This matches Linux bcmgenet.c and NetBSD bcmgenet.c for 1000BASE-T. */
     uint32_t oob = GR4(GENET_EXT_RGMII_OOB_CTRL);
-    oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
-    oob |=  GENET_EXT_RGMII_OOB_RGMII_MODE_EN;
-    oob &= ~GENET_EXT_RGMII_OOB_OOB_DISABLE;
+    oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;   /* PHY provides delay  */
+    oob |= GENET_EXT_RGMII_OOB_RGMII_MODE_EN;     /* enable RGMII OOB    */
     GW4(GENET_EXT_RGMII_OOB_CTRL, oob);
 
     /* Soft-reset UMAC and RX/TX paths */
@@ -437,6 +443,16 @@ void genet_apply_link(void)
     cmd &= ~GENET_UMAC_CMD_SPEED;
     cmd |= __SHIFTIN(spd, GENET_UMAC_CMD_SPEED);
     GW4(GENET_UMAC_CMD, cmd);
+
+    /* Also keep ID_MODE_DISABLE in sync: at 1Gbps the PHY provides RGMII
+     * clock delay so the MAC must not add its own (set ID_MODE_DISABLE).
+     * At 10/100 Mbps no clock delay is needed (clear ID_MODE_DISABLE).  */
+    uint32_t oob = GR4(GENET_EXT_RGMII_OOB_CTRL);
+    if (spd == GENET_UMAC_CMD_SPEED_1000)
+        oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
+    else
+        oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
+    GW4(GENET_EXT_RGMII_OOB_CTRL, oob);
 }
 
 /* ── Public: genet_send ────────────────────────────────────────────────── */
