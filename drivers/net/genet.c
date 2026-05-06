@@ -75,10 +75,11 @@ static uint8_t g_tx_buf[TX_DESC_COUNT][GENET_BUF_SIZE] __attribute__((aligned(64
 /* ── Driver state ──────────────────────────────────────────────────────── */
 uint8_t g_genet_mac[6];
 
-static uint16_t g_rx_cidx = 0;   /* consumer index into RX ring            */
-static uint16_t g_tx_pidx = 0;   /* producer index into TX ring            */
-static uint16_t g_tx_cidx = 0;   /* consumer index (completed TX) tracking */
-static int      g_genet_ok  = 0;  /* set to 1 after successful init         */
+static uint16_t g_rx_cidx      = 0;  /* consumer index into RX ring           */
+static uint32_t g_rx_write_ptr = 0;  /* tracked RDMA WRITE_PTR (word units)   */
+static uint16_t g_tx_pidx      = 0;  /* producer index into TX ring           */
+static uint16_t g_tx_cidx      = 0;  /* consumer index (completed TX) tracking*/
+static int      g_genet_ok     = 0;  /* set to 1 after successful init        */
 
 /* ── Tiny busy-wait delay ──────────────────────────────────────────────── */
 static void genet_delay_us(uint32_t us)
@@ -274,33 +275,44 @@ static void genet_init_rings(int qid)
     GW4(GENET_RX_DMA_CTRL, val);
 
     /* Pre-populate all RX descriptors with buffer addresses.
-     * boot321: STATUS must have OWN|EOP set — OWN (bit 15) gives the
-     * descriptor to the DMA hardware so it can write received frames into
-     * it.  STATUS=0 leaves OWN=0 (software-owned) and hardware skips the
-     * slot entirely, so PROD_INDEX never advances (pidx stays 0).
-     * EOP (bit 14) marks each slot as a single-buffer end-of-packet.     */
+     * boot341: STATUS must be 0 at init.  The STATUS word (offset +0 in each
+     * descriptor) is HARDWARE-WRITTEN — GENET fills it (frame length, OWN,
+     * EOP, SOP, error bits) when a frame arrives.  Software must not pre-set
+     * any bits here.  Slot availability is communicated to hardware via
+     * WRITE_PTR only.  Writing OWN|EOP=0xC000 (as boot340 did) puts garbage
+     * in the hardware-owned status word and appears to prevent RDMA from
+     * filling those slots — PROD_INDEX never advances.  boot314 had STATUS=0
+     * and worked (confirmed from bootlog333 readback: status=0x00000000).    */
     DSB();
     for (int i = 0; i < RX_DESC_COUNT; i++) {
         uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[i];
+        GW4(GENET_RX_DESC_STATUS(i),     0);      /* hardware fills on RX  */
         GW4(GENET_RX_DESC_ADDRESS_LO(i), paddr);
         GW4(GENET_RX_DESC_ADDRESS_HI(i), 0);
-        GW4(GENET_RX_DESC_STATUS(i),
-            GENET_RX_DESC_STATUS_OWN | GENET_RX_DESC_STATUS_EOP);
     }
     DSB();
 
-    /* boot320: update RDMA WRITE_PTR to reflect all 64 pre-armed slots.
-     * WRITE_PTR is a word (32-bit) address within the descriptor SRAM.
-     * Setting it to DESC_COUNT * DESC_SIZE/4 tells the hardware that
-     * all descriptor slots have been pre-armed by software and are ready
-     * for DMA writes.  Leaving it at 0 tells hardware 0 slots are ready.*/
-    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid),
-        (uint32_t)(RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4));
+    /* RDMA WRITE_PTR: free-running word-address counter.
+     * After arming all 64 slots WRITE_PTR = 64 * (12/4) = 192.
+     * Hardware tracks (WRITE_PTR - its_internal_read_ptr) to know how many
+     * slots are available.  Each subsequent refill increments by 3 (one
+     * descriptor's worth of 32-bit words) — see genet_poll_rx.             */
+    g_rx_write_ptr = (uint32_t)(RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4);
+    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
     GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
 
     g_rx_cidx = 0;
     g_tx_pidx = 0;
     g_tx_cidx = 0;
+
+    /* Diagnostic readback — mirrors boot314 output so we can compare logs  */
+    debug_print("[GENET] RX ring: WRITE_PTR=%u PROD=%u CONS=%u\n",
+        (unsigned)(GR4(GENET_RX_DMA_WRITE_PTR_LO(qid)) & 0xffff),
+        (unsigned)(GR4(GENET_RX_DMA_PROD_INDEX(qid))   & 0xffff),
+        (unsigned)(GR4(GENET_RX_DMA_CONS_INDEX(qid))   & 0xffff));
+    debug_print("[GENET] RX desc[0] addr_lo=0x%08x status=0x%08x\n",
+        (unsigned)GR4(GENET_RX_DESC_ADDRESS_LO(0)),
+        (unsigned)GR4(GENET_RX_DESC_STATUS(0)));
 }
 
 /* ── IRQ mask: mask everything (polling mode) ───────────────────────────── */
@@ -387,7 +399,7 @@ void genet_init(void)
     genet_phy_init();
 
     g_genet_ok = 1;
-    debug_print("[GENET] init complete (boot302 polling mode)\n");
+    debug_print("[GENET] init complete (boot341 polling mode)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */
@@ -451,8 +463,10 @@ void genet_apply_link(void)
      *   • OOB_DISABLE:     clear — enable OOB (link/speed) signalling.
      *   • RGMII_LINK:      set — tell MAC the physical link is established.
      *     Without RGMII_LINK set the MAC does not forward received frames
-     *     to RDMA, so PROD_INDEX never advances regardless of other fixes. */
+     *     to RDMA, so PROD_INDEX never advances regardless of other fixes.
+     * boot341: prints OOB before/after to confirm correct bits at runtime.  */
     uint32_t oob = GR4(GENET_EXT_RGMII_OOB_CTRL);
+    debug_print("[GENET] apply_link: OOB before=0x%08x\n", (unsigned)oob);
     if (spd == GENET_UMAC_CMD_SPEED_1000)
         oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
     else
@@ -460,6 +474,9 @@ void genet_apply_link(void)
     oob &= ~GENET_EXT_RGMII_OOB_OOB_DISABLE;  /* enable OOB signalling   */
     oob |=  GENET_EXT_RGMII_OOB_RGMII_LINK;   /* assert link-up to MAC   */
     GW4(GENET_EXT_RGMII_OOB_CTRL, oob);
+    debug_print("[GENET] apply_link: OOB after=0x%08x UMAC_CMD=0x%08x\n",
+        (unsigned)GR4(GENET_EXT_RGMII_OOB_CTRL),
+        (unsigned)GR4(GENET_UMAC_CMD));
 }
 
 /* ── Public: genet_send ────────────────────────────────────────────────── */
@@ -534,20 +551,23 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
     g_rx_cidx = (g_rx_cidx + 1) & 0xffff;
     GW4(GENET_RX_DMA_CONS_INDEX(qid), g_rx_cidx);
 
-    /* Re-arm this descriptor slot: restore OWN so hardware can reuse it */
+    /* Re-arm this descriptor slot.
+     * boot341: STATUS=0 (hardware fills it on the next received frame).
+     * Do NOT write OWN|EOP here — see genet_init_rings for why.          */
     uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[idx];
+    GW4(GENET_RX_DESC_STATUS(idx),     0);
     GW4(GENET_RX_DESC_ADDRESS_LO(idx), paddr);
     GW4(GENET_RX_DESC_ADDRESS_HI(idx), 0);
-    GW4(GENET_RX_DESC_STATUS(idx),
-        GENET_RX_DESC_STATUS_OWN | GENET_RX_DESC_STATUS_EOP);
-    /* Advance WRITE_PTR to next slot to tell hardware one more buffer is
-     * ready (mirrors the init WRITE_PTR update in genet_init_rings).     */
-    {
-        uint32_t next = (uint32_t)(g_rx_cidx & (RX_DESC_COUNT - 1));
-        GW4(GENET_RX_DMA_WRITE_PTR_LO(qid),
-            next * (GENET_DMA_DESC_SIZE / 4));
-        GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
-    }
+    /* Advance WRITE_PTR by one descriptor (3 words) using the tracked
+     * free-running counter g_rx_write_ptr.
+     * boot340 bug: calculated next*3 from g_rx_cidx, collapsing WRITE_PTR
+     * from 192 down to 3 after the first frame — hardware saw only 1 slot
+     * available.  After slot 63 it would collapse to 0 (no slots).
+     * boot341 fix: WRITE_PTR is a free-running counter; just += 3 each time
+     * and let hardware use START/END_ADDR for ring-wrap internally.         */
+    g_rx_write_ptr = (g_rx_write_ptr + (GENET_DMA_DESC_SIZE / 4)) & 0xffff;
+    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
+    GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
 
     /* Check for hardware errors */
     if (status & GENET_RX_DESC_STATUS_ALL_ERRS) {
