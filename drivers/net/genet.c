@@ -379,6 +379,51 @@ int genet_link_up(void)
     return (bmsr & BMSR_LSTATUS) ? 1 : 0;
 }
 
+/* ── Public: genet_rx_pidx_raw ─────────────────────────────────────────── */
+/* Returns the raw RX DMA producer index from hardware — used by the WIMP
+ * heartbeat log to confirm RX DMA is advancing (i.e. packets arriving).   */
+uint32_t genet_rx_pidx_raw(void)
+{
+    if (!g_genet_ok) return 0;
+    return GR4(GENET_RX_DMA_PROD_INDEX(GENET_DMA_DEFAULT_QUEUE)) & 0xffff;
+}
+
+/* ── Public: genet_apply_link ──────────────────────────────────────────── */
+/* Read PHY-negotiated speed via MDIO and program UMAC_CMD speed field to
+ * match.  Must be called when link comes UP (boot308 fix): if UMAC speed
+ * doesn't match the PHY's RGMII clock, pidx never advances on RX.
+ *
+ * MII register 5  (LPA)      — advertised by partner at 10/100
+ * MII register 10 (STAT1000) — advertised by partner at 1000 Mbps         */
+void genet_apply_link(void)
+{
+    if (!g_genet_ok) return;
+
+    /* MII reg 10 (1000BASE-T Status): bits 11:10 = partner 1000Mbps caps */
+#define MII_STAT1000  10
+    uint16_t stat1000 = genet_mdio_read(GENET_PHY_ADDR, MII_STAT1000);
+    /* MII reg 5 (LPA): bits 8:5 = partner 100/10 caps */
+#define MII_LPA       5
+    uint16_t lpa      = genet_mdio_read(GENET_PHY_ADDR, MII_LPA);
+
+    uint32_t spd;
+    if (stat1000 & ((1u << 11) | (1u << 10))) {
+        spd = GENET_UMAC_CMD_SPEED_1000;
+        debug_print("[GENET] link speed: 1000 Mbps\n");
+    } else if (lpa & ((1u << 8) | (1u << 7))) {
+        spd = GENET_UMAC_CMD_SPEED_100;
+        debug_print("[GENET] link speed: 100 Mbps\n");
+    } else {
+        spd = GENET_UMAC_CMD_SPEED_10;
+        debug_print("[GENET] link speed: 10 Mbps\n");
+    }
+
+    uint32_t cmd = GR4(GENET_UMAC_CMD);
+    cmd &= ~GENET_UMAC_CMD_SPEED;
+    cmd |= __SHIFTIN(spd, GENET_UMAC_CMD_SPEED);
+    GW4(GENET_UMAC_CMD, cmd);
+}
+
 /* ── Public: genet_send ────────────────────────────────────────────────── */
 /* Transmit one Ethernet frame (header + payload, no FCS — GENET appends). */
 int genet_send(const void *buf, uint32_t len)
