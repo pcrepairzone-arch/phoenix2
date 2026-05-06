@@ -444,14 +444,21 @@ void genet_apply_link(void)
     cmd |= __SHIFTIN(spd, GENET_UMAC_CMD_SPEED);
     GW4(GENET_UMAC_CMD, cmd);
 
-    /* Also keep ID_MODE_DISABLE in sync: at 1Gbps the PHY provides RGMII
-     * clock delay so the MAC must not add its own (set ID_MODE_DISABLE).
-     * At 10/100 Mbps no clock delay is needed (clear ID_MODE_DISABLE).  */
+    /* Update EXT_RGMII_OOB_CTRL on link-up — mirrors Circle bcm54213.cpp
+     * mii_setup() / adjust_link() sequence:
+     *   • ID_MODE_DISABLE: set at 1Gbps (PHY provides delay, MAC must not);
+     *                      clear at 10/100 (no delay needed).
+     *   • OOB_DISABLE:     clear — enable OOB (link/speed) signalling.
+     *   • RGMII_LINK:      set — tell MAC the physical link is established.
+     *     Without RGMII_LINK set the MAC does not forward received frames
+     *     to RDMA, so PROD_INDEX never advances regardless of other fixes. */
     uint32_t oob = GR4(GENET_EXT_RGMII_OOB_CTRL);
     if (spd == GENET_UMAC_CMD_SPEED_1000)
         oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
     else
         oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
+    oob &= ~GENET_EXT_RGMII_OOB_OOB_DISABLE;  /* enable OOB signalling   */
+    oob |=  GENET_EXT_RGMII_OOB_RGMII_LINK;   /* assert link-up to MAC   */
     GW4(GENET_EXT_RGMII_OOB_CTRL, oob);
 }
 
