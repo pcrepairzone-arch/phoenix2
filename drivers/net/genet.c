@@ -395,11 +395,63 @@ void genet_init(void)
 
     debug_print("[GENET] UMAC TX+RX enabled\n");
 
+    /* Mark driver OK now so genet_send/genet_poll_rx work below */
+    g_genet_ok = 1;
+
+    /* ── RDMA loopback self-test ─────────────────────────────────────────
+     * boot342: Enable UMAC MAC loopback (LCL_LOOP_EN), send one frame,
+     * and poll RX PROD_INDEX for up to 10 ms.
+     *
+     * If PROD_INDEX advances → RDMA is alive; the loopback path works
+     *   and any remaining pidx=0 issue is in the wire path (RGMII/PHY).
+     * If PROD_INDEX stays 0 → RDMA is broken regardless of OOB/link state;
+     *   the ring init is wrong at a more fundamental level.
+     *
+     * boot314 had this test and it passed; we lost it in the regression.
+     * It is the definitive split between "ring init broken" vs "wire broken".
+     ──────────────────────────────────────────────────────────────────── */
+    {
+        /* Enable MAC-level loopback */
+        uint32_t lpcmd = GR4(GENET_UMAC_CMD);
+        lpcmd |= GENET_UMAC_CMD_LCL_LOOP_EN;
+        GW4(GENET_UMAC_CMD, lpcmd);
+        genet_delay_us(100);  /* let UMAC settle */
+
+        /* Minimal 64-byte test frame: dst=broadcast src=our_MAC type=0x9000 */
+        static uint8_t s_lp_frame[64];
+        memset(s_lp_frame, 0, sizeof(s_lp_frame));
+        s_lp_frame[0] = 0xff; s_lp_frame[1] = 0xff; s_lp_frame[2] = 0xff;
+        s_lp_frame[3] = 0xff; s_lp_frame[4] = 0xff; s_lp_frame[5] = 0xff;
+        memcpy(s_lp_frame + 6, g_genet_mac, 6);
+        s_lp_frame[12] = 0x90; s_lp_frame[13] = 0x00; /* EtherType 0x9000 */
+        genet_send(s_lp_frame, sizeof(s_lp_frame));
+
+        /* Poll PROD_INDEX for up to 10 ms (1000 × 10 µs) */
+        uint32_t lp_pidx = 0;
+        for (int i = 0; i < 1000; i++) {
+            genet_delay_us(10);
+            lp_pidx = GR4(GENET_RX_DMA_PROD_INDEX(qid)) & 0xffff;
+            if (lp_pidx) break;
+        }
+        debug_print("[GENET] loopback: pidx=%u RDMA=%s\n",
+            (unsigned)lp_pidx, lp_pidx ? "OK" : "BROKEN");
+
+        /* Disable loopback */
+        lpcmd = GR4(GENET_UMAC_CMD);
+        lpcmd &= ~GENET_UMAC_CMD_LCL_LOOP_EN;
+        GW4(GENET_UMAC_CMD, lpcmd);
+
+        /* If the loopback frame landed in the ring, drain it */
+        if (lp_pidx) {
+            static uint8_t s_drain[GENET_BUF_SIZE];
+            genet_poll_rx(s_drain, sizeof(s_drain));
+        }
+    }
+
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    g_genet_ok = 1;
-    debug_print("[GENET] init complete (boot341 polling mode)\n");
+    debug_print("[GENET] init complete (boot342 polling mode)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */
