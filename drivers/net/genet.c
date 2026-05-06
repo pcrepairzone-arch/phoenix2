@@ -273,15 +273,30 @@ static void genet_init_rings(int qid)
     val |= GENET_RX_DMA_CTRL_RBUF_EN(GENET_DMA_DEFAULT_QUEUE);
     GW4(GENET_RX_DMA_CTRL, val);
 
-    /* Pre-populate all RX descriptors with buffer addresses */
+    /* Pre-populate all RX descriptors with buffer addresses.
+     * boot321: STATUS must have OWN|EOP set — OWN (bit 15) gives the
+     * descriptor to the DMA hardware so it can write received frames into
+     * it.  STATUS=0 leaves OWN=0 (software-owned) and hardware skips the
+     * slot entirely, so PROD_INDEX never advances (pidx stays 0).
+     * EOP (bit 14) marks each slot as a single-buffer end-of-packet.     */
     DSB();
     for (int i = 0; i < RX_DESC_COUNT; i++) {
         uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[i];
         GW4(GENET_RX_DESC_ADDRESS_LO(i), paddr);
         GW4(GENET_RX_DESC_ADDRESS_HI(i), 0);
-        GW4(GENET_RX_DESC_STATUS(i),     0);
+        GW4(GENET_RX_DESC_STATUS(i),
+            GENET_RX_DESC_STATUS_OWN | GENET_RX_DESC_STATUS_EOP);
     }
     DSB();
+
+    /* boot320: update RDMA WRITE_PTR to reflect all 64 pre-armed slots.
+     * WRITE_PTR is a word (32-bit) address within the descriptor SRAM.
+     * Setting it to DESC_COUNT * DESC_SIZE/4 tells the hardware that
+     * all descriptor slots have been pre-armed by software and are ready
+     * for DMA writes.  Leaving it at 0 tells hardware 0 slots are ready.*/
+    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid),
+        (uint32_t)(RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4));
+    GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
 
     g_rx_cidx = 0;
     g_tx_pidx = 0;
@@ -456,6 +471,12 @@ int genet_send(const void *buf, uint32_t len)
     GW4(GENET_TX_DESC_ADDRESS_LO(idx), paddr);
     GW4(GENET_TX_DESC_ADDRESS_HI(idx), 0);
     GW4(GENET_TX_DESC_STATUS(idx),     status);
+    /* boot320: update TDMA WRITE_PTR to the word address of this descriptor
+     * so hardware knows which SRAM slot contains the new TX frame.
+     * Without this, WRITE_PTR stays 0 and hardware reuses descriptor 0.  */
+    GW4(GENET_TX_DMA_WRITE_PTR_LO(qid),
+        (uint32_t)idx * (GENET_DMA_DESC_SIZE / 4));
+    GW4(GENET_TX_DMA_WRITE_PTR_HI(qid), 0);
     DSB();
 
     /* Advance producer index to kick DMA */
@@ -490,11 +511,20 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
     g_rx_cidx = (g_rx_cidx + 1) & 0xffff;
     GW4(GENET_RX_DMA_CONS_INDEX(qid), g_rx_cidx);
 
-    /* Re-arm this descriptor slot for next receive */
+    /* Re-arm this descriptor slot: restore OWN so hardware can reuse it */
     uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[idx];
     GW4(GENET_RX_DESC_ADDRESS_LO(idx), paddr);
     GW4(GENET_RX_DESC_ADDRESS_HI(idx), 0);
-    GW4(GENET_RX_DESC_STATUS(idx),     0);
+    GW4(GENET_RX_DESC_STATUS(idx),
+        GENET_RX_DESC_STATUS_OWN | GENET_RX_DESC_STATUS_EOP);
+    /* Advance WRITE_PTR to next slot to tell hardware one more buffer is
+     * ready (mirrors the init WRITE_PTR update in genet_init_rings).     */
+    {
+        uint32_t next = (uint32_t)(g_rx_cidx & (RX_DESC_COUNT - 1));
+        GW4(GENET_RX_DMA_WRITE_PTR_LO(qid),
+            next * (GENET_DMA_DESC_SIZE / 4));
+        GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
+    }
 
     /* Check for hardware errors */
     if (status & GENET_RX_DESC_STATUS_ALL_ERRS) {
