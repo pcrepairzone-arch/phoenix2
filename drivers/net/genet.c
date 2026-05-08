@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "kernel.h"                             /* debug_print, uart_puts   */
+#include "irq.h"                                /* irq_set_handler, irq_unmask */
 #include "drivers/gpu/mailbox_property.h"       /* mbox_get_mac_address()   */
 #include "drivers/net/genet.h"
 #include "drivers/net/bcmgenetreg.h"
@@ -36,6 +37,14 @@
 /* ── Hardware base address ─────────────────────────────────────────────── */
 /* BCM2711 GENETv5 is at 0xFD580000 regardless of periph_base.            */
 #define GENET_BASE        0xFD580000UL
+
+/* ── GIC interrupt ID for GENET ────────────────────────────────────────── */
+/* BCM2711 DTS (bcm2711.dtsi): ethernet@7d580000 interrupts =
+ *   <GIC_SPI 157 IRQ_TYPE_LEVEL_HIGH>  — "mac_0"  (RX/TX/MDIO events)
+ *   <GIC_SPI 158 IRQ_TYPE_LEVEL_HIGH>  — "mac_1"  (secondary)
+ * GIC INTID = SPI_number + 32, so mac_0 → INTID 189.
+ * RXDMA_DONE (INTRL2 bit 13) is delivered on mac_0.                      */
+#define GENET_GIC_INTID   189
 
 /* ── MMIO access ───────────────────────────────────────────────────────── */
 #define GR4(reg)          (*(volatile uint32_t *)(GENET_BASE + (reg)))
@@ -117,6 +126,12 @@ static uint16_t g_tx_cidx      = 0;  /* consumer index (completed TX) tracking*/
 static int      g_genet_ok     = 0;  /* set to 1 after successful init        */
 static uint32_t g_rx_count     = 0;  /* frames successfully delivered to caller*/
 static uint32_t g_rx_fcs       = 0;  /* frames dropped due to CRC/FCS error   */
+
+/* ── IRQ-driven RX flag ─────────────────────────────────────────────────── */
+/* Set by genet_rx_irq_handler() when RXDMA_DONE fires.  Cleared by the
+ * WIMP drain loop in lib.c.  Declared volatile so the compiler does not
+ * cache the value in a register across iterations of the outer WIMP loop. */
+volatile int g_genet_rx_pending = 0;
 
 /* ── Tiny busy-wait delay ──────────────────────────────────────────────── */
 static void genet_delay_us(uint32_t us)
@@ -396,11 +411,80 @@ static void genet_init_rings(int qid)
         (unsigned)GR4(GENET_RX_DESC_STATUS(0)));
 }
 
-/* ── IRQ mask: mask everything (polling mode) ───────────────────────────── */
+/* ── INTRL2 helpers ─────────────────────────────────────────────────────── */
+
+/* genet_disable_intr — mask all GENET INTRL2 sources and clear any pending.
+ * Called at init before the ring is ready.  Ensures no stale IRQ fires
+ * between genet_init_rings() and genet_enable_rx_irq().                    */
 static void genet_disable_intr(void)
 {
-    GW4(GENET_INTRL2_CPU_SET_MASK, 0xffffffff);
-    GW4(GENET_INTRL2_CPU_CLEAR,    0xffffffff);
+    GW4(GENET_INTRL2_CPU_SET_MASK, 0xffffffff);  /* mask all sources      */
+    GW4(GENET_INTRL2_CPU_CLEAR,    0xffffffff);  /* clear any pending     */
+}
+
+/* ── IRQ handler ────────────────────────────────────────────────────────── */
+
+/* genet_rx_irq_handler — GIC IRQ handler for GENET mac_0 (INTID 189).
+ *
+ * Called from irq_dispatch() when the GIC delivers INTID 189.
+ * Sequence:
+ *   1. Read INTRL2_CPU_STAT to find which sources are pending.
+ *   2. Write INTRL2_CPU_CLEAR with the same value to acknowledge them.
+ *      (must clear before re-enabling at GIC level, i.e. before returning
+ *       from irq_dispatch — irq_eoi is called by irq_dispatch after us.)
+ *   3. If RXDMA_DONE is set, raise g_genet_rx_pending.
+ *      WIMP's outer loop checks this flag and drains the ring.
+ *
+ * We do NOT call genet_poll_rx() here.  genet_poll_rx() copies frame data
+ * into a caller-supplied buffer; the caller (WIMP) owns that buffer and the
+ * ARP/ICMP processing state.  Setting a flag and returning is the correct
+ * pattern for a bottom-half / deferred handler.
+ *
+ * Single-core bare-metal: no locking needed.  WIMP cannot be in
+ * genet_poll_rx() while this handler runs — the IRQ preempts WIMP at a
+ * bounded boundary and returns.  genet_send() only touches the TX ring and
+ * is safe to be interrupted mid-flight.                                    */
+static void genet_rx_irq_handler(int vec, void *priv)
+{
+    (void)vec;
+    (void)priv;
+
+    uint32_t stat = GR4(GENET_INTRL2_CPU_STAT);
+    GW4(GENET_INTRL2_CPU_CLEAR, stat);     /* ack all pending INTRL2 bits */
+
+    if (stat & GENET_IRQ_RXDMA_DONE) {
+        g_genet_rx_pending = 1;
+    }
+    /* TXDMA_DONE and MDIO_DONE are not used — no handler needed.  Any other
+     * bits in stat are harmless: we cleared them above.                    */
+}
+
+/* genet_enable_rx_irq — wire RXDMA_DONE through INTRL2 → GIC → CPU.
+ *
+ * Call order (from genet_init, after rings are armed):
+ *   genet_disable_intr()   — masks all INTRL2; clears pending
+ *   genet_enable_rx_irq()  — register C handler, unmask GIC, unmask INTRL2
+ *
+ * After this returns, any frame received by RDMA triggers:
+ *   INTRL2_CPU_STAT[13] → GIC SPI 157 (INTID 189) → exc_irq_handler →
+ *   irq_dispatch → genet_rx_irq_handler → g_genet_rx_pending=1 → WIMP.  */
+static void genet_enable_rx_irq(void)
+{
+    /* Step 1: register C handler with the GIC dispatch table */
+    irq_set_handler(GENET_GIC_INTID, genet_rx_irq_handler, NULL);
+
+    /* Step 2: tell the GIC distributor to forward INTID 189 to CPU 0 */
+    irq_unmask(GENET_GIC_INTID);
+
+    /* Step 3: unmask RXDMA_DONE in GENET INTRL2 so the block asserts the
+     * GIC SPI line when RDMA finishes writing a frame.
+     * INTRL2_CPU_CLEAR_MASK (0x214): writing a 1 to bit N clears (unmasks)
+     * that bit in the mask register — i.e. allows the source to reach GIC.
+     * The inverse (SET_MASK / 0x210) re-masks sources.                    */
+    GW4(GENET_INTRL2_CPU_CLEAR_MASK, GENET_IRQ_RXDMA_DONE);
+
+    debug_print("[GENET] RXDMA_DONE IRQ enabled (INTID %d, INTRL2 bit 13)\n",
+                GENET_GIC_INTID);
 }
 
 /* ── Public: genet_init ────────────────────────────────────────────────── */
@@ -466,8 +550,9 @@ void genet_init(void)
     /* Set up TX/RX descriptor rings */
     genet_init_rings(qid);
 
-    /* Mask all interrupts — polling only for boot302 */
+    /* Mask all INTRL2 sources first, then enable just RXDMA_DONE via GIC */
     genet_disable_intr();
+    genet_enable_rx_irq();
 
     /* Enable UMAC transmitter, receiver, and data-path gate.
      * boot333: TX_RX_EN (bit 29) is the GENETv5 MAC data-path gate — it
@@ -542,7 +627,7 @@ void genet_init(void)
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    debug_print("[GENET] init complete (boot340 polling mode,"
+    debug_print("[GENET] init complete (boot343 IRQ-driven RX,"
                 " MDF_CTRL=0 + cache ops + ID_MODE_DISABLE=1)\n");
 }
 

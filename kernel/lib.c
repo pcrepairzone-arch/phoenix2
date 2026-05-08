@@ -540,19 +540,27 @@ void wimp_task(void)
             }
         }
 
-        /* ── GENET RX poll: 4 ms — drain entire RX ring each tick ─────── */
-        /* boot340: process all pending frames in one tick instead of one
-         * per tick.  With a single-frame policy, an ICMP echo request
-         * behind 50 queued broadcast frames waits 50×4 ms = 200 ms before
-         * being answered — in the worst case (ring fills between ticks)
-         * it can wait seconds.  Draining the ring in a tight inner loop
-         * delivers sub-4 ms echo latency regardless of background traffic
-         * volume.  The ring holds at most 64 frames (RX_DESC_COUNT), so
-         * the inner loop is bounded and can't stall the outer WIMP loop
-         * for more than a few hundred µs.                                */
+        /* ── GENET RX: IRQ-driven with 4 ms fallback poll ──────────────── */
+        /* boot343: primary trigger is g_genet_rx_pending, set by the
+         * GENET RXDMA_DONE IRQ handler (GIC INTID 189) the instant RDMA
+         * finishes writing a frame into a descriptor slot.  We clear the
+         * flag BEFORE draining so we can't miss a second IRQ that arrives
+         * while we're in the inner loop:
+         *
+         *   flag=1 (IRQ) → WIMP sees it → flag=0 → drain loop
+         *   new frame arrives mid-drain → IRQ fires → flag=1 again
+         *   drain loop finishes → outer loop → sees flag=1 → drains again
+         *
+         * The 4 ms fallback catches any frame that arrived in the brief
+         * GIC EOI window (between INTRL2_CPU_CLEAR and GIC EOIR write in
+         * irq_dispatch) where a back-to-back frame could slip through
+         * without raising another edge on the GIC input.                 */
         {
             uint32_t now_n = wimp_ms();
-            if ((now_n - last_net) >= 4u) {
+            int do_drain = (int)g_genet_rx_pending;
+            if (!do_drain && (now_n - last_net) >= 4u) do_drain = 1;
+            if (do_drain) {
+                g_genet_rx_pending = 0;
                 last_net = now_n;
                 int flen;
                 while ((flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME)) > 13) {

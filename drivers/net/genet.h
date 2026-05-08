@@ -1,6 +1,7 @@
 /*
  * genet.h — Phoenix interface for BCM2711 GENETv5 Ethernet driver.
  * boot302: polling-mode TX/RX, no IRQs.
+ * boot343: IRQ-driven RX via GIC SPI 157 (INTID 189), INTRL2 RXDMA_DONE.
  */
 #ifndef GENET_H
 #define GENET_H
@@ -41,5 +42,13 @@ int  genet_link_up(void);
 
 /* Board MAC address populated by genet_init() */
 extern uint8_t g_genet_mac[6];
+
+/* boot343: IRQ-driven RX flag.
+ * Set to 1 by the GENET RXDMA_DONE IRQ handler when a frame arrives.
+ * Cleared by the WIMP drain loop after the RX ring is emptied.
+ * Volatile: written in IRQ context (exc_irq_handler path), read in
+ * task context (wimp_task).  On single-core bare-metal, volatile is
+ * sufficient — no atomic needed.                                      */
+extern volatile int g_genet_rx_pending;
 
 #endif /* GENET_H */
