@@ -20,6 +20,18 @@ void genet_init(void);
  * Returns 0 on success, -1 if no free descriptor or len out of range. */
 int  genet_send(const void *buf, uint32_t len);
 
+/* boot329: Return TX DMA producer/consumer indices for diagnostics.
+ * Call before and after genet_send to confirm TDMA is consuming descriptors. */
+void genet_tx_diag(uint32_t *prod_out, uint32_t *cons_out);
+
+/* boot334: Diagnostic counters for the [WIMP] heartbeat.
+ *   genet_rx_count_raw  — software count of frames successfully received.
+ *   genet_tx_cons_raw   — hardware TX DMA consumer index (frames consumed).
+ *   genet_rx_fcs_raw    — software count of frames dropped due to CRC error. */
+uint32_t genet_rx_count_raw(void);
+uint32_t genet_tx_cons_raw(void);
+uint32_t genet_rx_fcs_raw(void);
+
 /* Poll for a received frame.  Copies into buf (up to maxlen bytes).
  * Returns frame length on success, 0 if no frame waiting, -1 on error. */
 int  genet_poll_rx(void *buf, uint32_t maxlen);

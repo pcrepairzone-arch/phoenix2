@@ -44,6 +44,41 @@
 /* Memory barrier before touching DMA descriptors */
 #define DSB()             __asm__ volatile("dsb sy" ::: "memory")
 
+/* ── Cache maintenance for non-cache-coherent GENET DMA ────────────────── */
+/* BCM2711 GENET DMA is NOT cache-coherent with the ARM Cortex-A72.
+ * Linux bcmgenet.c calls dma_map_single(DMA_TO_DEVICE) before TX and
+ * dma_map_single(DMA_FROM_DEVICE) before RX, which translates to DC CVAC
+ * (clean) and DC CIVAC (clean+invalidate) on arm64.  Without these ops:
+ *
+ *   TX: memcpy writes frame into D-cache.  DRAM still holds BSS zeros.
+ *       TDMA DMA-reads DRAM → gets zeros → UniMAC sees src=00:00:00:00:00:00
+ *       → UniMAC silently drops the frame before RGMII → nothing on wire.
+ *       (boot337 confirmed: mib=7 consumed by TDMA but zero Pi frames in pcap)
+ *
+ *   RX: RDMA writes received frame to DRAM.  CPU reads D-cache (stale zeros
+ *       from BSS init) → ARP/IP handler sees all-zeros → no replies sent.
+ *       (boot337 confirmed: rx=45 counted but mib never advanced past 7)
+ *
+ * Note: UniMAC loopback mode (LCL_LOOP_EN) bypasses the source MAC validity
+ * check, which is why the loopback self-test passes even without cache ops.
+ *
+ * CACHE_LINE = 64 bytes (Cortex-A72 L1/L2 cache line size).               */
+#define CACHE_LINE        64U
+#define CACHE_CLEAN(ptr, bytes) do {                                        \
+    uintptr_t _a = (uintptr_t)(ptr) & ~(uintptr_t)(CACHE_LINE - 1);       \
+    uintptr_t _e = (uintptr_t)(ptr) + (uintptr_t)(bytes);                  \
+    for (; _a < _e; _a += CACHE_LINE)                                       \
+        __asm__ volatile("dc cvac, %0" :: "r"(_a) : "memory");             \
+    __asm__ volatile("dsb sy" ::: "memory");                                \
+} while (0)
+#define CACHE_INVAL(ptr, bytes) do {                                        \
+    uintptr_t _a = (uintptr_t)(ptr) & ~(uintptr_t)(CACHE_LINE - 1);       \
+    uintptr_t _e = (uintptr_t)(ptr) + (uintptr_t)(bytes);                  \
+    for (; _a < _e; _a += CACHE_LINE)                                       \
+        __asm__ volatile("dc civac, %0" :: "r"(_a) : "memory");            \
+    __asm__ volatile("dsb sy" ::: "memory");                                \
+} while (0)
+
 /* ── PHY constants ─────────────────────────────────────────────────────── */
 #define GENET_PHY_ADDR    1                     /* BCM54213PE on Pi 4       */
 /* Standard MII register numbers */
@@ -80,6 +115,8 @@ static uint32_t g_rx_write_ptr = 0;  /* tracked RDMA WRITE_PTR (word units)   */
 static uint16_t g_tx_pidx      = 0;  /* producer index into TX ring           */
 static uint16_t g_tx_cidx      = 0;  /* consumer index (completed TX) tracking*/
 static int      g_genet_ok     = 0;  /* set to 1 after successful init        */
+static uint32_t g_rx_count     = 0;  /* frames successfully delivered to caller*/
+static uint32_t g_rx_fcs       = 0;  /* frames dropped due to CRC/FCS error   */
 
 /* ── Tiny busy-wait delay ──────────────────────────────────────────────── */
 static void genet_delay_us(uint32_t us)
@@ -170,7 +207,7 @@ static void genet_reset(void)
     GW4(GENET_SYS_RBUF_FLUSH_CTRL, 0);
     genet_delay_us(10);
 
-    /* Reset UMAC core */
+    /* Reset UMAC core (2 µs — matches boot342 working value) */
     GW4(GENET_UMAC_CMD, 0);
     GW4(GENET_UMAC_CMD, GENET_UMAC_CMD_LCL_LOOP_EN | GENET_UMAC_CMD_SW_RESET);
     genet_delay_us(2);
@@ -184,9 +221,38 @@ static void genet_reset(void)
     /* Set max frame length (1536 bytes) */
     GW4(GENET_UMAC_MAX_FRAME_LEN, 1536);
 
-    /* Enable 64-byte receive context + 2-byte IP alignment header */
-    GW4(GENET_RBUF_CTRL, GENET_RBUF_64B_EN | GENET_RBUF_ALIGN_2B);
+    /* RBUF_CTRL: ALIGN_2B only — matches the empirically working boot.
+     * boot332: remove RBUF_64B_EN (bit 0).  The one boot on record where
+     * wire RX worked had RBUF_CTRL=0x2 at post-link time (ALIGN_2B only).
+     * boot330/331 set bit 0 (64B_EN) and got pidx=0 throughout.  64B_EN
+     * enables a 64-byte receive-side buffer header; if the hardware uses
+     * this to gate RDMA writes and our descriptor layout doesn't match,
+     * it silently drops every frame. */
+    GW4(GENET_RBUF_CTRL, GENET_RBUF_ALIGN_2B);
+    debug_print("[GENET] RBUF_CTRL=0x%x (expect 0x2)\n", (unsigned)GR4(GENET_RBUF_CTRL));
     GW4(GENET_RBUF_TBUF_SIZE_CTRL, 1);
+
+    /* boot334: clear any UMAC_TX_FLUSH left by VideoCore firmware.
+     * EtherGENET-6 genet_stop_locked() writes TX_FLUSH=1 to drain the FIFO
+     * on shutdown.  If VC didn't complete a clean stop the flush bit stays
+     * set.  With TX_FLUSH=1: TDMA DMA engine reads the descriptor and
+     * advances CONS (DMA-level — the frame IS consumed from the ring), but
+     * UMAC discards it before it reaches RGMII or the internal loopback MAC.
+     * This explains boot333 RDMA=BROKEN: TDMA CONS advanced (DMA worked) yet
+     * nothing reached RX or the wire.  Log the value first for the boot log. */
+    debug_print("[GENET] UMAC_TX_FLUSH before clear=0x%x\n",
+        (unsigned)GR4(GENET_UMAC_TX_FLUSH));
+    GW4(GENET_UMAC_TX_FLUSH, 0);
+
+    /* boot339: clear SYS_TBUF_FLUSH_CTRL (offset 0x00c) — separate from the
+     * UMAC TX_FLUSH (0xb34) above.  Linux bcmgenet.c clears this register in
+     * bcmgenet_init().  If VideoCore left it set, TX frames are flushed from
+     * the TX buffer before they reach the UniMAC TX path → TDMA still advances
+     * CONS (DMA-level) but frames never exit to RGMII.  Unlike UMAC_TX_FLUSH,
+     * this register is in the SYS block and may survive the UMAC SW_RESET.   */
+    debug_print("[GENET] TBUF_FLUSH_CTRL before clear=0x%x\n",
+        (unsigned)GR4(GENET_SYS_TBUF_FLUSH_CTRL));
+    GW4(GENET_SYS_TBUF_FLUSH_CTRL, 0);
 }
 
 /* ── MAC address filter ─────────────────────────────────────────────────── */
@@ -205,12 +271,28 @@ static void genet_setup_rxfilter(const uint8_t *mac)
     GW4(GENET_UMAC_MDF_ADDR0(1), 0xffffffff);
     GW4(GENET_UMAC_MDF_ADDR1(1), 0x0000ffff);
 
-    /* Enable both entries (bits 17 and 16) */
-    GW4(GENET_UMAC_MDF_CTRL, (1u << 17) | (1u << 16));
+    /* boot337: disable MDF entirely — PROMISC alone is not sufficient to
+     * bypass MDF; Linux explicitly writes MDF_CTRL=0 when enabling promisc.
+     * Previous code wrote (1u<<17)|(1u<<16) which enables entries 16 and 17,
+     * not entries 0 and 1 where we programmed the unicast and broadcast MACs.
+     * Entries 16/17 held uninitialized zeros → no frame ever matched → every
+     * received frame was silently dropped before reaching RBUF/RDMA → pidx=0
+     * on every boot since boot302.  Writing 0 disables all MDF entries and
+     * allows PROMISC to work as intended. */
+    GW4(GENET_UMAC_MDF_CTRL, 0);
 
-    /* UMAC_CMD: clear promisc, set speed=1000, keep TX/RX off for now */
+    /* UMAC_CMD: set PROMISC + SPEED_1000, keep TX/RX off for now.
+     * boot323: PROMISC must be SET here.  boot314 (confirmed working — ARP
+     * and ICMP on the wire) had UMAC_CMD=0x18 at this point = PROMISC |
+     * SPEED_1000.  Between boot314 and boot341, this was changed to CLEAR
+     * PROMISC and rely on the MDF filter instead.  But the MDF filter does
+     * not pass frames: boot341 shows pidx=0 for 30+ seconds after link-up
+     * even though DHCP DISCOVERs are sent (TX works).  With PROMISC cleared
+     * the MAC filter drops every incoming frame before it reaches RDMA.
+     * Reinstating PROMISC matches boot314 exactly and unblocks RX.          */
     uint32_t cmd = GR4(GENET_UMAC_CMD);
-    cmd &= ~(GENET_UMAC_CMD_PROMISC | GENET_UMAC_CMD_SPEED);
+    cmd &= ~GENET_UMAC_CMD_SPEED;
+    cmd |= GENET_UMAC_CMD_PROMISC;
     cmd |= __SHIFTIN(GENET_UMAC_CMD_SPEED_1000, GENET_UMAC_CMD_SPEED);
     GW4(GENET_UMAC_CMD, cmd);
 }
@@ -233,7 +315,7 @@ static void genet_init_rings(int qid)
     GW4(GENET_TX_DMA_START_ADDR_LO(qid), 0);
     GW4(GENET_TX_DMA_START_ADDR_HI(qid), 0);
     GW4(GENET_TX_DMA_END_ADDR_LO(qid),
-        TX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4 - 1);
+        TX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4 - 1);  /* = 191 */
     GW4(GENET_TX_DMA_END_ADDR_HI(qid), 0);
     GW4(GENET_TX_DMA_MBUF_DONE_THRES(qid), 1);
     GW4(GENET_TX_DMA_FLOW_PERIOD(qid),     0);
@@ -259,7 +341,7 @@ static void genet_init_rings(int qid)
     GW4(GENET_RX_DMA_START_ADDR_LO(qid), 0);
     GW4(GENET_RX_DMA_START_ADDR_HI(qid), 0);
     GW4(GENET_RX_DMA_END_ADDR_LO(qid),
-        RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4 - 1);
+        RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4 - 1);  /* = 191 */
     GW4(GENET_RX_DMA_END_ADDR_HI(qid), 0);
     GW4(GENET_RX_DMA_XON_XOFF_THRES(qid),
         __SHIFTIN(5,                    GENET_RX_DMA_XON_XOFF_THRES_LO) |
@@ -267,24 +349,16 @@ static void genet_init_rings(int qid)
     GW4(GENET_RX_DMA_READ_PTR_LO(qid), 0);
     GW4(GENET_RX_DMA_READ_PTR_HI(qid), 0);
 
-    GW4(GENET_RX_DMA_RING_CFG, __BIT(qid));  /* enable this ring */
-
-    val  = GR4(GENET_RX_DMA_CTRL);
-    val |= GENET_RX_DMA_CTRL_EN;
-    val |= GENET_RX_DMA_CTRL_RBUF_EN(GENET_DMA_DEFAULT_QUEUE);
-    GW4(GENET_RX_DMA_CTRL, val);
-
-    /* Pre-populate all RX descriptors with buffer addresses.
-     * boot341: STATUS must be 0 at init.  The STATUS word (offset +0 in each
-     * descriptor) is HARDWARE-WRITTEN — GENET fills it (frame length, OWN,
-     * EOP, SOP, error bits) when a frame arrives.  Software must not pre-set
-     * any bits here.  Slot availability is communicated to hardware via
-     * WRITE_PTR only.  Writing OWN|EOP=0xC000 (as boot340 did) puts garbage
-     * in the hardware-owned status word and appears to prevent RDMA from
-     * filling those slots — PROD_INDEX never advances.  boot314 had STATUS=0
-     * and worked (confirmed from bootlog333 readback: status=0x00000000).    */
+    /* boot330 (= boot341/342 behaviour): populate all RX descriptors.
+     * STATUS must be 0 — it is hardware-owned (GENET fills length/flags on
+     * frame arrival).  Writing BUFLEN here (boot326) confused the hardware.
+     * WRITE_PTR must be set to DESC_COUNT×3=192 AFTER populating all slots
+     * to tell hardware "64 buffers are armed."  WRITE_PTR=0 at init means
+     * "ring empty" — that's what caused RDMA=BROKEN in boot322-329. */
     DSB();
     for (int i = 0; i < RX_DESC_COUNT; i++) {
+        /* boot337: raw ARM physical address — BCM2711 GENET is cache-coherent
+         * and uses the same address space as the CPU (no VC4 bus offset). */
         uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[i];
         GW4(GENET_RX_DESC_STATUS(i),     0);      /* hardware fills on RX  */
         GW4(GENET_RX_DESC_ADDRESS_LO(i), paddr);
@@ -292,14 +366,20 @@ static void genet_init_rings(int qid)
     }
     DSB();
 
-    /* RDMA WRITE_PTR: free-running word-address counter.
-     * After arming all 64 slots WRITE_PTR = 64 * (12/4) = 192.
-     * Hardware tracks (WRITE_PTR - its_internal_read_ptr) to know how many
-     * slots are available.  Each subsequent refill increments by 3 (one
-     * descriptor's worth of 32-bit words) — see genet_poll_rx.             */
+    /* Arm all 64 slots: WRITE_PTR = 64 × 3 words = 192.
+     * Hardware tracks (WRITE_PTR - its_fill_ptr) to know how many slots are
+     * available.  Each genet_poll_rx re-arm increments g_rx_write_ptr by 3. */
     g_rx_write_ptr = (uint32_t)(RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4);
     GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
     GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
+
+    /* Enable ring and DMA now that all descriptor slots have valid addresses */
+    GW4(GENET_RX_DMA_RING_CFG, __BIT(qid));  /* enable this ring */
+
+    val  = GR4(GENET_RX_DMA_CTRL);
+    val |= GENET_RX_DMA_CTRL_EN;
+    val |= GENET_RX_DMA_CTRL_RBUF_EN(GENET_DMA_DEFAULT_QUEUE);
+    GW4(GENET_RX_DMA_CTRL, val);
 
     g_rx_cidx = 0;
     g_tx_pidx = 0;
@@ -310,6 +390,7 @@ static void genet_init_rings(int qid)
         (unsigned)(GR4(GENET_RX_DMA_WRITE_PTR_LO(qid)) & 0xffff),
         (unsigned)(GR4(GENET_RX_DMA_PROD_INDEX(qid))   & 0xffff),
         (unsigned)(GR4(GENET_RX_DMA_CONS_INDEX(qid))   & 0xffff));
+    /* boot337: addr_lo = raw ARM physical address of g_rx_buf[0] (~0x08xxxxxx) */
     debug_print("[GENET] RX desc[0] addr_lo=0x%08x status=0x%08x\n",
         (unsigned)GR4(GENET_RX_DESC_ADDRESS_LO(0)),
         (unsigned)GR4(GENET_RX_DESC_STATUS(0)));
@@ -388,12 +469,20 @@ void genet_init(void)
     /* Mask all interrupts — polling only for boot302 */
     genet_disable_intr();
 
-    /* Enable UMAC transmitter and receiver */
+    /* Enable UMAC transmitter, receiver, and data-path gate.
+     * boot333: TX_RX_EN (bit 29) is the GENETv5 MAC data-path gate — it
+     * must be set at init time, not deferred to apply_link.  Without it:
+     *   • TX frames are silently swallowed by UMAC (not visible on wire)
+     *   • RX frames never reach RDMA (pidx stays 0)
+     * The pcap from boot332 confirmed zero Pi frames on wire despite
+     * DHCP DISCOVERs being logged — TX_RX_EN was only set in apply_link
+     * which runs ~40 s after boot, after DHCP had already given up. */
     uint32_t cmd = GR4(GENET_UMAC_CMD);
-    cmd |= GENET_UMAC_CMD_TXEN | GENET_UMAC_CMD_RXEN;
+    cmd |= GENET_UMAC_CMD_TX_RX_EN | GENET_UMAC_CMD_TXEN | GENET_UMAC_CMD_RXEN;
     GW4(GENET_UMAC_CMD, cmd);
 
-    debug_print("[GENET] UMAC TX+RX enabled\n");
+    debug_print("[GENET] UMAC TX+RX+gate enabled cmd=0x%08x\n",
+        (unsigned)GR4(GENET_UMAC_CMD));
 
     /* Mark driver OK now so genet_send/genet_poll_rx work below */
     g_genet_ok = 1;
@@ -411,37 +500,39 @@ void genet_init(void)
      * It is the definitive split between "ring init broken" vs "wire broken".
      ──────────────────────────────────────────────────────────────────── */
     {
-        /* Enable MAC-level loopback */
+        /* boot330 (= boot342): simple loopback — LCL_LOOP_EN only.
+         * boot342 did NOT set TX_RX_EN or manipulate OOB for the loopback,
+         * and it passed.  All the extra bits we added (boot326+) were wrong. */
         uint32_t lpcmd = GR4(GENET_UMAC_CMD);
         lpcmd |= GENET_UMAC_CMD_LCL_LOOP_EN;
         GW4(GENET_UMAC_CMD, lpcmd);
-        genet_delay_us(100);  /* let UMAC settle */
+        genet_delay_us(100);
 
-        /* Minimal 64-byte test frame: dst=broadcast src=our_MAC type=0x9000 */
         static uint8_t s_lp_frame[64];
         memset(s_lp_frame, 0, sizeof(s_lp_frame));
         s_lp_frame[0] = 0xff; s_lp_frame[1] = 0xff; s_lp_frame[2] = 0xff;
         s_lp_frame[3] = 0xff; s_lp_frame[4] = 0xff; s_lp_frame[5] = 0xff;
         memcpy(s_lp_frame + 6, g_genet_mac, 6);
-        s_lp_frame[12] = 0x90; s_lp_frame[13] = 0x00; /* EtherType 0x9000 */
+        s_lp_frame[12] = 0x90; s_lp_frame[13] = 0x00;
         genet_send(s_lp_frame, sizeof(s_lp_frame));
 
-        /* Poll PROD_INDEX for up to 10 ms (1000 × 10 µs) */
         uint32_t lp_pidx = 0;
         for (int i = 0; i < 1000; i++) {
             genet_delay_us(10);
             lp_pidx = GR4(GENET_RX_DMA_PROD_INDEX(qid)) & 0xffff;
             if (lp_pidx) break;
         }
-        debug_print("[GENET] loopback: pidx=%u RDMA=%s\n",
-            (unsigned)lp_pidx, lp_pidx ? "OK" : "BROKEN");
+        debug_print("[GENET] loopback: pidx=%u wptr=0x%x RDMA=%s UMAC_CMD=0x%08x TX_FLUSH=0x%x\n",
+            (unsigned)lp_pidx,
+            (unsigned)(GR4(GENET_RX_DMA_WRITE_PTR_LO(qid)) & 0xffff),
+            lp_pidx ? "OK" : "BROKEN",
+            (unsigned)GR4(GENET_UMAC_CMD),
+            (unsigned)GR4(GENET_UMAC_TX_FLUSH));
 
-        /* Disable loopback */
         lpcmd = GR4(GENET_UMAC_CMD);
         lpcmd &= ~GENET_UMAC_CMD_LCL_LOOP_EN;
         GW4(GENET_UMAC_CMD, lpcmd);
 
-        /* If the loopback frame landed in the ring, drain it */
         if (lp_pidx) {
             static uint8_t s_drain[GENET_BUF_SIZE];
             genet_poll_rx(s_drain, sizeof(s_drain));
@@ -451,7 +542,8 @@ void genet_init(void)
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    debug_print("[GENET] init complete (boot342 polling mode)\n");
+    debug_print("[GENET] init complete (boot340 polling mode,"
+                " MDF_CTRL=0 + cache ops + ID_MODE_DISABLE=1)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */
@@ -506,29 +598,83 @@ void genet_apply_link(void)
     uint32_t cmd = GR4(GENET_UMAC_CMD);
     cmd &= ~GENET_UMAC_CMD_SPEED;
     cmd |= __SHIFTIN(spd, GENET_UMAC_CMD_SPEED);
+    /* boot331: restore TX_RX_EN (bit 29) on link-up.
+     * boot330 removed it following the boot342 git analysis, but the one boot
+     * we have on record where wire RX actually worked (bootlog349 second boot)
+     * had UMAC_CMD=0x2000001b — bit 29 SET.  Without it frames do not flow
+     * (boot330 shows pidx=0 throughout despite correct ring init). */
+    cmd |= GENET_UMAC_CMD_TX_RX_EN;
+    cmd |= GENET_UMAC_CMD_TXEN | GENET_UMAC_CMD_RXEN;
     GW4(GENET_UMAC_CMD, cmd);
 
-    /* Update EXT_RGMII_OOB_CTRL on link-up — mirrors Circle bcm54213.cpp
-     * mii_setup() / adjust_link() sequence:
-     *   • ID_MODE_DISABLE: set at 1Gbps (PHY provides delay, MAC must not);
-     *                      clear at 10/100 (no delay needed).
-     *   • OOB_DISABLE:     clear — enable OOB (link/speed) signalling.
-     *   • RGMII_LINK:      set — tell MAC the physical link is established.
-     *     Without RGMII_LINK set the MAC does not forward received frames
-     *     to RDMA, so PROD_INDEX never advances regardless of other fixes.
-     * boot341: prints OOB before/after to confirm correct bits at runtime.  */
+    /* Update EXT_RGMII_OOB_CTRL on link-up.
+     * boot339: ID_MODE_DISABLE is KEPT SET (MAC adds no delay — see long
+     * comment below).  Only OOB_DISABLE and RGMII_LINK are touched here.
+     *   • OOB_DISABLE: clear — enable OOB signalling.
+     *   • RGMII_LINK:  set   — assert link-up to MAC.                      */
     uint32_t oob = GR4(GENET_EXT_RGMII_OOB_CTRL);
     debug_print("[GENET] apply_link: OOB before=0x%08x\n", (unsigned)oob);
-    if (spd == GENET_UMAC_CMD_SPEED_1000)
-        oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
-    else
-        oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
+
+    /* boot339: DO NOT clear ID_MODE_DISABLE.  Keep it SET (= MAC adds no TX
+     * clock delay) as genet_init() configured it.
+     *
+     * BCM54213PE on Pi 4 operates in RGMII-ID mode: the PHY adds internal
+     * delay on both TX_CLK and RX_CLK.  The MAC must therefore NOT add its
+     * own delay → ID_MODE_DISABLE=1.
+     *
+     * boot331 cleared ID_MODE_DISABLE based on bootlog349 showing
+     * OOB=0x00f00050 (bit 16 clear) when "RX worked."  But bootlog349 only
+     * confirmed RDMA=OK (pidx advancing); TX was never verified in that boot.
+     * With ID_MODE_DISABLE=0 the MAC also delays TX_CLK → double delay:
+     * PHY delay + MAC delay = RGMII TX misalignment → PHY discards every
+     * frame → nothing on wire.  This explains boot338: TDMA CONS advances
+     * (DMA consumed) but zero Pi frames ever appear in Wireshark.
+     *
+     * boot314 (confirmed ARP+ICMP on wire) had ID_MODE_DISABLE=1 after
+     * apply_link — the apply_link OOB code did not exist then; the init
+     * setting of bit 16 was preserved.  Reverting to that state. */
+    /* REMOVED: oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE; */
     oob &= ~GENET_EXT_RGMII_OOB_OOB_DISABLE;  /* enable OOB signalling   */
     oob |=  GENET_EXT_RGMII_OOB_RGMII_LINK;   /* assert link-up to MAC   */
     GW4(GENET_EXT_RGMII_OOB_CTRL, oob);
     debug_print("[GENET] apply_link: OOB after=0x%08x UMAC_CMD=0x%08x\n",
         (unsigned)GR4(GENET_EXT_RGMII_OOB_CTRL),
         (unsigned)GR4(GENET_UMAC_CMD));
+
+    /* boot339: dump PHY state at link-up to confirm 1 Gbps negotiated */
+    {
+        uint16_t phy_bmsr = genet_mdio_read(GENET_PHY_ADDR, MII_BMSR);
+        phy_bmsr = genet_mdio_read(GENET_PHY_ADDR, MII_BMSR); /* latch-low */
+        uint32_t spd_mhz = (spd == GENET_UMAC_CMD_SPEED_1000) ? 1000u :
+                           (spd == GENET_UMAC_CMD_SPEED_100)  ?  100u : 10u;
+        debug_print("[GENET] apply_link PHY: BMSR=0x%04x STAT1000=0x%04x"
+                    " LPA=0x%04x spd=%u\n",
+            (unsigned)phy_bmsr, (unsigned)stat1000,
+            (unsigned)lpa,      (unsigned)spd_mhz);
+    }
+
+    /* post-link state dump — RX and TX DMA sides.
+     * RX: PROD should advance once first frame arrives.
+     * TX: CONS should advance past 0 once DHCP DISCOVER is consumed by TDMA.
+     *     If tx_cons stays 0 after DHCP, TDMA is not consuming = TX broken. */
+    {
+        const int qid2 = GENET_DMA_DEFAULT_QUEUE;
+        debug_print("[GENET] post-link RX: CTRL=0x%08x CFG=0x%08x"
+                    " PROD=%u CONS=%u d0_stat=0x%08x d0_addr=0x%08x\n",
+            (unsigned)GR4(GENET_RX_DMA_CTRL),
+            (unsigned)GR4(GENET_RX_DMA_RING_CFG),
+            (unsigned)(GR4(GENET_RX_DMA_PROD_INDEX(qid2)) & 0xffff),
+            (unsigned)(GR4(GENET_RX_DMA_CONS_INDEX(qid2)) & 0xffff),
+            (unsigned)GR4(GENET_RX_DESC_STATUS(0)),
+            (unsigned)GR4(GENET_RX_DESC_ADDRESS_LO(0)));
+        debug_print("[GENET] post-link TX: CTRL=0x%08x CFG=0x%08x"
+                    " PROD=%u CONS=%u UMAC_CMD=0x%08x\n",
+            (unsigned)GR4(GENET_TX_DMA_CTRL),
+            (unsigned)GR4(GENET_TX_DMA_RING_CFG),
+            (unsigned)(GR4(GENET_TX_DMA_PROD_INDEX(qid2)) & 0xffff),
+            (unsigned)(GR4(GENET_TX_DMA_CONS_INDEX(qid2)) & 0xffff),
+            (unsigned)GR4(GENET_UMAC_CMD));
+    }
 }
 
 /* ── Public: genet_send ────────────────────────────────────────────────── */
@@ -554,21 +700,43 @@ int genet_send(const void *buf, uint32_t len)
     memcpy(g_tx_buf[idx], buf, len);
     DSB();
 
+    /* boot338: raw ARM physical address (no VC4 bus offset).
+     * Flush D-cache to DRAM so TDMA reads our actual frame data, not the
+     * stale BSS zeros.  Must happen AFTER memcpy, BEFORE PROD_INDEX bump. */
+    CACHE_CLEAN(g_tx_buf[idx], len);
+
     uint32_t paddr = (uint32_t)(uintptr_t)g_tx_buf[idx];
     uint32_t status = (len << 16) |
                       GENET_TX_DESC_STATUS_SOP |
                       GENET_TX_DESC_STATUS_EOP |
                       GENET_TX_DESC_STATUS_CRC;
 
+    /* boot339: log first 32 TX frames — split into two debug_print calls so
+     * the total vararg count never exceeds 7 (fits in AArch64 x1-x7 regs).
+     * Exceeding 7 args spills to stack; our bare-metal debug_print va_list
+     * does not reliably read stack args, causing bytes 3-5 of MACs to print
+     * as 00.  Two calls of ≤7 args each print correctly. */
+    if (g_tx_pidx < 32) {
+        const uint8_t *f = g_tx_buf[idx];
+        uint16_t etype = (uint16_t)((f[12] << 8) | f[13]);
+        debug_print("[GENET] TX#%u src=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            (unsigned)g_tx_pidx,
+            f[6],f[7],f[8],f[9],f[10],f[11]);
+        debug_print("[GENET]      dst=%02x:%02x:%02x:%02x:%02x:%02x"
+                    " type=0x%04x len=%u\n",
+            f[0],f[1],f[2],f[3],f[4],f[5],
+            etype, (unsigned)len);
+    }
+
     GW4(GENET_TX_DESC_ADDRESS_LO(idx), paddr);
     GW4(GENET_TX_DESC_ADDRESS_HI(idx), 0);
     GW4(GENET_TX_DESC_STATUS(idx),     status);
-    /* boot320: update TDMA WRITE_PTR to the word address of this descriptor
-     * so hardware knows which SRAM slot contains the new TX frame.
-     * Without this, WRITE_PTR stays 0 and hardware reuses descriptor 0.  */
-    GW4(GENET_TX_DMA_WRITE_PTR_LO(qid),
-        (uint32_t)idx * (GENET_DMA_DESC_SIZE / 4));
-    GW4(GENET_TX_DMA_WRITE_PTR_HI(qid), 0);
+    /* boot334: do NOT update TX WRITE_PTR per frame.
+     * EtherGENET-6 genet_start_locked() (the authoritative reference) only
+     * writes PROD_INDEX to kick DMA; WRITE_PTR is set once at ring init and
+     * never touched again.  Our per-frame WRITE_PTR update was wrong — it
+     * set WRITE_PTR to idx×3 which collapsed back to 0 on descriptor 0 and
+     * corrupted the hardware's view of the ring on every subsequent TX. */
     DSB();
 
     /* Advance producer index to kick DMA */
@@ -576,6 +744,18 @@ int genet_send(const void *buf, uint32_t len)
     GW4(GENET_TX_DMA_PROD_INDEX(qid), g_tx_pidx);
 
     return 0;
+}
+
+/* ── Public: genet_tx_diag ─────────────────────────────────────────────── */
+/* Return TX DMA producer and consumer indices (both 16-bit free-running).
+ * boot329: called from lib.c ARP handler to verify TDMA is consuming frames
+ * after each send — if cons stays stuck at the same value across multiple
+ * sends, the TX DMA engine is not advancing (hardware-side TX is broken).  */
+void genet_tx_diag(uint32_t *prod_out, uint32_t *cons_out)
+{
+    const int qid = GENET_DMA_DEFAULT_QUEUE;
+    if (prod_out) *prod_out = g_tx_pidx & 0xffff;
+    if (cons_out) *cons_out = GR4(GENET_TX_DMA_CONS_INDEX(qid)) & 0xffff;
 }
 
 /* ── Public: genet_poll_rx ─────────────────────────────────────────────── */
@@ -595,7 +775,11 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
 
     int idx = g_rx_cidx & (RX_DESC_COUNT - 1);
 
-    DSB();  /* ensure descriptor write from GENET is visible */
+    /* boot338: invalidate D-cache for this RX slot before reading status or
+     * frame data.  RDMA wrote to DRAM; without DC CIVAC the CPU would read
+     * stale cache lines (BSS zeros) instead of the received frame.          */
+    CACHE_INVAL(g_rx_buf[idx], GENET_BUF_SIZE);
+    DSB();  /* ensure all RDMA writes visible before we read status */
     uint32_t status = GR4(GENET_RX_DESC_STATUS(idx));
     uint32_t raw_len = __SHIFTOUT(status, GENET_RX_DESC_STATUS_BUFLEN);
 
@@ -603,13 +787,15 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
     g_rx_cidx = (g_rx_cidx + 1) & 0xffff;
     GW4(GENET_RX_DMA_CONS_INDEX(qid), g_rx_cidx);
 
-    /* Re-arm this descriptor slot.
-     * boot341: STATUS=0 (hardware fills it on the next received frame).
-     * Do NOT write OWN|EOP here — see genet_init_rings for why.          */
+    /* Re-arm this descriptor slot: restore buffer address and STATUS=0.
+     * boot330 (= boot342): STATUS is hardware-owned — RDMA fills it with
+     * length/flags on arrival.  Writing BUFLEN here (boot326) was wrong;
+     * the working boot342 writes STATUS=0 to return the slot to hardware.
+     * boot337: raw ARM physical address. */
     uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[idx];
-    GW4(GENET_RX_DESC_STATUS(idx),     0);
     GW4(GENET_RX_DESC_ADDRESS_LO(idx), paddr);
     GW4(GENET_RX_DESC_ADDRESS_HI(idx), 0);
+    GW4(GENET_RX_DESC_STATUS(idx), 0);  /* hardware-owned; 0 = slot available */
     /* Advance WRITE_PTR by one descriptor (3 words) using the tracked
      * free-running counter g_rx_write_ptr.
      * boot340 bug: calculated next*3 from g_rx_cidx, collapsing WRITE_PTR
@@ -623,6 +809,8 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
 
     /* Check for hardware errors */
     if (status & GENET_RX_DESC_STATUS_ALL_ERRS) {
+        if (status & GENET_RX_DESC_STATUS_CRC_ERR)
+            g_rx_fcs++;
         debug_print("[GENET] RX error status=0x%08x\n", (unsigned)status);
         return 0;
     }
@@ -641,5 +829,45 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
     /* Copy from the 2-byte offset position in the DMA buffer */
     memcpy(buf, g_rx_buf[idx] + ETHER_ALIGN, frame_len);
 
+    /* boot339: log first 32 RX frames — split into two calls (≤7 args each)
+     * to avoid AArch64 vararg stack spill in bare-metal debug_print.          */
+    if (g_rx_count < 32) {
+        const uint8_t *f = (const uint8_t *)buf;
+        uint16_t etype = (uint16_t)((f[12] << 8) | f[13]);
+        debug_print("[GENET] RX#%u src=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            (unsigned)g_rx_count,
+            f[6],f[7],f[8],f[9],f[10],f[11]);
+        debug_print("[GENET]      dst=%02x:%02x:%02x:%02x:%02x:%02x"
+                    " type=0x%04x len=%u\n",
+            f[0],f[1],f[2],f[3],f[4],f[5],
+            etype, (unsigned)frame_len);
+    }
+
+    g_rx_count++;
     return (int)frame_len;
+}
+
+/* ── Public: genet_rx_count_raw ────────────────────────────────────────── */
+/* Software counter of successfully received frames (incremented in poll_rx
+ * when a frame passes all error checks and is copied to caller's buffer).  */
+uint32_t genet_rx_count_raw(void)
+{
+    return g_rx_count;
+}
+
+/* ── Public: genet_tx_cons_raw ─────────────────────────────────────────── */
+/* Returns hardware TX DMA consumer index — the count of descriptors the
+ * TDMA engine has consumed (i.e. frames committed to UMAC at the DMA level).
+ * Used as the 'mib=' heartbeat field to confirm TX DMA is advancing.       */
+uint32_t genet_tx_cons_raw(void)
+{
+    if (!g_genet_ok) return 0;
+    return GR4(GENET_TX_DMA_CONS_INDEX(GENET_DMA_DEFAULT_QUEUE)) & 0xffff;
+}
+
+/* ── Public: genet_rx_fcs_raw ──────────────────────────────────────────── */
+/* Software counter of RX frames dropped due to CRC/FCS errors.            */
+uint32_t genet_rx_fcs_raw(void)
+{
+    return g_rx_fcs;
 }

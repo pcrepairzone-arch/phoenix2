@@ -63,6 +63,7 @@
 #define  GENET_RBUF_64B_EN              __BIT(0)
 #define GENET_RBUF_TBUF_SIZE_CTRL       0x3b4
 #define GENET_UMAC_CMD                  0x808
+#define  GENET_UMAC_CMD_TX_RX_EN        __BIT(29)  /* boot314/boot326: GENETv5 MAC data-path gate */
 #define  GENET_UMAC_CMD_LCL_LOOP_EN    __BIT(15)
 #define  GENET_UMAC_CMD_SW_RESET        __BIT(13)
 #define  GENET_UMAC_CMD_PROMISC         __BIT(4)
@@ -90,7 +91,9 @@
 #define GENET_UMAC_MDF_ADDR0(n)         (0xe54 + (n) * 0x8)
 #define GENET_UMAC_MDF_ADDR1(n)         (0xe58 + (n) * 0x8)
 
-/* Phoenix: use 64 descriptors — proven to work in RISC OS EtherGENET-6 */
+/* boot330: 64 descriptors per ring.  GENET SRAM is 256 words total but
+ * Q16 uses a 64-slot window (START_ADDR=0, END_ADDR=191=64*3-1).
+ * boot342 (last known working git HEAD) confirms 64 works; 256 broke it. */
 #define GENET_DMA_DESC_COUNT            64
 #define GENET_DMA_DESC_SIZE             12
 #define GENET_DMA_DEFAULT_QUEUE         16

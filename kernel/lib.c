@@ -399,7 +399,7 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot314  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot340  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 
@@ -466,9 +466,15 @@ void wimp_task(void)
             if ((now_b - last_beat) >= 500u) {
                 last_beat = now_b;
                 extern uint32_t genet_rx_pidx_raw(void);
-                debug_print("[WIMP] alive t=%dms stalls=%u pidx=%u\n",
+                extern uint32_t genet_rx_count_raw(void);
+                extern uint32_t genet_tx_cons_raw(void);
+                extern uint32_t genet_rx_fcs_raw(void);
+                debug_print("[WIMP] alive t=%dms stalls=%u rx=%u pidx=%u mib=%u rfcs=%u\n",
                             (int)now_b, (unsigned)g_uart_stalls,
-                            (unsigned)genet_rx_pidx_raw());
+                            (unsigned)genet_rx_count_raw(),
+                            (unsigned)genet_rx_pidx_raw(),
+                            (unsigned)genet_tx_cons_raw(),
+                            (unsigned)genet_rx_fcs_raw());
                 /* boot303/304: log link state changes; send grat ARP on UP */
                 int lnk = genet_link_up();
                 if (lnk != net_link_prev) {
@@ -534,13 +540,22 @@ void wimp_task(void)
             }
         }
 
-        /* ── GENET RX poll: 4 ms — non-blocking frame receive ─────────── */
+        /* ── GENET RX poll: 4 ms — drain entire RX ring each tick ─────── */
+        /* boot340: process all pending frames in one tick instead of one
+         * per tick.  With a single-frame policy, an ICMP echo request
+         * behind 50 queued broadcast frames waits 50×4 ms = 200 ms before
+         * being answered — in the worst case (ring fills between ticks)
+         * it can wait seconds.  Draining the ring in a tight inner loop
+         * delivers sub-4 ms echo latency regardless of background traffic
+         * volume.  The ring holds at most 64 frames (RX_DESC_COUNT), so
+         * the inner loop is bounded and can't stall the outer WIMP loop
+         * for more than a few hundred µs.                                */
         {
             uint32_t now_n = wimp_ms();
             if ((now_n - last_net) >= 4u) {
                 last_net = now_n;
-                int flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME);
-                if (flen > 13) {
+                int flen;
+                while ((flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME)) > 13) {
                     uint16_t etype = (uint16_t)
                         ((g_rx_frame[12] << 8) | g_rx_frame[13]);
 
@@ -555,7 +570,18 @@ void wimp_task(void)
                             g_rx_frame[41] == our_ip[3]) {
                             static uint8_t reply[60];
                             for (int _i=0;_i<60;_i++) reply[_i]=0;
-                            for (int _i=0;_i<6;_i++) reply[_i]   = g_rx_frame[22+_i];
+                            /* boot340: unicast ARP reply — dst = requester's MAC.
+                             * RFC 826 requires unicast ARP replies.  boot329 used
+                             * broadcast ff:ff:ff:ff:ff:ff in case the switch had not
+                             * yet learned the requester's port, but the requester
+                             * just sent us an ARP request — the switch has already
+                             * learned its port from that frame.  More importantly,
+                             * many host stacks (macOS, BSD) only update their ARP
+                             * cache from unicast replies; a broadcast reply is
+                             * accepted as a frame but not used to fill the cache,
+                             * causing repeated ARP retries and "Host is down" ping
+                             * errors.  Switch to unicast to match RFC 826. */
+                            for (int _i=0;_i<6;_i++) reply[_i]   = g_rx_frame[6+_i];
                             for (int _i=0;_i<6;_i++) reply[6+_i] = g_genet_mac[_i];
                             reply[12]=0x08; reply[13]=0x06;
                             reply[14]=0x00; reply[15]=0x01;
@@ -566,8 +592,31 @@ void wimp_task(void)
                             for (int _i=0;_i<4;_i++) reply[28+_i] = our_ip[_i];
                             for (int _i=0;_i<6;_i++) reply[32+_i] = g_rx_frame[22+_i];
                             for (int _i=0;_i<4;_i++) reply[38+_i] = g_rx_frame[28+_i];
-                            genet_send(reply, 60);
-                            debug_print("[ARP] replied to %d.%d.%d.%d\n",
+                            /* boot329: TX diagnostics — confirm TDMA consuming */
+                            uint32_t tx_prod_pre=0, tx_cons_pre=0;
+                            genet_tx_diag(&tx_prod_pre, &tx_cons_pre);
+                            int arp_rc = genet_send(reply, 60);
+                            uint32_t tx_prod_post=0, tx_cons_post=0;
+                            genet_tx_diag(&tx_prod_post, &tx_cons_post);
+                            /* boot339: split long debug_print into three
+                             * calls of ≤7 args each to avoid AArch64 stack
+                             * spill that printed SHA/SPA/TPA as zeros.      */
+                            debug_print(
+                                "[ARP] reply rc=%d"
+                                " tx_prod=%u->%u tx_cons=%u->%u\n",
+                                arp_rc,
+                                (unsigned)tx_prod_pre,  (unsigned)tx_prod_post,
+                                (unsigned)tx_cons_pre,  (unsigned)tx_cons_post);
+                            debug_print(
+                                "[ARP]  SHA=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                                g_genet_mac[0], g_genet_mac[1],
+                                g_genet_mac[2], g_genet_mac[3],
+                                g_genet_mac[4], g_genet_mac[5]);
+                            debug_print(
+                                "[ARP]  SPA=%d.%d.%d.%d"
+                                " TPA=%d.%d.%d.%d\n",
+                                our_ip[0], our_ip[1],
+                                our_ip[2], our_ip[3],
                                 g_rx_frame[28], g_rx_frame[29],
                                 g_rx_frame[30], g_rx_frame[31]);
                         }
