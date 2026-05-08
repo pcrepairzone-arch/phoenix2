@@ -2,6 +2,7 @@
  * genet.h — Phoenix interface for BCM2711 GENETv5 Ethernet driver.
  * boot302: polling-mode TX/RX, no IRQs.
  * boot343: IRQ-driven RX via GIC SPI 157 (INTID 189), INTRL2 RXDMA_DONE.
+ * boot344: mask-on-entry / rearm pattern to fix level-triggered IRQ storm.
  */
 #ifndef GENET_H
 #define GENET_H
@@ -50,5 +51,12 @@ extern uint8_t g_genet_mac[6];
  * task context (wimp_task).  On single-core bare-metal, volatile is
  * sufficient — no atomic needed.                                      */
 extern volatile int g_genet_rx_pending;
+
+/* boot344: Re-arm RXDMA_DONE IRQ after draining the RX ring.
+ * Call after the drain while-loop exits (ring empty) to re-enable
+ * INTRL2 RXDMA_DONE so the next arriving frame triggers a fresh IRQ.
+ * Implements the mask-on-entry / unmask-after-drain pattern that
+ * prevents the level-triggered IRQ storm seen in boot343.            */
+void genet_rx_irq_rearm(void);
 
 #endif /* GENET_H */

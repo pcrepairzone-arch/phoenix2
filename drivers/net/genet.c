@@ -429,34 +429,38 @@ static void genet_disable_intr(void)
  * Called from irq_dispatch() when the GIC delivers INTID 189.
  * Sequence:
  *   1. Read INTRL2_CPU_STAT to find which sources are pending.
- *   2. Write INTRL2_CPU_CLEAR with the same value to acknowledge them.
- *      (must clear before re-enabling at GIC level, i.e. before returning
- *       from irq_dispatch — irq_eoi is called by irq_dispatch after us.)
- *   3. If RXDMA_DONE is set, raise g_genet_rx_pending.
- *      WIMP's outer loop checks this flag and drains the ring.
+ *   2. Write INTRL2_CPU_CLEAR with the same value to acknowledge the latch.
+ *   3. If RXDMA_DONE is set:
+ *      a. MASK RXDMA_DONE via INTRL2_CPU_SET_MASK — this is CRITICAL.
+ *         RXDMA_DONE is level-triggered (BCM2711 DTS: IRQ_TYPE_LEVEL_HIGH).
+ *         If RDMA has more frames queued, the SPI line stays asserted even
+ *         after CPU_CLEAR.  Without masking, the GIC sees the level still
+ *         high after EOIR and delivers another IRQ instantly.  WIMP never
+ *         gets CPU time: the main loop runs at ~1 Hz instead of ~10 kHz.
+ *         (boot343 regression: gap grows to 160+ in 260 s — this was why.)
+ *      b. Set g_genet_rx_pending so WIMP drains the ring.
+ *         After draining, genet_rx_irq_rearm() re-enables RXDMA_DONE at
+ *         INTRL2.  If another frame arrived while masked, the SPI line
+ *         immediately re-asserts, delivering one clean IRQ per burst.
  *
- * We do NOT call genet_poll_rx() here.  genet_poll_rx() copies frame data
- * into a caller-supplied buffer; the caller (WIMP) owns that buffer and the
- * ARP/ICMP processing state.  Setting a flag and returning is the correct
- * pattern for a bottom-half / deferred handler.
+ * We do NOT call genet_poll_rx() here.  Setting a flag and returning is the
+ * correct bottom-half pattern; WIMP owns the RX buffer and protocol state.
  *
- * Single-core bare-metal: no locking needed.  WIMP cannot be in
- * genet_poll_rx() while this handler runs — the IRQ preempts WIMP at a
- * bounded boundary and returns.  genet_send() only touches the TX ring and
- * is safe to be interrupted mid-flight.                                    */
+ * Single-core bare-metal: no locking needed.                               */
 static void genet_rx_irq_handler(int vec, void *priv)
 {
     (void)vec;
     (void)priv;
 
     uint32_t stat = GR4(GENET_INTRL2_CPU_STAT);
-    GW4(GENET_INTRL2_CPU_CLEAR, stat);     /* ack all pending INTRL2 bits */
+    GW4(GENET_INTRL2_CPU_CLEAR, stat);      /* ack INTRL2 latch              */
 
     if (stat & GENET_IRQ_RXDMA_DONE) {
+        /* boot344: mask RXDMA_DONE immediately to stop the level-triggered
+         * interrupt from re-firing before WIMP drains the ring.             */
+        GW4(GENET_INTRL2_CPU_SET_MASK, GENET_IRQ_RXDMA_DONE);
         g_genet_rx_pending = 1;
     }
-    /* TXDMA_DONE and MDIO_DONE are not used — no handler needed.  Any other
-     * bits in stat are harmless: we cleared them above.                    */
 }
 
 /* genet_enable_rx_irq — wire RXDMA_DONE through INTRL2 → GIC → CPU.
@@ -485,6 +489,26 @@ static void genet_enable_rx_irq(void)
 
     debug_print("[GENET] RXDMA_DONE IRQ enabled (INTID %d, INTRL2 bit 13)\n",
                 GENET_GIC_INTID);
+}
+
+/* genet_rx_irq_rearm — re-enable RXDMA_DONE at INTRL2 after draining ring.
+ *
+ * Called by WIMP after the RX drain while-loop returns 0 (ring empty).
+ * Writes INTRL2_CPU_CLEAR_MASK to unmask RXDMA_DONE so the next frame
+ * delivered by RDMA will once again assert SPI 157 → INTID 189.
+ *
+ * If a frame arrived while RXDMA_DONE was masked (during the drain),
+ * INTRL2_CPU_STAT[13] is already set.  Clearing the mask immediately
+ * re-asserts the GIC SPI line → one clean IRQ fires → handler masks again
+ * and sets g_genet_rx_pending → WIMP drains the new frame.
+ *
+ * This is the re-arm half of the mask-on-entry / unmask-after-drain pattern
+ * that converts level-triggered behaviour into an edge-like single-IRQ-per-
+ * burst discipline, preventing the IRQ storm that caused boot343's regression
+ * (WIMP loop rate ~1 Hz instead of ~10 kHz → pidx gap growing to 160+).    */
+void genet_rx_irq_rearm(void)
+{
+    GW4(GENET_INTRL2_CPU_CLEAR_MASK, GENET_IRQ_RXDMA_DONE);
 }
 
 /* ── Public: genet_init ────────────────────────────────────────────────── */
@@ -627,8 +651,8 @@ void genet_init(void)
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    debug_print("[GENET] init complete (boot343 IRQ-driven RX,"
-                " MDF_CTRL=0 + cache ops + ID_MODE_DISABLE=1)\n");
+    debug_print("[GENET] init complete (boot344 IRQ-driven RX,"
+                " mask-on-entry rearm, MDF_CTRL=0 + cache ops + ID_MODE_DISABLE=1)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */

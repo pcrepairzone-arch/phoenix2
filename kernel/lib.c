@@ -541,20 +541,24 @@ void wimp_task(void)
         }
 
         /* ── GENET RX: IRQ-driven with 4 ms fallback poll ──────────────── */
-        /* boot343: primary trigger is g_genet_rx_pending, set by the
-         * GENET RXDMA_DONE IRQ handler (GIC INTID 189) the instant RDMA
-         * finishes writing a frame into a descriptor slot.  We clear the
-         * flag BEFORE draining so we can't miss a second IRQ that arrives
-         * while we're in the inner loop:
+        /* boot344: mask-on-entry / unmask-after-drain pattern.
          *
-         *   flag=1 (IRQ) → WIMP sees it → flag=0 → drain loop
-         *   new frame arrives mid-drain → IRQ fires → flag=1 again
-         *   drain loop finishes → outer loop → sees flag=1 → drains again
+         * RXDMA_DONE is level-triggered (BCM2711 DTS: IRQ_TYPE_LEVEL_HIGH).
+         * boot343 regression: handler cleared the INTRL2 latch but did NOT
+         * mask the source.  With frames queued in RDMA, the SPI line stays
+         * asserted after GIC EOIR → instant re-delivery → IRQ storm → WIMP
+         * main loop starved to ~1 Hz → pidx gap grew to 160+ over 260 s.
          *
-         * The 4 ms fallback catches any frame that arrived in the brief
-         * GIC EOI window (between INTRL2_CPU_CLEAR and GIC EOIR write in
-         * irq_dispatch) where a back-to-back frame could slip through
-         * without raising another edge on the GIC input.                 */
+         * boot344 fix (mask-on-entry):
+         *   IRQ fires → handler masks RXDMA_DONE (SET_MASK) → sets flag → ret
+         *   WIMP: flag=1 → clears flag → drains ring to empty
+         *   After drain: genet_rx_irq_rearm() unmasks RXDMA_DONE (CLEAR_MASK)
+         *   If a frame arrived while masked → SPI re-asserts immediately →
+         *   one clean IRQ fires → next drain on next outer loop iteration.
+         *
+         * The 4 ms fallback timer covers the window between INTRL2 CLEAR
+         * (in handler) and the rearm: any frame that sneaks in during that
+         * brief gap will be caught within 4 ms even without a fresh IRQ.   */
         {
             uint32_t now_n = wimp_ms();
             int do_drain = (int)g_genet_rx_pending;
@@ -799,6 +803,11 @@ void wimp_task(void)
                         }
                     }
                 }
+                /* boot344: re-arm RXDMA_DONE IRQ now that the ring is empty.
+                 * Unmasks INTRL2 RXDMA_DONE so the next arriving frame fires
+                 * a fresh IRQ.  If a frame arrived while masked, the SPI line
+                 * re-asserts the moment we unmask → one clean IRQ → next iter. */
+                genet_rx_irq_rearm();
             }
         }
 
