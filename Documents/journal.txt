@@ -2327,3 +2327,182 @@ and working on similar problems, start with Circle.
 
 Thank you, Circle. Thank you, R. Stange.
 
+
+═══════════════════════════════════════════════════════════════
+CHAPTER: BCM2711 GENETv5 ETHERNET — BOOT302 THROUGH BOOT342
+═══════════════════════════════════════════════════════════════
+
+Hardware: Broadcom BCM2711 on Raspberry Pi 4B, 4 GB.
+NIC: BCM2711 integrated GENETv5 at MMIO 0xFD580000.
+PHY: BCM54213PE, MDIO addr 1, RGMII-ID mode (PHY adds clock delays).
+MAC: dc:a6:32:94:84:24
+Host: macOS 192.168.0.74 on the same Ethernet segment.
+
+Goal: working ping (ICMP echo request/reply) between host and Pi,
+using a bare-metal Phoenix kernel with no OS services.
+
+── BOOT302 — INITIAL DRIVER ───────────────────────────────────
+
+  Wrote drivers/net/genet.c from scratch: BCM2711 GENETv5 polling
+  mode driver. TX/RX via Q16 (GENET_DMA_DEFAULT_QUEUE=16), 64
+  descriptors per ring, 2048-byte buffers.  genet_init() resets
+  UMAC, sets MAC address from mailbox, configures TX/RX DMA rings,
+  autoneg-waits for PHY link (BCM54213PE), enables UMAC TX+RX.
+  genet_send() / genet_poll_rx() implement single-frame TX/RX.
+  No IRQs — polling only.  kernel/lib.c calls genet_init() from
+  kernel_main() and polls for RX frames every 4 ms in wimp_task().
+
+── BOOT314 — FIRST CONFIRMED FRAMES ON WIRE ───────────────────
+
+  ARP and ICMP frames from the Pi (dc:a6:32:94:84:24) first
+  appeared in Wireshark at boot314.  DHCP succeeded, gratuitous
+  ARP sent, ICMP echo replies logged.  This boot is the critical
+  reference: genet_apply_link() did NOT exist yet, so the OOB
+  register retained the genet_init() value of ID_MODE_DISABLE=1.
+
+── BOOT331 — ID_MODE_DISABLE REGRESSION ───────────────────────
+
+  genet_apply_link() was added to set RGMII OOB control on link-up.
+  A line was included: oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE.
+  This cleared ID_MODE_DISABLE (bit 16), meaning the MAC now added
+  its own TX clock delay on top of the PHY's internal delay.
+
+  The regression was invisible at the time because bootlog349 showed
+  RDMA pidx advancing (RX frames being received), which was taken as
+  evidence that OOB was correct.  But RX and TX use separate clock
+  paths: RDMA works on RX_CLK which the PHY also delays, and the MAC
+  delay on RX_CLK is separate from TX_CLK.  TX was never verified in
+  that boot.  No Wireshark capture was taken.
+
+── BOOT337 — MDF_CTRL BUG ─────────────────────────────────────
+
+  MDF_CTRL (MAC destination filter) was written with (1<<17)|(1<<16),
+  enabling filter entries 16 and 17.  But the Pi MAC was programmed
+  into entries 0 and 1.  Result: every received frame was silently
+  dropped by the destination filter.  Symptom: rx counter advanced
+  but mib (TX consumed) stayed at 7 forever — ARP replies and ICMP
+  replies were never sent because no requests were received.
+  Fix: MDF_CTRL=0 (disable filter entirely), rely on PROMISC mode.
+
+── BOOT338 — TX DEAD: ROOT CAUSE HUNT ─────────────────────────
+
+  After boot337 MDF fix, RDMA was confirmed working (pidx advancing,
+  ARP/ICMP requests received and logged).  But TDMA consumed
+  descriptors while ZERO Pi frames appeared in Wireshark.  The Pi
+  sent ARP, DHCP, and ICMP replies from its own perspective, but
+  nothing reached the wire.
+
+  Evidence that confused the diagnosis:
+  - TDMA CONS_INDEX advanced → DMA layer was working.
+  - DHCP DISCOVER was never seen by the DHCP server → TX dead from
+    the very first frame.
+  - ARP debug print showed SHA=dc:a6:32:00:00:00 and SPA=0.0.0.0 →
+    initially suspected wrong data in frame, but this was actually
+    an AArch64 ABI vararg overflow bug (see Rule 47).
+
+── BOOT339 — ROOT CAUSE: RGMII DOUBLE CLOCK DELAY ─────────────
+
+  Root cause identified: the boot331 regression — ID_MODE_DISABLE=0.
+
+  BCM54213PE operates in RGMII-ID mode: the PHY adds an internal
+  clock delay on both TX_CLK and RX_CLK.  The MAC must NOT add its
+  own delay.  With ID_MODE_DISABLE=0, the MAC also delayed TX_CLK:
+
+    PHY TX delay + MAC TX delay = RGMII TX timing violation
+    → PHY discards every incoming TX frame silently
+    → TDMA consumed descriptors, nothing left the RGMII pads.
+
+  The fix: remove `oob &= ~GENET_EXT_RGMII_OOB_ID_MODE_DISABLE`
+  from genet_apply_link().  Preserve the init-time value of 1.
+
+  Additional fixes in boot339:
+  - SYS_TBUF_FLUSH_CTRL (0x00c) cleared at init.  This register is
+    separate from UMAC_TX_FLUSH (0xb34); Linux always clears it.
+  - debug_print calls with >7 integer args split into multiple calls
+    to avoid AArch64 stack-spill vararg corruption (see Rule 47).
+
+  boot339 result: DHCP BOUND to 192.168.0.145, Pi frames visible in
+  Wireshark (dc:a6:32:94:84:24), ARP correct, ICMP replies for seq
+  25-59 logged.  ping: 21/78 packets received, 73.1% loss, 10-18s RTT.
+
+── BOOT340 — DRAIN LOOP + UNICAST ARP ─────────────────────────
+
+  Two remaining problems after boot339:
+
+  1. 73% packet loss / multi-second RTT.
+     Cause: single genet_poll_rx() call per 4ms wimp_task tick.
+     Background broadcast traffic (IPv6 multicasts, STP, LLDP) queued
+     ahead of ICMP requests.  Each queued frame cost 4ms to drain,
+     so N queued frames → N×4ms latency before ICMP was seen.
+     Fix: replace `if (flen = poll_rx()) {...}` with
+          `while ((flen = poll_rx()) > 13) {...}` — drain the entire
+          64-slot ring per tick.  Bounded loop, can't stall WIMP.
+
+  2. "Host is down" errors, repeated ARP retries.
+     Cause: ARP reply sent to dst = ff:ff:ff:ff:ff:ff (broadcast).
+     macOS/BSD only updates its ARP cache from unicast ARP replies
+     per RFC 826.  A broadcast reply is delivered but not cached →
+     requester retries ARP → ping sees "Host is down."
+     Fix: ARP reply dst set to requester's MAC (g_rx_frame[6..11]).
+
+  boot340 result (bootlog360 + wire10.pcapng):
+  OOB = 0x00f10050 (ID_MODE_DISABLE=1 confirmed).
+  DHCP BOUND immediately.  ICMP seq 3–60 replied; gaps: seq 10 and
+  37 only (2 isolated drops, ~3.4% loss).  stalls=0, rfcs=0.
+  Sub-4ms RTT.  Confirmed: "the money shot."
+
+── BOOT341–342 — RX STABILITY AND SELF-TEST ──────────────────
+
+  boot341: Fixed GENET RX stability — STATUS=0 (clear OWN bit in
+  re-armed descriptors) and free-running WRITE_PTR (no modulo wrap
+  before writing to hardware).
+  boot342: Added RDMA loopback self-test at init using
+  UMAC_CMD_LCL_LOOP_EN.  Self-test passes before external link
+  comes up, confirming DMA path integrity independently of PHY.
+
+── BASELINE TAG ────────────────────────────────────────────────
+
+  git tag: v0.1-genet-working (commit 64ea1aa, boot343)
+  All boot302–342 changes committed at boot343 with full comments.
+  Safe rollback point before interrupt-driven RX development.
+
+── RULES ADDED THIS CHAPTER ────────────────────────────────────
+
+Rule 47: AArch64 ABI vararg limit — integer arguments 1-7 go in
+         registers x1-x7; argument 8 and beyond spill to the stack.
+         Bare-metal debug_print that uses va_arg without a proper
+         stack frame cannot reliably read stack-spilled args — they
+         read as zero.  Symptom: MAC printed as XX:XX:XX:00:00:00,
+         IP as 0.0.0.0.  Fix: split any debug_print with >7 integer
+         args into multiple calls of ≤7 args each.
+
+Rule 48: RGMII-ID means the PHY adds clock delay — the MAC must not.
+         Set ID_MODE_DISABLE=1 in EXT_RGMII_OOB_CTRL for BCM54213PE.
+         If the MAC also adds delay (ID_MODE_DISABLE=0), TX_CLK
+         arrives with double delay → PHY discards every TX frame
+         silently → frames consumed by TDMA but nothing on wire.
+         RDMA may still work (RX_CLK is separate path) which can
+         mislead diagnosis into thinking OOB settings are correct.
+
+Rule 49: Always verify TX with a wire capture (Wireshark/tcpdump)
+         before diagnosing RX.  RDMA advancing does NOT imply TDMA
+         is putting frames on wire.  These are independent paths
+         that can fail independently.
+
+Rule 50: MDF_CTRL entry N must match the descriptor slot N used for
+         the MAC address.  Writing (1<<17)|(1<<16) enables entries
+         16/17 while the address is in entries 0/1 → every received
+         frame dropped silently.  Or set MDF_CTRL=0 and use PROMISC.
+
+Rule 51: ARP replies must be unicast (RFC 826 §Packet Reception).
+         BSD/macOS kernels do not update their ARP cache from
+         broadcast ARP replies.  The reply is accepted at layer 2
+         but the sender's hardware address is not stored → ARP
+         retries repeat → ping sees "Host is down."
+
+Rule 52: RX drain loop, not single-poll.  Calling genet_poll_rx()
+         once per 4ms tick causes O(N×tick) latency when N frames
+         queue ahead of the one you care about.  Drain the entire
+         ring in a while() loop per tick; the ring is bounded (64
+         slots) so the loop cannot stall the task scheduler.
+
