@@ -211,111 +211,12 @@ void pci_scan_bus(void) {}
 void vfs_init(void) {}
 void net_init(void) {}
 
-/* ── DHCP client (boot334) ────────────────────────────────────────────────
- * Minimal DISCOVER → OFFER → REQUEST → ACK state machine over UDP/IP.
- * No TCP needed.  Falls back to static 192.168.0.200 after 5 retries.   */
-
-#define DHCP_DISCOVER     1
-#define DHCP_REQUEST      3
-#define DHCP_MSG_OFFER    2
-#define DHCP_MSG_ACK      5
-#define DHCP_MSG_NAK      6
-
-#define DHCP_ST_IDLE      0   /* not started yet             */
-#define DHCP_ST_DISCOVER  1   /* sent DISCOVER, awaiting OFFER */
-#define DHCP_ST_REQUEST   2   /* sent REQUEST,  awaiting ACK  */
-#define DHCP_ST_BOUND     3   /* ACK received, IP assigned    */
-
-static int     g_dhcp_st       = DHCP_ST_IDLE;
-static uint8_t g_dhcp_yiaddr[4];          /* IP offered to us            */
-static uint8_t g_dhcp_srvid[4];           /* server identifier option    */
-static int     g_dhcp_tries    = 0;       /* DISCOVER/REQUEST retries    */
-/* XID = "PHOE" — identifies our transaction in server replies           */
-static const uint8_t g_dhcp_xid[4]    = { 0x50, 0x48, 0x4F, 0x45 };
-/* Fallback static IP if DHCP times out completely                       */
-static const uint8_t g_dhcp_static[4] = { 192, 168, 0, 200 };
-
-/* One's-complement IP checksum */
-static uint16_t _ip_cksum(const uint8_t *p, int n)
-{
-    uint32_t s = 0;
-    for (int i = 0; i < n; i += 2)
-        s += (uint32_t)((p[i] << 8) | (i+1 < n ? p[i+1] : 0));
-    while (s >> 16) s = (s & 0xffff) + (s >> 16);
-    return (uint16_t)(~s & 0xffff);
-}
-
-/* Build a 342-byte Ethernet/IPv4/UDP/DHCP frame into buf.
- * type = DHCP_DISCOVER or DHCP_REQUEST.
- * DHCP frame layout:
- *   [  0.. 13] Ethernet header (14 B)
- *   [ 14.. 33] IPv4 header    (20 B)  total = 328 B
- *   [ 34.. 41] UDP header      (8 B)  length = 308 B
- *   [ 42..341] DHCP payload  (300 B)
- *     [42+  0] op  [42+  1] htype [42+  2] hlen [42+  3] hops
- *     [42+  4..7]  xid
- *     [42+  8..9]  secs   [42+10..11] flags
- *     [42+ 12..15] ciaddr [42+16..19] yiaddr
- *     [42+ 20..23] siaddr [42+24..27] giaddr
- *     [42+ 28..43] chaddr (16 B)
- *     [42+ 44..107] sname (64 B)
- *     [42+108..235] file  (128 B)
- *     [42+236..239] magic cookie = 63:82:53:63
- *     [42+240..]    options (TLV)                                       */
-static int dhcp_make(uint8_t *buf, int type)
-{
-    for (int i = 0; i < 342; i++) buf[i] = 0;
-
-    /* Ethernet: dst=broadcast, src=our MAC, type=IPv4 */
-    for (int i = 0; i < 6; i++) { buf[i] = 0xff; buf[6+i] = g_genet_mac[i]; }
-    buf[12] = 0x08; buf[13] = 0x00;
-
-    /* IPv4: ver=4 IHL=5, total=328, DF, TTL=64, proto=UDP(17)
-     * src=0.0.0.0, dst=255.255.255.255                                  */
-    buf[14] = 0x45;
-    buf[16] = 0x01; buf[17] = 0x48;   /* total length 328 */
-    buf[20] = 0x40;                    /* DF bit           */
-    buf[22] = 0x40;                    /* TTL = 64         */
-    buf[23] = 0x11;                    /* UDP              */
-    buf[30] = 255; buf[31] = 255; buf[32] = 255; buf[33] = 255;
-    uint16_t ck = _ip_cksum(buf+14, 20);
-    buf[24] = (uint8_t)(ck >> 8); buf[25] = (uint8_t)ck;
-
-    /* UDP: src=68, dst=67, length=308, checksum=0 (disabled in IPv4) */
-    buf[34] = 0x00; buf[35] = 0x44;   /* src port 68 */
-    buf[36] = 0x00; buf[37] = 0x43;   /* dst port 67 */
-    buf[38] = 0x01; buf[39] = 0x34;   /* length 308  */
-
-    /* DHCP fixed header */
-    buf[42] = 0x01;              /* op = BOOTREQUEST   */
-    buf[43] = 0x01;              /* htype = Ethernet   */
-    buf[44] = 0x06;              /* hlen  = 6          */
-    buf[46] = g_dhcp_xid[0]; buf[47] = g_dhcp_xid[1];
-    buf[48] = g_dhcp_xid[2]; buf[49] = g_dhcp_xid[3];
-    buf[52] = 0x80;              /* flags: broadcast bit */
-    /* chaddr at offset 42+28 = 70 */
-    for (int i = 0; i < 6; i++) buf[70+i] = g_genet_mac[i];
-    /* magic cookie at 42+236 = 278 */
-    buf[278] = 0x63; buf[279] = 0x82; buf[280] = 0x53; buf[281] = 0x63;
-
-    /* Options at 282 */
-    int o = 282;
-    buf[o++] = 53; buf[o++] = 1; buf[o++] = (uint8_t)type; /* msg type */
-    if (type == DHCP_REQUEST) {
-        buf[o++] = 50; buf[o++] = 4;              /* Requested IP  */
-        buf[o++] = g_dhcp_yiaddr[0]; buf[o++] = g_dhcp_yiaddr[1];
-        buf[o++] = g_dhcp_yiaddr[2]; buf[o++] = g_dhcp_yiaddr[3];
-        buf[o++] = 54; buf[o++] = 4;              /* Server ID     */
-        buf[o++] = g_dhcp_srvid[0]; buf[o++] = g_dhcp_srvid[1];
-        buf[o++] = g_dhcp_srvid[2]; buf[o++] = g_dhcp_srvid[3];
-    } else {
-        /* Parameter Request List: subnet(1), router(3), domain(15), DNS(6) */
-        buf[o++] = 55; buf[o++] = 4;
-        buf[o++] = 1; buf[o++] = 3; buf[o++] = 15; buf[o++] = 6;
-    }
-    buf[o] = 0xff; /* End option */
-    return 342;
-}
+/* ── DHCP — delegated to net/dhcp.c (PhoenixDHCP module) ─────────────────
+ * boot345: extracted from inline implementation.
+ * All state, frame building, and retransmit logic live in net/dhcp.c.
+ * wimp_task() just calls dhcp_start(), dhcp_tick(), and dhcp_rx().
+ * g_our_ip is exported by dhcp.c and used directly below for ARP/ICMP.    */
+#include "../net/dhcp.h"
 
 /*
  * wimp_task — main desktop/input polling loop (boot178).
@@ -399,7 +300,7 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot340  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot351  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 
@@ -445,14 +346,15 @@ void wimp_task(void)
     uint32_t last_beat     = wimp_ms();
     uint32_t last_dwc2     = wimp_ms(); /* boot267: DWC2 HID poll timestamp */
     uint32_t last_net      = wimp_ms(); /* boot303: GENET RX poll */
-    uint32_t last_dhcp     = 0;        /* boot334: DHCP retransmit timer */
+    /* boot334: DHCP retransmit timer removed — dhcp_tick() carries its own
+     * timestamp internally; wimp_task just calls dhcp_tick(now) each loop. */
     /* boot305: start at -1 (unknown) so the heartbeat always fires on its
      * first check, logs the link state, and sends the gratuitous ARP if
      * link is already up from the initial wait.                            */
     int      net_link_prev = -1;
     static uint8_t g_rx_frame[GENET_MAX_FRAME]; /* RX frame buffer */
-    /* our_ip: starts 0.0.0.0; filled by DHCP ACK or static fallback */
-    static uint8_t our_ip[4] = { 0, 0, 0, 0 };
+    /* boot345: our IP read from g_our_ip (exported by net/dhcp.c).
+     * ARP and ICMP handlers use g_our_ip directly — no local copy needed.  */
     /* boot265: visual heartbeat — blinks a 16×16 square below the green
      * corner marker (top-right) at 1 Hz so the user can see WIMP is alive
      * without needing a serial terminal.  Drawn only when fb.valid is set. */
@@ -465,14 +367,10 @@ void wimp_task(void)
             uint32_t now_b = wimp_ms();
             if ((now_b - last_beat) >= 500u) {
                 last_beat = now_b;
-                extern uint32_t genet_rx_pidx_raw(void);
-                extern uint32_t genet_rx_count_raw(void);
-                extern uint32_t genet_tx_cons_raw(void);
-                extern uint32_t genet_rx_fcs_raw(void);
-                debug_print("[WIMP] alive t=%dms stalls=%u rx=%u pidx=%u mib=%u rfcs=%u\n",
+                debug_print("[WIMP] alive t=%dms stalls=%u pidx=%u rx=%u mib=%u rfcs=%u\n",
                             (int)now_b, (unsigned)g_uart_stalls,
-                            (unsigned)genet_rx_count_raw(),
                             (unsigned)genet_rx_pidx_raw(),
+                            (unsigned)genet_rx_count_raw(),
                             (unsigned)genet_tx_cons_raw(),
                             (unsigned)genet_rx_fcs_raw());
                 /* boot303/304: log link state changes; send grat ARP on UP */
@@ -485,89 +383,50 @@ void wimp_task(void)
                          * PHY drives RGMII RX clock; if UMAC speed doesn't
                          * match, pidx never advances (RX silently broken). */
                         genet_apply_link();
-                        /* boot334: start DHCP to acquire IP dynamically.
-                         * Grat ARP deferred until we receive a DHCP ACK
-                         * (or fall back to static after 5 retries).      */
-                        static uint8_t disc[342];
-                        dhcp_make(disc, DHCP_DISCOVER);
-                        genet_send(disc, 342);
-                        g_dhcp_st    = DHCP_ST_DISCOVER;
-                        g_dhcp_tries = 1;
-                        last_dhcp    = wimp_ms();
-                        debug_print("[DHCP] DISCOVER sent (xid=PHOE)\n");
+                        /* boot348: re-arm DHCP with real board MAC before
+                         * starting negotiation.  DHCPTest calls dhcp_init()
+                         * with a fake MAC (de:ad:be:ef:00:01); if we don't
+                         * overwrite that here, every real DISCOVER goes out
+                         * with the wrong chaddr and the router's OFFER (if
+                         * it ever matches) will be for the wrong client.    */
+                        dhcp_init(g_genet_mac);
+                        /* boot345: DHCP start delegated to PhoenixDHCP module.
+                         * dhcp_start() sets state BEFORE genet_send() —
+                         * closes the ISR race window present in boot334.
+                         * Reset last_net to force an immediate RX poll so
+                         * we don't wait up to 4 ms for the first OFFER.  */
+                        dhcp_start();
+                        last_net = wimp_ms();
                     }
                 }
             }
         }
 
-        /* ── DHCP retransmit: 4 s — resend if no reply yet ────────────── */
-        {
-            uint32_t now_b = wimp_ms();
-            if ((g_dhcp_st == DHCP_ST_DISCOVER ||
-                 g_dhcp_st == DHCP_ST_REQUEST) &&
-                (now_b - last_dhcp) >= 4000u) {
-                last_dhcp = now_b;
-                g_dhcp_tries++;
-                if (g_dhcp_tries > 5) {
-                    /* Give up — fall back to static IP */
-                    for (int _i=0;_i<4;_i++) our_ip[_i]=g_dhcp_static[_i];
-                    g_dhcp_st = DHCP_ST_BOUND;
-                    debug_print("[DHCP] timeout — using static %d.%d.%d.%d\n",
-                        our_ip[0],our_ip[1],our_ip[2],our_ip[3]);
-                    /* Gratuitous ARP with fallback IP */
-                    static uint8_t gfb[60];
-                    for (int _i=0;_i<60;_i++) gfb[_i]=0;
-                    for (int _i=0;_i<6;_i++) gfb[_i]=0xff;
-                    for (int _i=0;_i<6;_i++) gfb[6+_i]=g_genet_mac[_i];
-                    gfb[12]=0x08; gfb[13]=0x06;
-                    gfb[14]=0x00; gfb[15]=0x01; gfb[16]=0x08; gfb[17]=0x00;
-                    gfb[18]=6;    gfb[19]=4;
-                    gfb[20]=0x00; gfb[21]=0x02;
-                    for (int _i=0;_i<6;_i++) gfb[22+_i]=g_genet_mac[_i];
-                    for (int _i=0;_i<4;_i++) gfb[28+_i]=our_ip[_i];
-                    gfb[32]=0xff; gfb[33]=0xff; gfb[34]=0xff;
-                    gfb[35]=0xff; gfb[36]=0xff; gfb[37]=0xff;
-                    for (int _i=0;_i<4;_i++) gfb[38+_i]=our_ip[_i];
-                    genet_send(gfb, 60);
-                } else {
-                    int t = (g_dhcp_st==DHCP_ST_DISCOVER)
-                            ? DHCP_DISCOVER : DHCP_REQUEST;
-                    static uint8_t dret[342];
-                    dhcp_make(dret, t);
-                    genet_send(dret, 342);
-                    debug_print("[DHCP] retransmit try=%d\n", g_dhcp_tries);
-                }
-            }
-        }
+        /* ── DHCP tick: drives retransmit / timeout (PhoenixDHCP module) ─ */
+        dhcp_tick(wimp_ms());
 
-        /* ── GENET RX: IRQ-driven with 4 ms fallback poll ──────────────── */
-        /* boot344: mask-on-entry / unmask-after-drain pattern.
-         *
-         * RXDMA_DONE is level-triggered (BCM2711 DTS: IRQ_TYPE_LEVEL_HIGH).
-         * boot343 regression: handler cleared the INTRL2 latch but did NOT
-         * mask the source.  With frames queued in RDMA, the SPI line stays
-         * asserted after GIC EOIR → instant re-delivery → IRQ storm → WIMP
-         * main loop starved to ~1 Hz → pidx gap grew to 160+ over 260 s.
-         *
-         * boot344 fix (mask-on-entry):
-         *   IRQ fires → handler masks RXDMA_DONE (SET_MASK) → sets flag → ret
-         *   WIMP: flag=1 → clears flag → drains ring to empty
-         *   After drain: genet_rx_irq_rearm() unmasks RXDMA_DONE (CLEAR_MASK)
-         *   If a frame arrived while masked → SPI re-asserts immediately →
-         *   one clean IRQ fires → next drain on next outer loop iteration.
-         *
-         * The 4 ms fallback timer covers the window between INTRL2 CLEAR
-         * (in handler) and the rearm: any frame that sneaks in during that
-         * brief gap will be caught within 4 ms even without a fresh IRQ.   */
+        /* ── GENET RX poll: 4 ms — drain entire ring on each tick ─────── */
         {
             uint32_t now_n = wimp_ms();
-            int do_drain = (int)g_genet_rx_pending;
-            if (!do_drain && (now_n - last_net) >= 4u) do_drain = 1;
-            if (do_drain) {
-                g_genet_rx_pending = 0;
+            if ((now_n - last_net) >= 4u) {
                 last_net = now_n;
+                /* boot347: drain ALL frames queued in the RDMA ring, not just
+                 * one per 4 ms tick.  Previously a single genet_poll_rx() call
+                 * left multiple frames (e.g. DHCP OFFERs buried behind IPv6
+                 * multicast bursts) stuck in the ring for seconds.
+                 *
+                 * Loop condition:
+                 *  flen > 0  → valid frame delivered, keep draining
+                 *  flen == 0 → no frame OR error/oversized frame was skipped
+                 *              (consumer index still advanced);
+                 *              genet_rx_available() > 0 means ring not empty
+                 *  flen == -1 → driver not init → stop
+                 *
+                 * We drain until (flen < 0) OR (flen == 0 AND ring empty).   */
                 int flen;
-                while ((flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME)) > 13) {
+                while ((flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME)) >= 0
+                       && (flen > 0 || genet_rx_available() > 0)) {
+                if (flen > 13) {
                     uint16_t etype = (uint16_t)
                         ((g_rx_frame[12] << 8) | g_rx_frame[13]);
 
@@ -576,24 +435,16 @@ void wimp_task(void)
                         uint16_t op = (uint16_t)
                             ((g_rx_frame[20] << 8) | g_rx_frame[21]);
                         if (op == 1 &&
-                            g_rx_frame[38] == our_ip[0] &&
-                            g_rx_frame[39] == our_ip[1] &&
-                            g_rx_frame[40] == our_ip[2] &&
-                            g_rx_frame[41] == our_ip[3]) {
+                            g_rx_frame[38] == g_our_ip[0] &&
+                            g_rx_frame[39] == g_our_ip[1] &&
+                            g_rx_frame[40] == g_our_ip[2] &&
+                            g_rx_frame[41] == g_our_ip[3]) {
                             static uint8_t reply[60];
                             for (int _i=0;_i<60;_i++) reply[_i]=0;
-                            /* boot340: unicast ARP reply — dst = requester's MAC.
-                             * RFC 826 requires unicast ARP replies.  boot329 used
-                             * broadcast ff:ff:ff:ff:ff:ff in case the switch had not
-                             * yet learned the requester's port, but the requester
-                             * just sent us an ARP request — the switch has already
-                             * learned its port from that frame.  More importantly,
-                             * many host stacks (macOS, BSD) only update their ARP
-                             * cache from unicast replies; a broadcast reply is
-                             * accepted as a frame but not used to fill the cache,
-                             * causing repeated ARP retries and "Host is down" ping
-                             * errors.  Switch to unicast to match RFC 826. */
-                            for (int _i=0;_i<6;_i++) reply[_i]   = g_rx_frame[6+_i];
+                            /* boot329: broadcast dst (ff:ff:ff:ff:ff:ff) so
+                             * the pinger receives the reply even if the switch
+                             * drops unicast frames to an unknown MAC address. */
+                            for (int _i=0;_i<6;_i++) reply[_i]   = 0xff;
                             for (int _i=0;_i<6;_i++) reply[6+_i] = g_genet_mac[_i];
                             reply[12]=0x08; reply[13]=0x06;
                             reply[14]=0x00; reply[15]=0x01;
@@ -601,7 +452,7 @@ void wimp_task(void)
                             reply[18]=6;    reply[19]=4;
                             reply[20]=0x00; reply[21]=0x02;
                             for (int _i=0;_i<6;_i++) reply[22+_i] = g_genet_mac[_i];
-                            for (int _i=0;_i<4;_i++) reply[28+_i] = our_ip[_i];
+                            for (int _i=0;_i<4;_i++) reply[28+_i] = g_our_ip[_i];
                             for (int _i=0;_i<6;_i++) reply[32+_i] = g_rx_frame[22+_i];
                             for (int _i=0;_i<4;_i++) reply[38+_i] = g_rx_frame[28+_i];
                             /* boot329: TX diagnostics — confirm TDMA consuming */
@@ -610,124 +461,32 @@ void wimp_task(void)
                             int arp_rc = genet_send(reply, 60);
                             uint32_t tx_prod_post=0, tx_cons_post=0;
                             genet_tx_diag(&tx_prod_post, &tx_cons_post);
-                            /* boot339: split long debug_print into three
-                             * calls of ≤7 args each to avoid AArch64 stack
-                             * spill that printed SHA/SPA/TPA as zeros.      */
+                            /* boot352: split into ≤7-arg calls — AArch64 bare-metal
+                             * debug_print puts args 8+ on the stack; va_arg can't
+                             * read stack args → they print as 0. Split prevents
+                             * SHA=dc:a6:32:00:00:00 / SPA=0.0.0.0 in the log.  */
                             debug_print(
-                                "[ARP] reply rc=%d"
-                                " tx_prod=%u->%u tx_cons=%u->%u\n",
+                                "[ARP] reply: rc=%d tx_prod=%u->%u tx_cons=%u->%u\n",
                                 arp_rc,
                                 (unsigned)tx_prod_pre,  (unsigned)tx_prod_post,
                                 (unsigned)tx_cons_pre,  (unsigned)tx_cons_post);
                             debug_print(
-                                "[ARP]  SHA=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                                g_genet_mac[0], g_genet_mac[1],
-                                g_genet_mac[2], g_genet_mac[3],
-                                g_genet_mac[4], g_genet_mac[5]);
-                            debug_print(
-                                "[ARP]  SPA=%d.%d.%d.%d"
-                                " TPA=%d.%d.%d.%d\n",
-                                our_ip[0], our_ip[1],
-                                our_ip[2], our_ip[3],
+                                "[ARP]   SHA=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                                g_genet_mac[0], g_genet_mac[1], g_genet_mac[2],
+                                g_genet_mac[3], g_genet_mac[4], g_genet_mac[5]);
+                            debug_print("[ARP]   SPA=%d.%d.%d.%d\n",
+                                g_our_ip[0], g_our_ip[1],
+                                g_our_ip[2], g_our_ip[3]);
+                            debug_print("[ARP]   TPA=%d.%d.%d.%d\n",
                                 g_rx_frame[28], g_rx_frame[29],
                                 g_rx_frame[30], g_rx_frame[31]);
                         }
                     }
 
-                    /* boot334: DHCP reply (UDP port 68).
-                     * IP frame: [23]=proto [14]=ver/IHL
-                     * IHL lets us find the UDP header even with options.
-                     * DHCP: op=BOOTREPLY(2), xid must match g_dhcp_xid,
-                     * magic cookie at dhcp_off+236.                     */
-                    if (g_rx_frame[23] == 0x11 && flen >= 300) {
-                        int ihl2     = (g_rx_frame[14] & 0x0f) * 4;
-                        int udp_off  = 14 + ihl2;
-                        int doff     = udp_off + 8;   /* DHCP payload  */
-                        int udp_dp   = (g_rx_frame[udp_off+2]<<8)|
-                                        g_rx_frame[udp_off+3];
-                        if (udp_dp == 68 &&
-                            flen >= doff + 240 &&
-                            g_rx_frame[doff+0] == 0x02 &&     /* BOOTREPLY */
-                            g_rx_frame[doff+4] == g_dhcp_xid[0] &&
-                            g_rx_frame[doff+5] == g_dhcp_xid[1] &&
-                            g_rx_frame[doff+6] == g_dhcp_xid[2] &&
-                            g_rx_frame[doff+7] == g_dhcp_xid[3] &&
-                            g_rx_frame[doff+236] == 0x63 &&
-                            g_rx_frame[doff+237] == 0x82 &&
-                            g_rx_frame[doff+238] == 0x53 &&
-                            g_rx_frame[doff+239] == 0x63) {
-                            /* Parse options: tag 53=msg type, 54=server ID */
-                            uint8_t dmsg = 0;
-                            uint8_t dsrv[4] = {0,0,0,0};
-                            int p = doff + 240;
-                            while (p < flen && g_rx_frame[p] != 0xff) {
-                                uint8_t tag = g_rx_frame[p++];
-                                if (tag == 0) continue;
-                                if (p >= flen) break;
-                                uint8_t tl = g_rx_frame[p++];
-                                if (tag == 53 && tl >= 1)
-                                    dmsg = g_rx_frame[p];
-                                if (tag == 54 && tl >= 4) {
-                                    dsrv[0]=g_rx_frame[p];
-                                    dsrv[1]=g_rx_frame[p+1];
-                                    dsrv[2]=g_rx_frame[p+2];
-                                    dsrv[3]=g_rx_frame[p+3];
-                                }
-                                p += tl;
-                            }
-                            if (dmsg == DHCP_MSG_OFFER &&
-                                g_dhcp_st == DHCP_ST_DISCOVER) {
-                                /* OFFER received — extract yiaddr, send REQUEST */
-                                for (int _i=0;_i<4;_i++)
-                                    g_dhcp_yiaddr[_i]=g_rx_frame[doff+16+_i];
-                                for (int _i=0;_i<4;_i++)
-                                    g_dhcp_srvid[_i]=dsrv[_i];
-                                debug_print("[DHCP] OFFER %d.%d.%d.%d"
-                                    " from %d.%d.%d.%d\n",
-                                    g_dhcp_yiaddr[0],g_dhcp_yiaddr[1],
-                                    g_dhcp_yiaddr[2],g_dhcp_yiaddr[3],
-                                    g_dhcp_srvid[0], g_dhcp_srvid[1],
-                                    g_dhcp_srvid[2], g_dhcp_srvid[3]);
-                                static uint8_t dreq[342];
-                                dhcp_make(dreq, DHCP_REQUEST);
-                                genet_send(dreq, 342);
-                                g_dhcp_st    = DHCP_ST_REQUEST;
-                                g_dhcp_tries = 0;
-                                last_dhcp    = wimp_ms();
-                            } else if (dmsg == DHCP_MSG_ACK &&
-                                       g_dhcp_st == DHCP_ST_REQUEST) {
-                                /* ACK — bind the offered IP */
-                                for (int _i=0;_i<4;_i++)
-                                    our_ip[_i]=g_rx_frame[doff+16+_i];
-                                g_dhcp_st = DHCP_ST_BOUND;
-                                debug_print("[DHCP] BOUND — IP"
-                                    " %d.%d.%d.%d\n",
-                                    our_ip[0],our_ip[1],
-                                    our_ip[2],our_ip[3]);
-                                /* Gratuitous ARP with our new IP */
-                                static uint8_t garp[60];
-                                for (int _i=0;_i<60;_i++) garp[_i]=0;
-                                for (int _i=0;_i<6;_i++) garp[_i]=0xff;
-                                for (int _i=0;_i<6;_i++) garp[6+_i]=g_genet_mac[_i];
-                                garp[12]=0x08; garp[13]=0x06;
-                                garp[14]=0x00; garp[15]=0x01;
-                                garp[16]=0x08; garp[17]=0x00;
-                                garp[18]=6;    garp[19]=4;
-                                garp[20]=0x00; garp[21]=0x02;
-                                for (int _i=0;_i<6;_i++) garp[22+_i]=g_genet_mac[_i];
-                                for (int _i=0;_i<4;_i++) garp[28+_i]=our_ip[_i];
-                                garp[32]=0xff; garp[33]=0xff; garp[34]=0xff;
-                                garp[35]=0xff; garp[36]=0xff; garp[37]=0xff;
-                                for (int _i=0;_i<4;_i++) garp[38+_i]=our_ip[_i];
-                                genet_send(garp, 60);
-                            } else if (dmsg == DHCP_MSG_NAK) {
-                                debug_print("[DHCP] NAK — restarting\n");
-                                g_dhcp_st    = DHCP_ST_DISCOVER;
-                                g_dhcp_tries = 0;
-                                last_dhcp    = wimp_ms();
-                            }
-                        }
-                    }
+                    /* boot345: DHCP frame handling delegated to PhoenixDHCP.
+                     * dhcp_rx() filters non-DHCP frames internally.
+                     * g_our_ip (exported by dhcp.c) is updated on BOUND.  */
+                    dhcp_rx(g_rx_frame, flen);
 
                     /* boot326: ICMP echo reply (ping).
                      * IPv4 frame layout:
@@ -747,10 +506,10 @@ void wimp_task(void)
                         if (g_rx_frame[23] == 0x01 &&          /* ICMP */
                             g_rx_frame[icmp_off] == 0x08 &&    /* echo request */
                             g_rx_frame[icmp_off+1] == 0x00 &&  /* code 0 */
-                            g_rx_frame[30] == our_ip[0] &&
-                            g_rx_frame[31] == our_ip[1] &&
-                            g_rx_frame[32] == our_ip[2] &&
-                            g_rx_frame[33] == our_ip[3]) {
+                            g_rx_frame[30] == g_our_ip[0] &&
+                            g_rx_frame[31] == g_our_ip[1] &&
+                            g_rx_frame[32] == g_our_ip[2] &&
+                            g_rx_frame[33] == g_our_ip[3]) {
 
                             static uint8_t pkt[1500];
                             int ip_total = (g_rx_frame[16]<<8)|g_rx_frame[17];
@@ -767,7 +526,7 @@ void wimp_task(void)
                             }
                             /* IP: swap src/dst, set TTL=64, clear+redo checksum */
                             for (int _i=0;_i<4;_i++) {
-                                pkt[26+_i] = our_ip[_i];          /* src = us   */
+                                pkt[26+_i] = g_our_ip[_i];          /* src = us   */
                                 pkt[30+_i] = g_rx_frame[26+_i];   /* dst = them */
                             }
                             pkt[22] = 64;    /* TTL */
@@ -802,12 +561,8 @@ void wimp_task(void)
                                  g_rx_frame[icmp_off+7]);
                         }
                     }
-                }
-                /* boot344: re-arm RXDMA_DONE IRQ now that the ring is empty.
-                 * Unmasks INTRL2 RXDMA_DONE so the next arriving frame fires
-                 * a fresh IRQ.  If a frame arrived while masked, the SPI line
-                 * re-asserts the moment we unmask → one clean IRQ → next iter. */
-                genet_rx_irq_rearm();
+                } /* if (flen > 13) */
+                } /* while drain loop */
             }
         }
 
@@ -906,27 +661,4 @@ loop_exit:
 
 void paint_task(void)    { while(1) { yield(); } }
 void netsurf_task(void)  { while(1) { yield(); } }
-
-void mmu_free_pagetable(task_t *task) { (void)task; }
-void mmu_free_usermemory(task_t *task) { (void)task; }
-
-/* Dummy symbols - declared in kernel.c */
-extern int nr_cpus;
-extern task_t *current_task;
-extern char exception_vectors[];
-
-/* Atomic operations stub */
-int __aarch64_ldadd4_acq_rel(int val, int *ptr) {
-    int old = *ptr;
-    *ptr += val;
-    return old;
-}
-
-/* Get current CPU ID from MPIDR_EL1 */
-int get_cpu_id(void) {
-    uint64_t mpidr;
-    __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
-    return (int)(mpidr & 0xFF);
-}
-
 /* strncpy_safe is defined as a static inline in kernel/error.h */

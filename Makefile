@@ -29,7 +29,8 @@ endif
 # ── Flags ────────────────────────────────────────────────────────────────────
 CFLAGS  = -Wall -O2 -ffreestanding -mcpu=$(CPU) -mgeneral-regs-only \
           -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp \
-          -DPI_MODEL=$(BOARD_ID)
+          -DPI_MODEL=$(BOARD_ID) \
+          -mno-outline-atomics
 
 ASFLAGS = -mcpu=$(CPU)
 
@@ -97,12 +98,14 @@ OBJS = \
     net/tcp.o \
     net/udp.o \
     net/arp.o \
+    net/dhcp.o \
     wimp/wimp.o \
     wimp/window.o \
     wimp/event.o \
     wimp/menu.o \
     apps/paint.o \
-    apps/netsurf.o
+    apps/netsurf.o \
+    Tests/dhcp_test_module.o
 
 TARGET = phoenix64.img
 
