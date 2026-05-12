@@ -394,3 +394,7 @@ void mmu_tlb_invalidate_addr(uint64_t virt, uint64_t size) {
     (void)size;
     asm volatile("tlbi vae1is, %0\ndsb ish\nisb" :: "r"(virt >> 12) : "memory");
 }
+
+/* boot352 stubs — full per-task page table teardown is future work */
+void mmu_free_pagetable(task_t *task)   { (void)task; }
+void mmu_free_usermemory(task_t *task)  { (void)task; }

@@ -254,3 +254,11 @@ void halt_system(void)
     debug_print("\n!!! KERNEL PANIC – system halted !!!\n");
     while (1) __asm__ volatile ("wfi");
 }
+
+/* boot352: read CPU affinity level-0 from MPIDR_EL1 bits [1:0] */
+int get_cpu_id(void)
+{
+    uint64_t mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (int)(mpidr & 0x3u);
+}
