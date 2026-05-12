@@ -358,12 +358,12 @@ static void genet_init_rings(int qid)
     DSB();
 
     /* Arm all 64 slots: WRITE_PTR = RX_DESC_COUNT × 3 words = 192.
-     * WRITE_PTR is a free-running word counter.  Setting it to 192 tells
-     * hardware "software has prepared 64 buffers."  WRITE_PTR=0 at init
+     * WRITE_PTR is a 16-bit free-running word-address counter.  Setting it
+     * to 192 tells hardware "64 buffer slots are prepared."  WRITE_PTR=0
      * means "ring empty" — that was why RDMA=BROKEN in boot322-328.
-     * boot346: must write to HARDWARE register — g_rx_write_ptr alone is
-     * insufficient; hardware reads WRITE_PTR_LO, not the C variable.
-     * Each genet_poll_rx re-arm increments g_rx_write_ptr by 3.            */
+     * Each genet_poll_rx re-arm increments g_rx_write_ptr by 3 to keep
+     * (WRITE_PTR - PROD_INDEX*3) == 64 slots worth = 192 words.
+     * boot364: restored after boot351 incorrectly removed per-frame updates. */
     g_rx_write_ptr = (uint32_t)(RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4);
     GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
     /* WRITE_PTR_HI already 0 from line above */
@@ -560,7 +560,7 @@ void genet_init(void)
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    debug_print("[GENET] init complete (boot351 no-per-frame-WRITE_PTR)\n");
+    debug_print("[GENET] init complete (boot364 +3-per-rearm-WRITE_PTR)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */
@@ -794,9 +794,20 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
     GW4(GENET_RX_DESC_ADDRESS_LO(idx), paddr);
     GW4(GENET_RX_DESC_ADDRESS_HI(idx), 0);
     GW4(GENET_RX_DESC_STATUS(idx),     0);   /* STATUS=0 = hardware-owned  */
-    /* boot351: do NOT update WRITE_PTR per-frame — set once at init only.
-     * Per-frame writes cause GENETv5 RDMA to phantom-advance PROD_INDEX,
-     * producing STATUS=0 ghost frames.  NetBSD sets WRITE_PTR once only.  */
+    /* boot364: restore free-running WRITE_PTR increment per re-arm.
+     * WRITE_PTR is a 16-bit free-running WORD counter.  hardware computes:
+     *   available_slots = (WRITE_PTR - PROD_INDEX*3) / 3
+     * At init WRITE_PTR=192 and PROD_INDEX=0 → 64 slots available ✓
+     * Without incrementing: after consuming 64 frames PROD_INDEX=64 and
+     * PROD_INDEX*3=192 = WRITE_PTR → available=0 → hardware stops DMA'ing
+     * → STATUS=0 phantom cascade until ring wraps back to position 0.
+     * boot341 proved +3 per re-arm is correct (boot342-343 had ~97% ping
+     * delivery with this in place).  boot351 wrongly removed it under the
+     * theory that per-frame writes caused phantoms — the real boot350 bug
+     * was (cidx%64)*3 collapsing WRITE_PTR, not the per-frame write itself.*/
+    g_rx_write_ptr = (g_rx_write_ptr + (GENET_DMA_DESC_SIZE / 4)) & 0xffff;
+    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
+    GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
 
     if (status & GENET_RX_DESC_STATUS_ALL_ERRS) {
         if (status & GENET_RX_DESC_STATUS_CRC_ERR)
