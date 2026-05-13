@@ -503,7 +503,7 @@ void genet_init(void)
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    debug_print("[GENET] init complete (boot369 no-loopback no-writeptr)\n");
+    debug_print("[GENET] init complete (boot373 TCP response visible+clean close)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */

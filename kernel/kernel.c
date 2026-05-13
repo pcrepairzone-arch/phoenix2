@@ -48,7 +48,7 @@ extern void filecore_init(void);        /* kernel/filecore.c */
 extern void filecore_list_root(void);   /* kernel/filecore.c */
 extern void filecore_show_results(void);/* kernel/filecore.c */
 extern void module_init_all(void);      /* kernel/module.c   */
-extern void net_init(void);             /* net/tcpip.c (stub)       */
+extern void tcpip_init(void);           /* net/tcpip.c — PhoenixTCPIP dispatcher */
 extern void genet_init(void);           /* drivers/net/genet.c      */
 extern void wimp_init(void);            /* wimp/wimp.c (stub)       */
 extern void register_default_handlers(void); /* kernel/signal.c    */
@@ -200,7 +200,7 @@ void kernel_main(uint64_t dtb_ptr)
                              * dhcp_module_init saw all-zero MAC then the wimp
                              * task had to call dhcp_init(g_genet_mac) a second
                              * time on link-up.  Correct order eliminates that. */
-    net_init();
+    tcpip_init();           /* boot370: init ARP table, IPv4, TCP, UDP modules */
     module_init_all();      /* PhoenixDHCP.init blocks here: waits for link,
                              * completes DISCOVER→BOUND, stores full lease.
                              * wimp_task() starts with IP already bound.       */

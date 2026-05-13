@@ -8,6 +8,8 @@
 #include "drivers/gpu/framebuffer.h"
 /* boot303: Ethernet link + ARP */
 #include "drivers/net/genet.h"
+/* boot370: PhoenixTCPIP dispatcher — replaces inline ARP/ICMP handlers */
+#include "net/net.h"
 
 /* Forward declare UART functions */
 extern void uart_putc(char c);
@@ -300,7 +302,7 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot369  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot373  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 
@@ -403,148 +405,135 @@ void wimp_task(void)
                 int flen;
                 while ((flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME)) >= 0
                        && (flen > 0 || genet_rx_available() > 0)) {
-                if (flen > 13) {
-                    uint16_t etype = (uint16_t)
-                        ((g_rx_frame[12] << 8) | g_rx_frame[13]);
-
-                    /* ARP reply handler — answer who-has for our IP */
-                    if (etype == 0x0806 && flen >= 42) {
-                        uint16_t op = (uint16_t)
-                            ((g_rx_frame[20] << 8) | g_rx_frame[21]);
-                        if (op == 1 &&
-                            g_rx_frame[38] == g_our_ip[0] &&
-                            g_rx_frame[39] == g_our_ip[1] &&
-                            g_rx_frame[40] == g_our_ip[2] &&
-                            g_rx_frame[41] == g_our_ip[3]) {
-                            static uint8_t reply[60];
-                            for (int _i=0;_i<60;_i++) reply[_i]=0;
-                            /* boot368: unicast dst — send ARP reply directly to
-                             * the requester's Ethernet source MAC (frame[6..11]).
-                             * boot329 used broadcast (ff:ff:ff:ff:ff:ff) to work
-                             * around potential unknown-unicast drops, but that
-                             * caused DUP! replies on the pinger and flooded the
-                             * switch, driving RTT spikes.  By the time we receive
-                             * a who-has, the requester is already reachable (DHCP
-                             * completed, grat-ARP sent) so unicast is correct. */
-                            for (int _i=0;_i<6;_i++) reply[_i]   = g_rx_frame[6+_i];
-                            for (int _i=0;_i<6;_i++) reply[6+_i] = g_genet_mac[_i];
-                            reply[12]=0x08; reply[13]=0x06;
-                            reply[14]=0x00; reply[15]=0x01;
-                            reply[16]=0x08; reply[17]=0x00;
-                            reply[18]=6;    reply[19]=4;
-                            reply[20]=0x00; reply[21]=0x02;
-                            for (int _i=0;_i<6;_i++) reply[22+_i] = g_genet_mac[_i];
-                            for (int _i=0;_i<4;_i++) reply[28+_i] = g_our_ip[_i];
-                            for (int _i=0;_i<6;_i++) reply[32+_i] = g_rx_frame[22+_i];
-                            for (int _i=0;_i<4;_i++) reply[38+_i] = g_rx_frame[28+_i];
-                            /* boot329: TX diagnostics — confirm TDMA consuming */
-                            uint32_t tx_prod_pre=0, tx_cons_pre=0;
-                            genet_tx_diag(&tx_prod_pre, &tx_cons_pre);
-                            int arp_rc = genet_send(reply, 60);
-                            uint32_t tx_prod_post=0, tx_cons_post=0;
-                            genet_tx_diag(&tx_prod_post, &tx_cons_post);
-                            /* boot352: split into ≤7-arg calls — AArch64 bare-metal
-                             * debug_print puts args 8+ on the stack; va_arg can't
-                             * read stack args → they print as 0. Split prevents
-                             * SHA=dc:a6:32:00:00:00 / SPA=0.0.0.0 in the log.  */
-                            debug_print(
-                                "[ARP] reply: rc=%d tx_prod=%u->%u tx_cons=%u->%u\n",
-                                arp_rc,
-                                (unsigned)tx_prod_pre,  (unsigned)tx_prod_post,
-                                (unsigned)tx_cons_pre,  (unsigned)tx_cons_post);
-                            debug_print(
-                                "[ARP]   SHA=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                                g_genet_mac[0], g_genet_mac[1], g_genet_mac[2],
-                                g_genet_mac[3], g_genet_mac[4], g_genet_mac[5]);
-                            debug_print("[ARP]   SPA=%d.%d.%d.%d\n",
-                                g_our_ip[0], g_our_ip[1],
-                                g_our_ip[2], g_our_ip[3]);
-                            debug_print("[ARP]   TPA=%d.%d.%d.%d\n",
-                                g_rx_frame[28], g_rx_frame[29],
-                                g_rx_frame[30], g_rx_frame[31]);
-                        }
-                    }
-
-                    /* boot369: dhcp_rx() removed from wimp RX dispatch.
-                     * DHCP exchange is complete before wimp_task starts.
-                     * Frames arriving here are not DHCP — they are ARP,
-                     * ICMP ping, or background multicast traffic.          */
-
-                    /* boot326: ICMP echo reply (ping).
-                     * IPv4 frame layout:
-                     *  [14]    version+IHL (0x45 = v4, 20-byte header)
-                     *  [23]    protocol (0x01 = ICMP)
-                     *  [24-25] IP header checksum
-                     *  [26-29] src IP
-                     *  [30-33] dst IP
-                     *  [34]    ICMP type (8=echo request, 0=echo reply)
-                     *  [35]    ICMP code
-                     *  [36-37] ICMP checksum
-                     *  [38+]   ICMP id, seq, data (echo back verbatim)  */
-                    if (etype == 0x0800 && flen >= 42) {
-                        int ihl = (g_rx_frame[14] & 0x0f) * 4;
-                        int icmp_off = 14 + ihl;
-                        /* ICMP echo request to our IP? */
-                        if (g_rx_frame[23] == 0x01 &&          /* ICMP */
-                            g_rx_frame[icmp_off] == 0x08 &&    /* echo request */
-                            g_rx_frame[icmp_off+1] == 0x00 &&  /* code 0 */
-                            g_rx_frame[30] == g_our_ip[0] &&
-                            g_rx_frame[31] == g_our_ip[1] &&
-                            g_rx_frame[32] == g_our_ip[2] &&
-                            g_rx_frame[33] == g_our_ip[3]) {
-
-                            static uint8_t pkt[1500];
-                            int ip_total = (g_rx_frame[16]<<8)|g_rx_frame[17];
-                            int pkt_len  = 14 + ip_total;
-                            if (pkt_len > flen) pkt_len = flen;
-
-                            /* Copy entire frame then patch fields */
-                            for (int _i=0;_i<pkt_len;_i++) pkt[_i]=g_rx_frame[_i];
-
-                            /* Ethernet: swap src/dst MAC */
-                            for (int _i=0;_i<6;_i++) {
-                                pkt[_i]   = g_rx_frame[6+_i]; /* dst = sender */
-                                pkt[6+_i] = g_genet_mac[_i];  /* src = us    */
-                            }
-                            /* IP: swap src/dst, set TTL=64, clear+redo checksum */
-                            for (int _i=0;_i<4;_i++) {
-                                pkt[26+_i] = g_our_ip[_i];          /* src = us   */
-                                pkt[30+_i] = g_rx_frame[26+_i];   /* dst = them */
-                            }
-                            pkt[22] = 64;    /* TTL */
-                            pkt[24] = 0; pkt[25] = 0; /* zero checksum field */
-                            /* IP header checksum (one's complement sum) */
-                            uint32_t ck = 0;
-                            for (int _i=14; _i<14+ihl; _i+=2)
-                                ck += (uint32_t)((pkt[_i]<<8)|pkt[_i+1]);
-                            while (ck>>16) ck=(ck&0xffff)+(ck>>16);
-                            ck = ~ck & 0xffff;
-                            pkt[24]=(uint8_t)(ck>>8); pkt[25]=(uint8_t)ck;
-
-                            /* ICMP: type=0 (reply), clear+redo checksum */
-                            pkt[icmp_off] = 0x00;
-                            pkt[icmp_off+2] = 0; pkt[icmp_off+3] = 0;
-                            int icmp_len = ip_total - ihl;
-                            ck = 0;
-                            for (int _i=0; _i<icmp_len; _i+=2)
-                                ck += (uint32_t)((pkt[icmp_off+_i]<<8)|
-                                      (_i+1<icmp_len?pkt[icmp_off+_i+1]:0));
-                            while (ck>>16) ck=(ck&0xffff)+(ck>>16);
-                            ck = ~ck & 0xffff;
-                            pkt[icmp_off+2]=(uint8_t)(ck>>8);
-                            pkt[icmp_off+3]=(uint8_t)ck;
-
-                            genet_send(pkt, pkt_len);
-                            debug_print("[ICMP] echo reply → "
-                                "%d.%d.%d.%d seq=%d\n",
-                                g_rx_frame[26],g_rx_frame[27],
-                                g_rx_frame[28],g_rx_frame[29],
-                                (g_rx_frame[icmp_off+6]<<8)|
-                                 g_rx_frame[icmp_off+7]);
-                        }
-                    }
-                } /* if (flen > 13) */
+                /* boot370: PhoenixTCPIP dispatcher.
+                 * Replaces 140 lines of inline ARP + ICMP handlers
+                 * (boot326/368/369). All protocol handling now lives in
+                 * net/arp.c, net/ipv4.c, net/tcp.c — proper RISC OS
+                 * module separation.  net_rx_frame() dispatches by
+                 * EtherType: ARP → arp_input, IPv4 → ipv4_input
+                 * (which further dispatches ICMP/TCP/UDP).            */
+                if (flen > 13)
+                    net_rx_frame(g_rx_frame, flen);
                 } /* while drain loop */
+            }
+        }
+
+        /* ── TCP connect test (boot372) ────────────────────────────────
+         * One-shot HTTP GET to the LAN router (192.168.0.1:80).
+         *
+         * boot371 lesson: wimp_ms() counts from boot so now_t≥2000
+         * is already true at WIMP start — SYN fired before the router's
+         * ARP broadcast arrived, dropped on ARP miss, then timed out.
+         *
+         * Two fixes applied here:
+         *  1. Track time since WIMP start (s_wimp_start), wait 5 s.
+         *     The router broadcasts an ARP within ~3 s of WIMP start
+         *     so this gives a comfortable margin.
+         *  2. Retransmit SYN every 1 s via tcp_tick() while in
+         *     SYN_SENT — if the first SYN still misses the ARP window,
+         *     the next tick will catch the now-cached MAC.
+         *
+         * State machine (s_phase):
+         *   0 → waiting 5 s from WIMP start then fire tcp_connect()
+         *   1 → SYN_SENT: retransmit every 1 s, wait for ESTABLISHED
+         *   2 → ESTABLISHED: send HTTP/1.0 GET
+         *   3 → reading response chunks until connection closes
+         *   4 → done (success or timeout)
+         *
+         * tcp_rx() is driven by net_rx_frame() in the drain loop
+         * above — state machine advances automatically.              */
+        {
+            static int      s_phase     = 0;
+            static int      s_handle    = -1;
+            static uint32_t s_t0        = 0;   /* time of tcp_connect call */
+            static uint32_t s_last_syn  = 0;   /* last SYN retransmit time */
+            static uint32_t s_wimp_start= 0;   /* time wimp loop started   */
+
+            uint32_t now_t = wimp_ms();
+
+            /* Record WIMP loop start time once */
+            if (s_wimp_start == 0) s_wimp_start = now_t;
+
+            /* Phase 0: wait 5 s from WIMP start then fire SYN */
+            if (s_phase == 0 &&
+                (now_t - s_wimp_start) >= 5000u) {
+                static const uint8_t router_ip[4] = {192, 168, 0, 1};
+                s_handle = tcp_connect(router_ip, 80);
+                s_t0       = now_t;
+                s_last_syn = now_t;
+                if (s_handle >= 0) {
+                    s_phase = 1;
+                    debug_print("[TCPtest] SYN → 192.168.0.1:80 handle=%d\n",
+                        s_handle);
+                } else {
+                    debug_print("[TCPtest] tcp_connect failed (no free slot)\n");
+                    s_phase = 4;
+                }
+            }
+
+            /* Phase 1: SYN sent.
+             * Retransmit every 1 s via tcp_tick() so an initial ARP miss
+             * is recovered once the router's ARP broadcast arrives.
+             * Give up after 15 s total.                               */
+            if (s_phase == 1 && s_handle >= 0) {
+                int st = tcp_state(s_handle);
+                if (st == TCPS_ESTABLISHED) {
+                    static const char req[] =
+                        "GET / HTTP/1.0\r\n"
+                        "Host: 192.168.0.1\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+                    int sent = tcp_write(s_handle,
+                                         (const uint8_t *)req,
+                                         sizeof(req) - 1);
+                    s_phase = 2;
+                    debug_print("[TCPtest] ESTABLISHED — GET sent (%d bytes)\n",
+                        sent);
+                } else {
+                    /* Retransmit SYN every 1 s */
+                    if ((now_t - s_last_syn) >= 1000u) {
+                        s_last_syn = now_t;
+                        tcp_tick(s_handle);
+                    }
+                    /* 15 s overall timeout */
+                    if ((now_t - s_t0) > 15000u) {
+                        debug_print("[TCPtest] SYN gave up state=%d\n", st);
+                        tcp_close(s_handle);
+                        s_phase = 4;
+                    }
+                }
+            }
+
+            /* Phase 2/3: read response chunks, log them, detect close */
+            if ((s_phase == 2 || s_phase == 3) && s_handle >= 0) {
+                static uint8_t rxbuf[128];
+                int n = tcp_read(s_handle, rxbuf, (int)sizeof(rxbuf) - 1);
+                if (n > 0) {
+                    rxbuf[n] = '\0';
+                    debug_print("[TCPtest] rx %d bytes\n", n);
+                    debug_print("[TCPtest] %s\n", (char *)rxbuf);
+                    s_phase = 3;
+                }
+                int st = tcp_state(s_handle);
+                if (st == TCPS_CLOSED || st == TCPS_TIME_WAIT) {
+                    debug_print("[TCPtest] connection closed — done\n");
+                    tcp_close(s_handle);
+                    s_phase = 4;
+                }
+                /* FIN_WAIT_2: our FIN was ACKed but no more FIN from peer
+                 * (already consumed in ESTABLISHED simultaneous close).
+                 * Only finalise when buffer is drained to avoid losing the
+                 * last data bytes that may have arrived with the server FIN. */
+                if ((st == TCPS_FIN_WAIT_2 || st == TCPS_CLOSE_WAIT) && n <= 0) {
+                    debug_print("[TCPtest] peer done (st=%d) — closing\n", st);
+                    tcp_close(s_handle);
+                    s_phase = 4;
+                }
+                if (s_phase != 4 && (now_t - s_t0) > 20000u) {
+                    debug_print("[TCPtest] rx timeout — closing\n");
+                    tcp_close(s_handle);
+                    s_phase = 4;
+                }
             }
         }
 

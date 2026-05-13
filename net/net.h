@@ -1,7 +1,11 @@
 /*
- * net.h – Network Headers for RISC OS Phoenix
- * Defines netdev_t, socket_t, eth_hdr_t, and constants
- * Author: R Andrews  – 10 Dec 2025
+ * net.h – PhoenixNet public API
+ * boot370: complete rewrite. Removed Linux-derived netdev_t / net_queue_t /
+ * socket_t cruft that referenced undefined types (spinlock_t, socklen_t).
+ * All protocol modules use raw uint8_t frame buffers and genet_send()
+ * directly — no netdev abstraction layer needed for a single-NIC kernel.
+ *
+ * Author: R Andrews – boot370 (based on original 10 Dec 2025 skeleton)
  */
 
 #ifndef NET_H
@@ -9,88 +13,67 @@
 
 #include <stdint.h>
 
-#define ETH_HDR_SIZE    14
+/* ----------------------------------------------------------------
+ * Ethernet constants (shared by all net/ modules)
+ * ---------------------------------------------------------------- */
+#define ETH_HDR_LEN     14
 #define ETH_MTU         1500
 #define ETH_P_ARP       0x0806
 #define ETH_P_IP        0x0800
 #define ETH_P_IPV6      0x86DD
 
-typedef struct eth_hdr {
-    uint8_t  dst[6];
-    uint8_t  src[6];
-    uint16_t type;
-} eth_hdr_t;
+/* ----------------------------------------------------------------
+ * PhoenixTCPIP — EtherType frame dispatcher (net/tcpip.c)
+ * ---------------------------------------------------------------- */
+void  tcpip_init   (void);
+void  net_rx_frame (uint8_t *frame, int len);
 
-typedef struct netdev {
-    char     name[16];
-    uint8_t  mac[6];
-    net_queue_t *rx_queue;
-    net_queue_t *tx_queue;
-    void     (*tx_func)(struct netdev *dev, void *pkt, size_t len);
-    // IP config, MTU, etc.
-} netdev_t;
+/* ----------------------------------------------------------------
+ * PhoenixARP — RFC 826 ARP handler + 16-entry cache (net/arp.c)
+ * ---------------------------------------------------------------- */
+void  arp_init     (void);
+void  arp_input    (uint8_t *frame, int len);
+int   arp_resolve  (const uint8_t ip[4], uint8_t mac_out[6]);
 
-typedef struct net_queue {
-    void    *packets[1024];
-    size_t   sizes[1024];
-    int      head, tail;
-    spinlock_t lock;
-} net_queue_t;
+/* ----------------------------------------------------------------
+ * PhoenixIPv4 — IPv4 input dispatch + ICMP echo + output (net/ipv4.c)
+ * ---------------------------------------------------------------- */
+void  ipv4_init    (void);
+void  ipv4_input   (uint8_t *frame, int len);
+void  ipv4_output  (const uint8_t dst_mac[6], const uint8_t dst_ip[4],
+                    uint8_t proto, const uint8_t *payload, int payload_len);
 
-#define AF_INET         2
-#define AF_INET6        10
-#define SOCK_STREAM     1
-#define SOCK_DGRAM      2
+/* ----------------------------------------------------------------
+ * PhoenixIPv6 — stub, silently drops all IPv6 frames (net/ipv6.c)
+ * ---------------------------------------------------------------- */
+void  ipv6_init    (void);
+void  ipv6_input   (uint8_t *frame, int len);
 
-typedef struct sockaddr {
-    uint16_t sa_family;
-    char     sa_data[14];
-} sockaddr_t;
+/* ----------------------------------------------------------------
+ * PhoenixTCP — RFC 793 TCP client state machine (net/tcp.c)
+ * TCP state numbers from Inet6Sources obsd/Lib/netinet/h/tcp_fsm
+ * ---------------------------------------------------------------- */
+#define TCPS_CLOSED       0
+#define TCPS_SYN_SENT     2
+#define TCPS_ESTABLISHED  4
+#define TCPS_CLOSE_WAIT   5
+#define TCPS_FIN_WAIT_1   6
+#define TCPS_FIN_WAIT_2   9
+#define TCPS_TIME_WAIT    10
 
-typedef struct sockaddr_in {
-    uint16_t sin_family;
-    uint16_t sin_port;
-    uint32_t sin_addr;
-    char     sin_zero[8];
-} sockaddr_in_t;
+void  tcp_init     (void);
+void  tcp_rx       (uint8_t *frame, int len);
+void  tcp_tick     (int handle);   /* retransmit SYN if still in SYN_SENT */
+int   tcp_connect  (const uint8_t dst_ip[4], uint16_t dst_port);
+int   tcp_state    (int handle);
+int   tcp_write    (int handle, const uint8_t *data, int len);
+int   tcp_read     (int handle, uint8_t *buf, int bufsz);
+void  tcp_close    (int handle);
 
-typedef struct socket socket_t;
-
-void netdev_register(netdev_t *dev);
-void net_rx_packet(netdev_t *dev, void *data, size_t len);
-void net_tx_packet(netdev_t *dev, void *pkt, size_t len);
-
-void net_queue_init(net_queue_t *q);
-void net_queue_enqueue(net_queue_t *q, void *pkt, size_t len);
-int net_queue_dequeue(net_queue_t *q, void **pkt, size_t *len);
-
-int socket_create(int domain, int type, int protocol);
-socket_t *socket_get(int fd);
-int socket_bind(socket_t *sock, const sockaddr_t *addr, socklen_t addrlen);
-int socket_listen(socket_t *sock, int backlog);
-int socket_accept(socket_t *sock, sockaddr_t *addr, socklen_t *addrlen);
-int socket_connect(socket_t *sock, const sockaddr_t *addr, socklen_t addrlen);
-ssize_t socket_send(socket_t *sock, const void *buf, size_t len, int flags);
-ssize_t socket_recv(socket_t *sock, void *buf, size_t len, int flags);
-
-void arp_init(void);
-void arp_input(netdev_t *dev, void *data, size_t len);
-int arp_resolve(netdev_t *dev, uint32_t ip, uint8_t *mac);
-
-void ipv4_init(void);
-void ipv4_input(netdev_t *dev, void *data, size_t len);
-void ipv4_output(netdev_t *dev, uint32_t dst_ip, uint8_t proto, void *payload, size_t len);
-
-void ipv6_init(void);
-void ipv6_input(netdev_t *dev, void *data, size_t len);
-void ipv6_output(netdev_t *dev, const uint8_t *dst_ip, uint8_t next_hdr, void *payload, size_t len);
-
-void tcp_init(void);
-void tcp_input(netdev_t *dev, void *data, size_t len);
-
-void udp_init(void);
-void udp_input(netdev_t *dev, void *data, size_t len);
-
-uint16_t ip_checksum(void *data, size_t len);
+/* ----------------------------------------------------------------
+ * PhoenixUDP — stub, silently drops all UDP frames (net/udp.c)
+ * ---------------------------------------------------------------- */
+void  udp_init     (void);
+void  udp_rx       (uint8_t *frame, int len);
 
 #endif /* NET_H */
