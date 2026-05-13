@@ -41,6 +41,13 @@ static uint8_t g_dhcp_srvid[4];              /* server identifier option 54 */
 static int     g_dhcp_tries    = 0;           /* retransmit count            */
 static uint32_t g_dhcp_last_ms = 0;           /* timestamp of last send      */
 
+/* ── boot369: full lease store ───────────────────────────────────────────── */
+/* Populated from ACK options; available to any module via query API below.  */
+static uint8_t  g_dhcp_netmask[4]  = { 255, 255, 255,   0 }; /* option  1  */
+static uint8_t  g_dhcp_gateway[4]  = {   0,   0,   0,   0 }; /* option  3  */
+static uint8_t  g_dhcp_dns[4]      = {   0,   0,   0,   0 }; /* option  6  */
+static uint32_t g_dhcp_lease_secs  = 0;                       /* option 51  */
+
 /* XID "PHOE" — constant transaction ID identifies our exchange            */
 static const uint8_t g_dhcp_xid[4]    = { 0x50, 0x48, 0x4F, 0x45 };
 
@@ -184,7 +191,12 @@ void dhcp_init(const uint8_t *mac)
         g_dhcp_yiaddr[i] = 0;
         g_dhcp_srvid[i]  = 0;
         g_our_ip[i]      = 0;
+        g_dhcp_gateway[i] = 0;
+        g_dhcp_dns[i]     = 0;
     }
+    g_dhcp_netmask[0] = 255; g_dhcp_netmask[1] = 255;
+    g_dhcp_netmask[2] = 255; g_dhcp_netmask[3] =   0; /* default /24  */
+    g_dhcp_lease_secs = 0;
     debug_print("[DHCP] module initialised (mac=%02x:%02x:%02x:%02x:%02x:%02x)\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
@@ -311,9 +323,13 @@ void dhcp_rx(const uint8_t *frame, int len)
         return;
     }
 
-    /* Parse options: extract msg-type (53) and server-id (54)             */
-    uint8_t dmsg   = 0;
-    uint8_t dsrv[4] = { 0, 0, 0, 0 };
+    /* Parse options: extract all fields needed for a complete lease        */
+    uint8_t  dmsg      = 0;
+    uint8_t  dsrv[4]   = { 0, 0, 0, 0 };   /* option 54: server identifier */
+    uint8_t  dmask[4]  = { 255, 255, 255, 0 }; /* option  1: subnet mask   */
+    uint8_t  dgw[4]    = { 0, 0, 0, 0 };   /* option  3: router/gateway    */
+    uint8_t  ddns[4]   = { 0, 0, 0, 0 };   /* option  6: DNS server        */
+    uint32_t dlease    = 0;                 /* option 51: IP address lease  */
     int p = doff + 240;
     while (p < len && frame[p] != 0xff) {
         uint8_t tag = frame[p++];
@@ -321,9 +337,27 @@ void dhcp_rx(const uint8_t *frame, int len)
         if (p >= len) break;
         uint8_t tl = frame[p++];
         if (tag == 53 && tl >= 1) dmsg = frame[p];
+        if (tag ==  1 && tl >= 4) {
+            dmask[0]=frame[p]; dmask[1]=frame[p+1];
+            dmask[2]=frame[p+2]; dmask[3]=frame[p+3];
+        }
+        if (tag ==  3 && tl >= 4) {
+            dgw[0]=frame[p]; dgw[1]=frame[p+1];
+            dgw[2]=frame[p+2]; dgw[3]=frame[p+3];
+        }
+        if (tag ==  6 && tl >= 4) {
+            ddns[0]=frame[p]; ddns[1]=frame[p+1];
+            ddns[2]=frame[p+2]; ddns[3]=frame[p+3];
+        }
+        if (tag == 51 && tl >= 4) {
+            dlease = ((uint32_t)frame[p]   << 24) |
+                     ((uint32_t)frame[p+1] << 16) |
+                     ((uint32_t)frame[p+2] <<  8) |
+                      (uint32_t)frame[p+3];
+        }
         if (tag == 54 && tl >= 4) {
-            dsrv[0] = frame[p];     dsrv[1] = frame[p + 1];
-            dsrv[2] = frame[p + 2]; dsrv[3] = frame[p + 3];
+            dsrv[0]=frame[p]; dsrv[1]=frame[p+1];
+            dsrv[2]=frame[p+2]; dsrv[3]=frame[p+3];
         }
         p += tl;
     }
@@ -354,11 +388,24 @@ void dhcp_rx(const uint8_t *frame, int len)
         debug_print("[DHCP] REQUEST sent\n");
 
     } else if (dmsg == DHCP_MSG_ACK && g_dhcp_st == DHCP_ST_REQUEST) {
-        /* ACK — bind the offered IP                                       */
-        for (int i = 0; i < 4; i++) g_our_ip[i] = frame[doff + 16 + i];
+        /* ACK — bind the offered IP and store complete lease              */
+        for (int i = 0; i < 4; i++) g_our_ip[i]       = frame[doff + 16 + i];
+        for (int i = 0; i < 4; i++) g_dhcp_netmask[i] = dmask[i];
+        for (int i = 0; i < 4; i++) g_dhcp_gateway[i] = dgw[i];
+        for (int i = 0; i < 4; i++) g_dhcp_dns[i]     = ddns[i];
+        g_dhcp_lease_secs = dlease;
         g_dhcp_st = DHCP_ST_BOUND;
-        debug_print("[DHCP] BOUND — IP %d.%d.%d.%d\n",
-                    g_our_ip[0], g_our_ip[1], g_our_ip[2], g_our_ip[3]);
+        debug_print("[DHCP] BOUND — IP %d.%d.%d.%d mask %d.%d.%d.%d\n",
+                    g_our_ip[0],       g_our_ip[1],
+                    g_our_ip[2],       g_our_ip[3],
+                    g_dhcp_netmask[0], g_dhcp_netmask[1],
+                    g_dhcp_netmask[2], g_dhcp_netmask[3]);
+        debug_print("[DHCP]        gw %d.%d.%d.%d dns %d.%d.%d.%d lease %us\n",
+                    g_dhcp_gateway[0], g_dhcp_gateway[1],
+                    g_dhcp_gateway[2], g_dhcp_gateway[3],
+                    g_dhcp_dns[0],     g_dhcp_dns[1],
+                    g_dhcp_dns[2],     g_dhcp_dns[3],
+                    (unsigned)g_dhcp_lease_secs);
         _send_grat_arp();
 
     } else if (dmsg == DHCP_MSG_NAK) {
@@ -381,12 +428,102 @@ void dhcp_get_ip(uint8_t out[4])
     for (int i = 0; i < 4; i++) out[i] = g_our_ip[i];
 }
 
+/* ── boot369: full lease query API ──────────────────────────────────────── */
+
+void dhcp_get_gateway(uint8_t out[4])
+{
+    for (int i = 0; i < 4; i++) out[i] = g_dhcp_gateway[i];
+}
+
+void dhcp_get_netmask(uint8_t out[4])
+{
+    for (int i = 0; i < 4; i++) out[i] = g_dhcp_netmask[i];
+}
+
+void dhcp_get_dns(uint8_t out[4])
+{
+    for (int i = 0; i < 4; i++) out[i] = g_dhcp_dns[i];
+}
+
+uint32_t dhcp_get_lease_secs(void)
+{
+    return g_dhcp_lease_secs;
+}
+
 /* ── Module entry points ─────────────────────────────────────────────────── */
 
+/*
+ * dhcp_module_init — boot369 blocking module initialisation.
+ *
+ * Called from module_init_all() AFTER genet_init() so g_genet_mac is live.
+ * This function does not return until the DHCP exchange is complete (BOUND)
+ * or a 30-second timeout triggers the static fallback.
+ *
+ * Sequence:
+ *   1. dhcp_init(g_genet_mac)       — set real MAC, clear state
+ *   2. wait for genet_link_up()     — PHY autoneg (typically ~3.5 s on Pi 4)
+ *   3. genet_apply_link()           — set UMAC to negotiated speed
+ *   4. dhcp_start()                 — send DISCOVER (state set before TX)
+ *   5. tight poll loop              — genet_poll_rx → dhcp_rx → dhcp_tick
+ *                                     until dhcp_bound() or 30 s elapsed
+ *   6. log complete lease           — IP, mask, gateway, DNS, lease time
+ *
+ * On return, g_our_ip, g_dhcp_gateway, g_dhcp_netmask, g_dhcp_dns, and
+ * g_dhcp_lease_secs are all populated.  Any module or stack component can
+ * query them via dhcp_get_ip(), dhcp_get_gateway() etc. without any further
+ * network traffic.
+ *
+ * The wimp_task() no longer drives DHCP at all.  It starts with a bound IP.
+ */
 int dhcp_module_init(void)
 {
+    /* Step 1: initialise with real hardware MAC (g_genet_mac set by
+     * genet_init() which now runs before module_init_all()).              */
     dhcp_init(g_genet_mac);
-    debug_print("[Module] PhoenixDHCP initialised\n");
+
+    /* Step 2: wait for PHY link-up — BCM54213PE autoneg typically 3.5 s  */
+    debug_print("[DHCP] waiting for carrier...\n");
+    uint32_t t0 = _ms();
+    while (!genet_link_up()) {
+        if ((_ms() - t0) > 10000u) {
+            debug_print("[DHCP] no carrier after 10 s — DHCP skipped\n");
+            return 0;   /* wimp task will log link DOWN; no IP yet         */
+        }
+        for (volatile int d = 0; d < 50000; d++) {}  /* don't hammer MDIO */
+    }
+    debug_print("[DHCP] carrier UP after %u ms\n", (unsigned)(_ms() - t0));
+
+    /* Step 3: apply negotiated PHY speed to UMAC                         */
+    genet_apply_link();
+
+    /* Step 4: send DISCOVER (state set BEFORE TX — boot345 race fix)     */
+    dhcp_start();
+
+    /* Step 5: poll until BOUND or 30 s timeout                           */
+    static uint8_t s_frame[GENET_MAX_FRAME];
+    uint32_t t1 = _ms();
+    while (!dhcp_bound()) {
+        int flen = genet_poll_rx(s_frame, GENET_MAX_FRAME);
+        if (flen > 0) dhcp_rx(s_frame, flen);
+        dhcp_tick(_ms());
+        if ((_ms() - t1) > 30000u) {
+            debug_print("[DHCP] 30 s timeout — static fallback applied\n");
+            break;  /* dhcp_tick() already applied static fallback IP     */
+        }
+    }
+
+    /* Step 6: log complete lease so it appears in bootlog                */
+    debug_print("[Module] PhoenixDHCP ready: IP=%d.%d.%d.%d mask=%d.%d.%d.%d\n",
+                g_our_ip[0],       g_our_ip[1],
+                g_our_ip[2],       g_our_ip[3],
+                g_dhcp_netmask[0], g_dhcp_netmask[1],
+                g_dhcp_netmask[2], g_dhcp_netmask[3]);
+    debug_print("[Module] PhoenixDHCP ready: gw=%d.%d.%d.%d dns=%d.%d.%d.%d lease=%us\n",
+                g_dhcp_gateway[0], g_dhcp_gateway[1],
+                g_dhcp_gateway[2], g_dhcp_gateway[3],
+                g_dhcp_dns[0],     g_dhcp_dns[1],
+                g_dhcp_dns[2],     g_dhcp_dns[3],
+                (unsigned)g_dhcp_lease_secs);
     return 0;
 }
 

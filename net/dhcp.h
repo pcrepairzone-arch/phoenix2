@@ -4,13 +4,21 @@
  * Registered as a native Phoenix module via module_register_native().
  *
  * State machine: IDLE → DISCOVER → REQUEST → BOUND
- *   dhcp_start()  — call on link-up; sends DISCOVER (state set BEFORE TX)
- *   dhcp_tick()   — call every ~100 ms from WIMP loop; drives retransmit
- *   dhcp_rx()     — call for every received Ethernet frame (EtherType 0x0800)
+ *   dhcp_start()  — send DISCOVER (state set BEFORE TX — boot345 race fix)
+ *   dhcp_tick()   — retransmit / timeout engine
+ *   dhcp_rx()     — frame handler; silently ignores non-DHCP frames
  *
- * Module init:
+ * boot369 module init (blocking):
  *   Registered in kernel/module.c module_init_all() as "PhoenixDHCP".
- *   dhcp_module_init() calls dhcp_init(g_genet_mac) and returns 0.
+ *   genet_init() now runs BEFORE module_init_all() so g_genet_mac is live.
+ *   dhcp_module_init() blocks until DHCP BOUND (or 30 s static fallback):
+ *     1. dhcp_init(g_genet_mac)  — real MAC, clear state
+ *     2. wait genet_link_up()    — PHY autoneg, up to 10 s
+ *     3. genet_apply_link()      — UMAC speed match
+ *     4. dhcp_start()            — DISCOVER
+ *     5. poll loop               — genet_poll_rx → dhcp_rx → dhcp_tick
+ *   On return the full lease (IP, mask, gw, dns, lease_secs) is stored.
+ *   wimp_task() starts with a bound IP — no DHCP calls needed in the loop.
  *
  * Bug fixes vs inline boot334 version:
  *   [boot345 fix-1] g_dhcp_st set BEFORE genet_send() — closes ISR race window
@@ -63,6 +71,15 @@ int dhcp_bound(void);
 /* dhcp_get_ip — copies current IP into out[4].
  * Always valid to call; returns 0.0.0.0 until BOUND.                    */
 void dhcp_get_ip(uint8_t out[4]);
+
+/* boot369: full lease query API — all populated after module_init returns.
+ * Any module or stack component may call these; no network traffic is made.
+ * Values come from the ACK options; sensible defaults are set if the server
+ * omitted a particular option (e.g. netmask defaults to 255.255.255.0).  */
+void     dhcp_get_gateway   (uint8_t out[4]);   /* option  3: router       */
+void     dhcp_get_netmask   (uint8_t out[4]);   /* option  1: subnet mask  */
+void     dhcp_get_dns       (uint8_t out[4]);   /* option  6: DNS server   */
+uint32_t dhcp_get_lease_secs(void);             /* option 51: lease time   */
 
 /* dhcp_module_init — Phoenix module init entry point.
  * Calls dhcp_init(g_genet_mac) and returns 0 on success.

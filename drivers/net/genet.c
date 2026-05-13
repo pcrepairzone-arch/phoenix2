@@ -101,7 +101,7 @@ static uint8_t g_tx_buf[TX_DESC_COUNT][GENET_BUF_SIZE] __attribute__((aligned(64
 uint8_t g_genet_mac[6];
 
 static uint16_t g_rx_cidx      = 0;  /* consumer index into RX ring           */
-static uint32_t g_rx_write_ptr = 0;  /* tracked RDMA WRITE_PTR (word units)   */
+/* g_rx_write_ptr removed in boot368: EtherGENET-6 leaves WRITE_PTR=0 always */
 static uint16_t g_tx_pidx      = 0;  /* producer index into TX ring           */
 static uint16_t g_tx_cidx      = 0;  /* consumer index (completed TX) tracking*/
 static int      g_genet_ok     = 0;  /* set to 1 after successful init        */
@@ -328,6 +328,13 @@ static void genet_init_rings(int qid)
     GW4(GENET_RX_SCB_BURST_SIZE, 0x08);
     GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), 0);
     GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
+    /* boot366 / EtherGENET-6 line 533 (Inet6Sources bcmgenet RISCOS path):
+     * Sync g_rx_cidx to the current hardware PROD_INDEX BEFORE writing
+     * PROD_INDEX=0.  On a clean Pi 4 power-on the bootloader does not use
+     * GENET so PROD=0, making this a no-op.  On warm reboot or reinit the
+     * software consumer index stays in sync with actual hardware state and
+     * does not diverge when the ring resets.                                 */
+    g_rx_cidx = GR4(GENET_RX_DMA_PROD_INDEX(qid)) & 0xffff;
     GW4(GENET_RX_DMA_PROD_INDEX(qid),   0);
     GW4(GENET_RX_DMA_CONS_INDEX(qid),   0);
     GW4(GENET_RX_DMA_RING_BUF_SIZE(qid),
@@ -357,16 +364,14 @@ static void genet_init_rings(int qid)
     }
     DSB();
 
-    /* Arm all 64 slots: WRITE_PTR = RX_DESC_COUNT × 3 words = 192.
-     * WRITE_PTR is a 16-bit free-running word-address counter.  Setting it
-     * to 192 tells hardware "64 buffer slots are prepared."  WRITE_PTR=0
-     * means "ring empty" — that was why RDMA=BROKEN in boot322-328.
-     * Each genet_poll_rx re-arm increments g_rx_write_ptr by 3 to keep
-     * (WRITE_PTR - PROD_INDEX*3) == 64 slots worth = 192 words.
-     * boot364: restored after boot351 incorrectly removed per-frame updates. */
-    g_rx_write_ptr = (uint32_t)(RX_DESC_COUNT * GENET_DMA_DESC_SIZE / 4);
-    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
-    /* WRITE_PTR_HI already 0 from line above */
+    /* boot368: WRITE_PTR left at 0, matching EtherGENET-6 (Inet6Sources RISCOS
+     * port, lines 540-541).  The reference driver writes WRITE_PTR=0 at init
+     * and never updates it per-frame or at re-arm.  Hardware uses PROD_INDEX /
+     * CONS_INDEX arithmetic directly for flow control; WRITE_PTR=0 is the
+     * correct quiescent value.  Our boot322-367 value of 192 (64 slots × 3
+     * words) was not needed and may have contributed to sporadic STATUS=0
+     * phantom frames seen in boot367.
+     * WRITE_PTR_LO and WRITE_PTR_HI are already 0 from the writes above. */
 
     /* Enable ring and DMA now that all descriptor slots have valid addresses */
     GW4(GENET_RX_DMA_RING_CFG, __BIT(qid));  /* enable this ring */
@@ -376,7 +381,8 @@ static void genet_init_rings(int qid)
     val |= GENET_RX_DMA_CTRL_RBUF_EN(GENET_DMA_DEFAULT_QUEUE);
     GW4(GENET_RX_DMA_CTRL, val);
 
-    g_rx_cidx = 0;
+    /* g_rx_cidx already synced above to hardware PROD before ring reset
+     * (EtherGENET-6 line 533 pattern) — do NOT overwrite to 0 here.       */
     g_tx_pidx = 0;
     g_tx_cidx = 0;
 
@@ -474,93 +480,30 @@ void genet_init(void)
     /* Mark driver OK now so genet_send/genet_poll_rx work below */
     g_genet_ok = 1;
 
-    /* ── RDMA loopback self-test ─────────────────────────────────────────
-     * boot342: Enable UMAC MAC loopback (LCL_LOOP_EN), send one frame,
-     * and poll RX PROD_INDEX for up to 10 ms.
+    /* boot367: loopback self-test REMOVED.
      *
-     * If PROD_INDEX advances → RDMA is alive; the loopback path works
-     *   and any remaining pidx=0 issue is in the wire path (RGMII/PHY).
-     * If PROD_INDEX stays 0 → RDMA is broken regardless of OOB/link state;
-     *   the ring init is wrong at a more fundamental level.
+     * boot342–366 used LCL_LOOP_EN to verify RDMA health at init time.
+     * boot366 analysis revealed that setting and then clearing LCL_LOOP_EN
+     * triggers the BCM2711 GENETv5 64-slot hardware ring scan: RDMA advances
+     * PROD_INDEX through all 64 slots at ~2–3/second WITHOUT DMA'ing any data.
+     * This "phantom scan" runs for ~17 seconds after LCL_LOOP_EN is cleared,
+     * contaminating the first 17 seconds of real traffic with STATUS=0 phantom
+     * ring advances.  Real frames still arrive (in non-phantom slots) but the
+     * phantom slots cause the ring to appear fuller than it is, backing up the
+     * MAC FIFO and producing 15–25 second RTTs.
      *
-     * boot314 had this test and it passed; we lost it in the regression.
-     * It is the definitive split between "ring init broken" vs "wire broken".
-     ──────────────────────────────────────────────────────────────────── */
-    {
-        /* boot326 (boot310/314): RDMA is gated by OOB RGMII_LINK even in
-         * internal loopback mode.  Set it temporarily so the loopback is a
-         * valid RDMA health test independent of physical link state.       */
-        uint32_t lp_oob_save = GR4(GENET_EXT_RGMII_OOB_CTRL);
-        uint32_t lp_oob = lp_oob_save;
-        lp_oob |= GENET_EXT_RGMII_OOB_RGMII_LINK;
-        lp_oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
-        GW4(GENET_EXT_RGMII_OOB_CTRL, lp_oob);
-
-        /* Enable MAC-level loopback + TX_RX_EN (bit 29) gate (boot314).
-         * Without TX_RX_EN GENETv5's MAC data path is closed regardless
-         * of LCL_LOOP_EN, TXEN, or RXEN bits.                            */
-        uint32_t lpcmd = GR4(GENET_UMAC_CMD);
-        lpcmd |= GENET_UMAC_CMD_LCL_LOOP_EN
-               | GENET_UMAC_CMD_TX_RX_EN
-               | GENET_UMAC_CMD_TXEN
-               | GENET_UMAC_CMD_RXEN;
-        GW4(GENET_UMAC_CMD, lpcmd);
-        genet_delay_us(100);  /* let UMAC settle */
-
-        /* Minimal 64-byte test frame: dst=broadcast src=our_MAC type=0x9000 */
-        static uint8_t s_lp_frame[64];
-        memset(s_lp_frame, 0, sizeof(s_lp_frame));
-        s_lp_frame[0] = 0xff; s_lp_frame[1] = 0xff; s_lp_frame[2] = 0xff;
-        s_lp_frame[3] = 0xff; s_lp_frame[4] = 0xff; s_lp_frame[5] = 0xff;
-        memcpy(s_lp_frame + 6, g_genet_mac, 6);
-        s_lp_frame[12] = 0x90; s_lp_frame[13] = 0x00; /* EtherType 0x9000 */
-        /* Log TX CONS before send, then send */
-        uint32_t lp_tx_cons_pre = GR4(GENET_TX_DMA_CONS_INDEX(qid)) & 0xffff;
-        genet_send(s_lp_frame, sizeof(s_lp_frame));
-        genet_delay_us(200);   /* give TDMA time to consume */
-        uint32_t lp_tx_cons_post = GR4(GENET_TX_DMA_CONS_INDEX(qid)) & 0xffff;
-
-        /* Poll PROD_INDEX for up to 10 ms (1000 × 10 µs) */
-        uint32_t lp_pidx = 0;
-        for (int i = 0; i < 1000; i++) {
-            genet_delay_us(10);
-            lp_pidx = GR4(GENET_RX_DMA_PROD_INDEX(qid)) & 0xffff;
-            if (lp_pidx) break;
-        }
-
-        /* Detailed loopback state dump so we can pinpoint the failure */
-        debug_print("[GENET] loopback: pidx=%u wptr=0x%x RDMA=%s UMAC_CMD=0x%08x\n",
-            (unsigned)lp_pidx,
-            (unsigned)(GR4(GENET_RX_DMA_WRITE_PTR_LO(qid)) & 0xffff),
-            lp_pidx ? "OK" : "BROKEN",
-            (unsigned)GR4(GENET_UMAC_CMD));
-        debug_print("[GENET] loopback diag: tx_cons=%u->%u rdma_ctrl=0x%08x"
-                    " d0_stat=0x%08x d0_addr=0x%08x rbuf=0x%08x\n",
-            (unsigned)lp_tx_cons_pre, (unsigned)lp_tx_cons_post,
-            (unsigned)GR4(GENET_RX_DMA_CTRL),
-            (unsigned)GR4(GENET_RX_DESC_STATUS(0)),
-            (unsigned)GR4(GENET_RX_DESC_ADDRESS_LO(0)),
-            (unsigned)GR4(GENET_RBUF_CTRL));
-
-        /* Disable loopback; TX_RX_EN stays set (apply_link will update) */
-        lpcmd = GR4(GENET_UMAC_CMD);
-        lpcmd &= ~GENET_UMAC_CMD_LCL_LOOP_EN;
-        GW4(GENET_UMAC_CMD, lpcmd);
-        /* Restore OOB to pre-loopback state; RGMII_LINK will be
-         * re-asserted by genet_apply_link() on the real link-up event.   */
-        GW4(GENET_EXT_RGMII_OOB_CTRL, lp_oob_save);
-
-        /* If the loopback frame landed in the ring, drain it */
-        if (lp_pidx) {
-            static uint8_t s_drain[GENET_BUF_SIZE];
-            genet_poll_rx(s_drain, sizeof(s_drain));
-        }
-    }
+     * Linux bcmgenet.c and EtherGENET-6 (Inet6Sources) both omit the loopback
+     * test and never set LCL_LOOP_EN.  Without it the BCM2711 ring scan does
+     * not trigger: PROD stays 0 until the first real frame DMA after RGMII_LINK
+     * is asserted, and RTTs should drop to <1 ms.
+     *
+     * The loopback test can be re-enabled as a factory diagnostic via a boot
+     * flag once the phantom scan mechanism is better understood.             */
 
     /* Init PHY and start autoneg */
     genet_phy_init();
 
-    debug_print("[GENET] init complete (boot364 +3-per-rearm-WRITE_PTR)\n");
+    debug_print("[GENET] init complete (boot369 no-loopback no-writeptr)\n");
 }
 
 /* ── Public: genet_link_up ─────────────────────────────────────────────── */
@@ -581,6 +524,14 @@ uint32_t genet_rx_pidx_raw(void)
     if (!g_genet_ok) return 0;
     return GR4(GENET_RX_DMA_PROD_INDEX(GENET_DMA_DEFAULT_QUEUE)) & 0xffff;
 }
+
+/* genet_rx_ring_reset() was removed in boot366.
+ * It reset PROD_INDEX=0 from inside genet_apply_link() after UMAC TX_RX_EN
+ * was already active, which triggered the BCM2711 GENETv5 64-slot hardware
+ * initialisation scan — the RDMA engine advanced PROD_INDEX through all 64
+ * slots without DMA'ing any data, taking ~17-20 seconds and holding the MAC
+ * FIFO (causing 20-second RTTs).  EtherGENET-6 (Inet6Sources) confirms:
+ * never reset PROD_INDEX after the MAC is active.                            */
 
 /* ── Public: genet_apply_link ──────────────────────────────────────────── */
 /* Read PHY-negotiated speed via MDIO and program UMAC_CMD speed field to
@@ -619,6 +570,24 @@ void genet_apply_link(void)
     cmd |= GENET_UMAC_CMD_TX_RX_EN;   /* boot326/boot314: GENETv5 MAC data-path gate */
     cmd |= GENET_UMAC_CMD_TXEN | GENET_UMAC_CMD_RXEN;
     GW4(GENET_UMAC_CMD, cmd);
+
+    /* boot366: ring_reset REMOVED.
+     *
+     * boot365's genet_rx_ring_reset() wrote PROD_INDEX=0 here, which triggered
+     * the BCM2711 GENETv5 64-slot hardware initialization scan: the RDMA engine
+     * cycled through all 64 ring slots advancing PROD_INDEX without DMA'ing any
+     * data (~17-20 seconds).  During the scan the UniMAC FIFO held all arriving
+     * frames, causing 20-second RTTs and ~42% phantom-driven packet loss.
+     *
+     * Why the scan fires here but not in genet_init_rings():
+     *   UMAC_CMD TX_RX_EN (bit 29) gates the BCM2711 scan.  In init_rings TX_RX_EN
+     *   is not yet set (it is first set in the loopback test above), so writing
+     *   PROD_INDEX=0 there is safe.  By the time apply_link() runs TX_RX_EN is
+     *   active; any subsequent PROD_INDEX=0 write triggers the full 64-slot scan.
+     *
+     * EtherGENET-6 (Inet6Sources Drivers/EtherGENET-6/c/bcmgenet RISCOS port of
+     * NetBSD bcmgenet.c) confirms: after rings are initialised, never reset
+     * PROD_INDEX again.  Just assert RGMII_LINK and let hardware run.           */
 
     /* Update EXT_RGMII_OOB_CTRL on link-up — mirrors Circle bcm54213.cpp
      * mii_setup() / adjust_link() sequence:
@@ -762,18 +731,6 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
 
     uint32_t status  = GR4(GENET_RX_DESC_STATUS(idx));
 
-    /* boot350 hypothesis (disproved): STATUS=0 was a hardware race.
-     * boot351 finding: STATUS=0 was caused by per-frame WRITE_PTR writes
-     * creating phantom PROD_INDEX advances with no real DMA.  The retry
-     * loop is kept as a safety net but will rarely (if ever) trigger now
-     * that WRITE_PTR is fixed to init-time only.                          */
-    if (status == 0) {
-        for (int _r = 0; _r < 8 && status == 0; _r++) {
-            DSB();
-            status = GR4(GENET_RX_DESC_STATUS(idx));
-        }
-    }
-
     uint32_t raw_len = __SHIFTOUT(status, GENET_RX_DESC_STATUS_BUFLEN);
 
     /* boot349: log STATUS so we can see what hardware wrote.
@@ -785,29 +742,28 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
                     idx, (unsigned)status, (unsigned)raw_len, (unsigned)total);
     }
 
-    /* Advance consumer regardless of frame validity                        */
+    /* Advance consumer — this is the ONLY re-arm operation needed.
+     *
+     * boot366: EtherGENET-6 (NetBSD bcmgenet.c RISCOS port, Inet6Sources)
+     * reveals that the reference driver NEVER writes STATUS, ADDRESS_LO/HI,
+     * or WRITE_PTR per re-arm.  Only CONS_INDEX is updated per consumed frame.
+     * Buffer addresses are written ONCE at init (genet_init_rings) and left
+     * permanently — hardware reuses the same physical address for each new
+     * frame it DMAs into that slot.
+     *
+     * Root cause of STATUS=0 phantoms in boot364/365: our per-rearm writes
+     * of STATUS=0, ADDRESS_LO/HI, and WRITE_PTR were triggering BCM2711
+     * GENETv5 internal RDMA recalculation, causing it to advance PROD_INDEX
+     * ~64 times (full ring scan) without DMA'ing any data.  WRITE_PTR is
+     * set once at init (to 192) and NEVER updated — hardware uses PROD/CONS
+     * arithmetic directly for flow control, not WRITE_PTR.
+     *
+     * Reference: EtherGENET-6/c/bcmgenet genet_rxintr() RISCOS path:
+     *   sc->sc_rx.cidx = (sc->sc_rx.cidx + 1) & 0xffff;
+     *   WR4(sc, GENET_RX_DMA_CONS_INDEX(qid), sc->sc_rx.cidx);
+     *   [no STATUS write, no ADDRESS write, no WRITE_PTR write]             */
     g_rx_cidx = (g_rx_cidx + 1) & 0xffff;
     GW4(GENET_RX_DMA_CONS_INDEX(qid), g_rx_cidx);
-
-    /* Re-arm: restore buffer address and return slot to hardware           */
-    uint32_t paddr = (uint32_t)(uintptr_t)g_rx_buf[idx];
-    GW4(GENET_RX_DESC_ADDRESS_LO(idx), paddr);
-    GW4(GENET_RX_DESC_ADDRESS_HI(idx), 0);
-    GW4(GENET_RX_DESC_STATUS(idx),     0);   /* STATUS=0 = hardware-owned  */
-    /* boot364: restore free-running WRITE_PTR increment per re-arm.
-     * WRITE_PTR is a 16-bit free-running WORD counter.  hardware computes:
-     *   available_slots = (WRITE_PTR - PROD_INDEX*3) / 3
-     * At init WRITE_PTR=192 and PROD_INDEX=0 → 64 slots available ✓
-     * Without incrementing: after consuming 64 frames PROD_INDEX=64 and
-     * PROD_INDEX*3=192 = WRITE_PTR → available=0 → hardware stops DMA'ing
-     * → STATUS=0 phantom cascade until ring wraps back to position 0.
-     * boot341 proved +3 per re-arm is correct (boot342-343 had ~97% ping
-     * delivery with this in place).  boot351 wrongly removed it under the
-     * theory that per-frame writes caused phantoms — the real boot350 bug
-     * was (cidx%64)*3 collapsing WRITE_PTR, not the per-frame write itself.*/
-    g_rx_write_ptr = (g_rx_write_ptr + (GENET_DMA_DESC_SIZE / 4)) & 0xffff;
-    GW4(GENET_RX_DMA_WRITE_PTR_LO(qid), g_rx_write_ptr);
-    GW4(GENET_RX_DMA_WRITE_PTR_HI(qid), 0);
 
     if (status & GENET_RX_DESC_STATUS_ALL_ERRS) {
         if (status & GENET_RX_DESC_STATUS_CRC_ERR)

@@ -194,9 +194,16 @@ void kernel_main(uint64_t dtb_ptr)
     uart_set_quiet(1);   /* boot256: silence FileCore/IDA verbose scan */
     filecore_list_root();
     filecore_show_results();
-    module_init_all();
+    genet_init();           /* boot369: GENET MUST init before module_init_all()
+                             * so g_genet_mac is populated before PhoenixDHCP
+                             * module_init runs.  boot302–368 had this reversed:
+                             * dhcp_module_init saw all-zero MAC then the wimp
+                             * task had to call dhcp_init(g_genet_mac) a second
+                             * time on link-up.  Correct order eliminates that. */
     net_init();
-    genet_init();           /* boot302: BCM2711 GENETv5 Ethernet */
+    module_init_all();      /* PhoenixDHCP.init blocks here: waits for link,
+                             * completes DISCOVER→BOUND, stores full lease.
+                             * wimp_task() starts with IP already bound.       */
     register_default_handlers();
     uart_set_quiet(0);   /* boot256: re-enable for boot-complete banner */
     debug_print("Subsystems ready\n");

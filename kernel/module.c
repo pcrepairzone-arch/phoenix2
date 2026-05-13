@@ -279,11 +279,11 @@ void module_dump_list(void)
 }
 
 /* ── Native C module declarations ───────────────────────────────────────── */
-/* PhoenixDHCP and PhoenixDHCPTest are plain C modules registered via
- * module_register_native() — no binary header required.                    */
+/* PhoenixDHCP is a plain C module registered via module_register_native(). */
 extern int dhcp_module_init(void);
 extern int dhcp_module_final(void);
-extern int dhcp_test_module_init(void);
+/* boot368: dhcp_test_module_init removed — test module no longer linked into
+ * production build.  See Makefile comment and Tests/dhcp_test_module.c.     */
 
 /* ── Embedded AArch64 test modules ──────────────────────────────────────── */
 /*
@@ -341,15 +341,13 @@ void module_init_all(void)
         mod_dec((uint32_t)rc); uart_puts("\n");
     }
 
-    /* ── Register PhoenixDHCPTest native module ─────────────────────────── */
-    rc = module_register_native("PhoenixDHCPTest",
-                                 dhcp_test_module_init,
-                                 NULL,
-                                 NULL);
-    if (rc != 0) {
-        uart_puts("[Module] PhoenixDHCPTest registration failed rc=");
-        mod_dec((uint32_t)rc); uart_puts("\n");
-    }
+    /* boot368: PhoenixDHCPTest registration REMOVED.
+     * The unit test ran at every production boot using a fake MAC
+     * (de:ad:be:ef:00:01) and synthetic frames, leaving the DHCP state
+     * machine bound to 192.168.0.145 before genet_init() ran.  When real
+     * DHCP started with the hardware MAC the test binding was discarded and
+     * a full discover/offer/request/ack cycle had to run from scratch.
+     * dhcp_test_module.c is available for standalone test builds only.      */
 
     /* External .ffa module loading via module_load_from_file() once
      * VFS is fully wired to the FileCore read path (future work).          */

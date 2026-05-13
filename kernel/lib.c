@@ -300,29 +300,17 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot351  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot369  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 
-    /* boot304/305: wait up to 8 s for GENETv5 PHY autoneg (boot305 measures
-     * 3519 ms on BCM54213PE).  Just polls and logs; gratuitous ARP is sent
-     * by the heartbeat link-state monitor on first tick (net_link_prev=-1). */
-    {
-        int link = 0;
-        uint32_t t0 = wimp_ms();
-        while ((wimp_ms() - t0) < 8000u) {
-            if (genet_link_up()) { link = 1; break; }
-            /* tiny pause — avoid hammering MDIO */
-            for (volatile int d = 0; d < 50000; d++) {}
-        }
-        if (link) {
-            debug_print("[WIMP] GENET link UP after %u ms\n",
-                        (unsigned)(wimp_ms() - t0));
-        } else {
-            debug_print("[WIMP] GENET link still DOWN after 8 s\n");
-            if (con_puts) con_puts("[NET] No link\n");
-        }
-    }
+    /* boot369: pre-loop link wait removed.
+     * PhoenixDHCP module_init() (called from module_init_all() before
+     * wimp_task runs) now handles link-up wait, genet_apply_link(), and the
+     * full DISCOVER→BOUND exchange.  By the time we reach this point the IP
+     * is already bound and g_our_ip is valid.  No link polling needed here. */
+    debug_print("[WIMP] task running — IP=%d.%d.%d.%d\n",
+                g_our_ip[0], g_our_ip[1], g_our_ip[2], g_our_ip[3]);
 
     /* keyboard_poll: drain the RISC OS keyboard event ring */
     extern int keyboard_poll(void *ev) __attribute__((weak));
@@ -346,12 +334,10 @@ void wimp_task(void)
     uint32_t last_beat     = wimp_ms();
     uint32_t last_dwc2     = wimp_ms(); /* boot267: DWC2 HID poll timestamp */
     uint32_t last_net      = wimp_ms(); /* boot303: GENET RX poll */
-    /* boot334: DHCP retransmit timer removed — dhcp_tick() carries its own
-     * timestamp internally; wimp_task just calls dhcp_tick(now) each loop. */
-    /* boot305: start at -1 (unknown) so the heartbeat always fires on its
-     * first check, logs the link state, and sends the gratuitous ARP if
-     * link is already up from the initial wait.                            */
-    int      net_link_prev = -1;
+    /* boot369: net_link_prev starts at 1 (UP) since PhoenixDHCP module_init
+     * confirmed link before returning.  Heartbeat still monitors for cable
+     * disconnect/reconnect and re-applies PHY speed on reconnect.          */
+    int      net_link_prev = 1;
     static uint8_t g_rx_frame[GENET_MAX_FRAME]; /* RX frame buffer */
     /* boot345: our IP read from g_our_ip (exported by net/dhcp.c).
      * ARP and ICMP handlers use g_our_ip directly — no local copy needed.  */
@@ -379,31 +365,22 @@ void wimp_task(void)
                     net_link_prev = lnk;
                     debug_print("[NET] link %s\n", lnk ? "UP" : "DOWN");
                     if (lnk) {
-                        /* boot308: apply negotiated PHY speed to UMAC.
-                         * PHY drives RGMII RX clock; if UMAC speed doesn't
-                         * match, pidx never advances (RX silently broken). */
+                        /* boot308/369: re-apply PHY speed on reconnect.
+                         * If the cable was unplugged and re-plugged, UMAC
+                         * speed must be re-matched to the newly-negotiated
+                         * PHY rate.  DHCP is NOT re-triggered here — that
+                         * is future work (PhoenixDHCP reconnect service).  */
                         genet_apply_link();
-                        /* boot348: re-arm DHCP with real board MAC before
-                         * starting negotiation.  DHCPTest calls dhcp_init()
-                         * with a fake MAC (de:ad:be:ef:00:01); if we don't
-                         * overwrite that here, every real DISCOVER goes out
-                         * with the wrong chaddr and the router's OFFER (if
-                         * it ever matches) will be for the wrong client.    */
-                        dhcp_init(g_genet_mac);
-                        /* boot345: DHCP start delegated to PhoenixDHCP module.
-                         * dhcp_start() sets state BEFORE genet_send() —
-                         * closes the ISR race window present in boot334.
-                         * Reset last_net to force an immediate RX poll so
-                         * we don't wait up to 4 ms for the first OFFER.  */
-                        dhcp_start();
-                        last_net = wimp_ms();
                     }
                 }
             }
         }
 
-        /* ── DHCP tick: drives retransmit / timeout (PhoenixDHCP module) ─ */
-        dhcp_tick(wimp_ms());
+        /* boot369: dhcp_tick() removed from wimp loop.
+         * DHCP is fully handled by PhoenixDHCP.module_init before wimp_task
+         * starts.  Once BOUND the state machine sits in DHCP_ST_BOUND and
+         * dhcp_tick() would return immediately anyway — but cleaner to remove
+         * it entirely so the module boundary is explicit.                   */
 
         /* ── GENET RX poll: 4 ms — drain entire ring on each tick ─────── */
         {
@@ -441,10 +418,15 @@ void wimp_task(void)
                             g_rx_frame[41] == g_our_ip[3]) {
                             static uint8_t reply[60];
                             for (int _i=0;_i<60;_i++) reply[_i]=0;
-                            /* boot329: broadcast dst (ff:ff:ff:ff:ff:ff) so
-                             * the pinger receives the reply even if the switch
-                             * drops unicast frames to an unknown MAC address. */
-                            for (int _i=0;_i<6;_i++) reply[_i]   = 0xff;
+                            /* boot368: unicast dst — send ARP reply directly to
+                             * the requester's Ethernet source MAC (frame[6..11]).
+                             * boot329 used broadcast (ff:ff:ff:ff:ff:ff) to work
+                             * around potential unknown-unicast drops, but that
+                             * caused DUP! replies on the pinger and flooded the
+                             * switch, driving RTT spikes.  By the time we receive
+                             * a who-has, the requester is already reachable (DHCP
+                             * completed, grat-ARP sent) so unicast is correct. */
+                            for (int _i=0;_i<6;_i++) reply[_i]   = g_rx_frame[6+_i];
                             for (int _i=0;_i<6;_i++) reply[6+_i] = g_genet_mac[_i];
                             reply[12]=0x08; reply[13]=0x06;
                             reply[14]=0x00; reply[15]=0x01;
@@ -483,10 +465,10 @@ void wimp_task(void)
                         }
                     }
 
-                    /* boot345: DHCP frame handling delegated to PhoenixDHCP.
-                     * dhcp_rx() filters non-DHCP frames internally.
-                     * g_our_ip (exported by dhcp.c) is updated on BOUND.  */
-                    dhcp_rx(g_rx_frame, flen);
+                    /* boot369: dhcp_rx() removed from wimp RX dispatch.
+                     * DHCP exchange is complete before wimp_task starts.
+                     * Frames arriving here are not DHCP — they are ARP,
+                     * ICMP ping, or background multicast traffic.          */
 
                     /* boot326: ICMP echo reply (ping).
                      * IPv4 frame layout:
