@@ -1,0 +1,31 @@
+# .robuild.yaml — EtherGENET-6 build service configuration
+# Send to build.riscos.online via: riscos-build-online -i source.zip -A aarch32 -o output
+# For 64-bit: riscos-build-online -i source.zip -A aarch64 -o output
+#
+# Charles Ferguson (gerph) — riscos-build-service-action wraps this.
+# Two build jobs: 32-bit RAM module (rm32) and 64-bit RAM module (rm64).
+# The 64-bit job uses BUILD64=1 which outputs to oz64/ and rm64/.
+# Note: BBC BASIC testing cannot be used for 64-bit modules; load-only test.
+
+format: 1
+
+jobs:
+  build-32:
+    steps:
+      - name: Build EtherGENET 32-bit RAM module
+        run: riscos-amu standalone
+      - name: Verify 32-bit module exists
+        run: IfThere rm32.EtherGENET Then Echo EtherGENET 32-bit OK
+
+  build-64:
+    steps:
+      - name: Build EtherGENET 64-bit RAM module
+        run: riscos-amu standalone BUILD64=1
+      - name: Verify 64-bit module exists
+        run: IfThere rm64.EtherGENET Then Echo EtherGENET 64-bit OK
+      - name: Test 64-bit module load (AArch64 environment)
+        run: RMLoad rm64.EtherGENET
+
+artifacts:
+  - rm32/EtherGENET
+  - rm64/EtherGENET
