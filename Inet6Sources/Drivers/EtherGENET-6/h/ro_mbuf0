@@ -1,0 +1,366 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * Licensing/CDDL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2022 Andy Vawer & John Ballance.  All rights reserved.
+ * Use is subject to license terms.
+ */
+ 
+/* RISC OS Mbuf pieces
+ * 
+ * extends the OpenBSD mbuf bits
+ * by having a control block so we can call the shared module
+ *
+ */
+
+#ifndef __ro_mbuf_h
+#define __ro_mbuf_h
+
+#define DCI6VERSION 600
+
+/* main mbuf description */
+#include <stdint.h>
+#include "obsd_mbuf.h"
+
+/* add our extensions */
+/* client needs to have a global mbctl structure */
+/* we then alias the BSD calls into module calls through this */
+/* we need to know the name of the external structure though. */
+
+#ifndef MBCTL_CLIENT
+#error Please identify the client global 'struct mbctl6' with #define MBCTL_CLIENT <structname>
+#endif
+#ifdef MBUF_MANAGER_VERSION
+#undef MBUF_MANAGER_VERSION
+#endif
+#define MBUF_MANAGER_VERSION 200
+
+// you shouldn't be playing with this one directly
+struct pool {
+  int pw_content;  // private word contents
+  void *mbufglobals;  // pointer to mbufmanager workspace
+  char *pool_owner_id;
+  int pool_array_offset;
+  char *pool_data_addr; // start of pool in memory
+  char *pool_data_end;  // end of pool in memory
+  char *pool_name;
+  short pool_ipl;
+  short pool_flags;
+  char *pool_lowat;
+  char *pool_hiwat;
+  unsigned int pr_hardlimit; //pool_limit;
+  int pr_size; //pool_blocksize;
+  void *pool_freechain_first;
+  void *pool_inusechain_first;
+  unsigned int pr_nout; // pool_inuse_count;
+  unsigned int pr_nfree; // pool free count (blocks on the free chain, not free space)
+  char *pool_memtop;    // top of the allocated blocks in pool
+  char *pool_last_pagedaddr; // last spot actually paged in
+  int callback_wanted; // are we wanting a callback for memory moves?
+};
+
+/* pool blocks have a header and then the data */
+#define POOLBLOCK_HDRSIZE 12
+
+// if set, then two changes:
+// pool blocks are adjusted to ensure they always fit entirely in a page
+// phys_addr is filled in for new blocks too
+#define PR_MAPADDR 0x8000
+
+typedef struct mbctl6
+{
+  int     pw_content;   /* set to NULL on registration.  Used to locate Mbuf Manager workspace */
+  int  mbcsize;        /* size of mbctl structure from client */
+  unsigned int  mbcvers;        /* client version of mbuf manager spec */
+  uint32_t      flags;          /* fixed-width: mirrors mbctl fix in ro_mbuf — unsigned long
+                                 * changes size between 32 and 64-bit, breaking the SWI layout */
+  int        advminubs;      /* Advisory desired minimum underlying block size */
+  int        advmaxubs;      /* Advisory desired maximum underlying block size */
+  int        mincontig;      /* client required min ensure_contig value */
+  unsigned int  unused1;         /* Must be set to zero on initialisation */ /* defined as unused1 for public */
+  
+  /* initialised by Mbuf Manager when session opened */
+  int        minubs;         /* Minimum underlying block size */
+  int        maxubs;         /* Maximum underlying block size */
+  int        maxcontig;      /* Maximum contiguify block size */
+  unsigned int  unused2;         /* Reserved for future use */ /* use internally for mbufglobals ptr? */
+
+  /* functions exported by the manager module */
+  /* main functions from sys/mbuf.h */
+  struct mbuf * (*m_copym)(struct mbctl6*, struct mbuf *, int, int, int);
+  struct mbuf * (*m_free)(struct mbctl6 *, struct mbuf *);
+  struct mbuf * (*m_get)(struct mbctl6 *, int, int);
+  struct mbuf * (*m_getclr)(struct mbctl6 *, int, int);
+  struct mbuf * (*m_gethdr)(struct mbctl6 *, int, int);
+  struct mbuf * (*m_inithdr)(struct mbctl6 *, struct mbuf *);
+  void  (*m_removehdr)(struct mbctl6 *, struct mbuf *);
+  void  (*m_resethdr)(struct mbctl6 *, struct mbuf *);
+  void  (*m_calchdrlen)(struct mbuf *);
+  int   (*m_defrag)(struct mbctl6 *, struct mbuf *, int);
+  struct mbuf * (*m_prepend)(struct mbctl6 *, struct mbuf *, int, int);
+  struct mbuf * (*m_pulldown)(struct mbctl6 *, struct mbuf *, int, int, int *);
+  struct mbuf * (*m_pullup)(struct mbctl6 *, struct mbuf *, int);
+  struct mbuf * (*m_split)(struct mbctl6 *, struct mbuf *, int, int);
+  struct mbuf * (*m_makespace)(struct mbctl6 *, struct mbuf *, int, int, int *);
+  struct mbuf * (*m_getptr)(struct mbuf *, int, int *);
+  int   (*m_leadingspace)(struct mbuf *);
+  int   (*m_trailingspace)(struct mbuf *);
+  void  (*m_align)(struct mbuf *, int);
+  struct mbuf * (*m_clget)(struct mbctl6 *, struct mbuf *, int, unsigned int);
+  void  (*m_extref)(struct mbctl6 *, struct mbuf *, struct mbuf *);
+  void  (*m_adj)(struct mbuf *, int);
+  int   (*m_copyback)(struct mbctl6 *, struct mbuf *, int, int, const void *, int);
+  struct mbuf * (*m_freem)(struct mbctl6 *, struct mbuf *);
+  void  (*m_purge)(struct mbctl6 *, struct mbuf *);
+  void  (*m_reclaim)(struct mbctl6 *, void *, int);
+  void  (*m_copydata)(struct mbctl6 *, struct mbuf *, int, int, void *);
+  void  (*m_cat)(struct mbctl6 *, struct mbuf *, struct mbuf *);
+  struct mbuf * (*m_devget)(struct mbctl6 *, char *, int, int);
+  struct mbuf * (*m_dup_pkt)(struct mbctl6 *, struct mbuf *, unsigned int, int);
+  int   (*m_dup_pkthdr)(struct mbctl6 *, struct mbuf *, struct mbuf *, int);
+
+  /* packet tag routines */
+  struct m_tag * (*m_tag_get)(struct mbctl6 *, int, int, int);
+  void  (*m_tag_prepend)(struct mbuf *, struct m_tag *);
+  void  (*m_tag_delete)(struct mbctl6 *, struct mbuf *, struct m_tag *);
+  void  (*m_tag_delete_chain)(struct mbctl6 *, struct mbuf *);
+  struct m_tag * (*m_tag_find)(struct mbuf *, int, struct m_tag *);
+  struct m_tag * (*m_tag_copy)(struct m_tag *, int);
+  int   (*m_tag_copy_chain)(struct mbuf *, struct mbuf *, int);
+  void  (*m_tag_init)(struct mbuf *);
+  struct m_tag * (*m_tag_first)(struct mbuf *);
+  struct m_tag * (*m_tag_next)(struct mbuf *, struct m_tag *);
+
+  
+  /* mbuf list operations */
+  void                  (*ml_init)(struct mbuf_list *);
+  void                  (*ml_enqueue)(struct mbuf_list *, struct mbuf *);
+  struct mbuf *         (*ml_dequeue)(struct mbuf_list *);
+  void                  (*ml_enlist)(struct mbctl6 *, struct mbuf_list *, struct mbuf_list *);
+  struct mbuf *         (*ml_dechain)(struct mbctl6 *, struct mbuf_list *);
+  unsigned int          (*ml_purge)(struct mbctl6 *, struct mbuf_list *);
+ unsigned int           (*ml_hdatalen)(struct mbuf_list *);
+
+  /* mbuf queue control */
+  void                  (*mq_init)(struct mbctl6 *, struct mbuf_queue *, unsigned int, int);
+  int                   (*mq_enqueue)(struct mbctl6 *, struct mbuf_queue *, struct mbuf *);
+  struct mbuf *         (*mq_dequeue)(struct mbctl6 *, struct mbuf_queue *);
+  int                   (*mq_enlist)(struct mbctl6 *, struct mbuf_queue *, struct mbuf_list *);
+  void                  (*mq_delist)(struct mbctl6 *, struct mbuf_queue *, struct mbuf_list *); 
+  struct mbuf *         (*mq_dechain)(struct mbctl6 *, struct mbuf_queue *);
+  unsigned int          (*mq_purge)(struct mbctl6 *, struct mbuf_queue *);
+  int                   (*mq_push)(struct mbctl6 *, struct mbuf_queue *, struct mbuf *);       
+  unsigned int          (*mq_hdatalen)(struct mbctl6 *, struct mbuf_queue *);
+
+  /* packet timestamp */
+  void                  (*m_microtime)(struct mbctl6 *, struct mbuf *, void *);
+
+  /* memory pool allocation */
+  void (*pool_init)(struct mbctl6 *, struct pool *_pool, unsigned int size, unsigned int align, int ipl, int flags, const char *wmesg, int max);
+  void * (*pool_get)(struct pool *pp,int flags);
+  void (*pool_put)(struct pool *pp,void *item);
+  void (*pool_destroy)(struct pool *pp);
+  int (*pool_prime)(struct pool *pp,int nitems);
+  void (*pool_sethiwat)(struct pool *pp,int n);
+  void (*pool_setlowat)(struct pool *pp,int n);
+  int (*pool_sethardlimit)(struct pool *pp,unsigned int n,const char *warnmess, int ratecap);
+  unsigned int (*pool_physical_addr)(struct pool *pp,void *block);
+
+} dci4_mbctl6;
+
+/* flags options for session creation */
+#define MBSESSION_FLAGS_SVCMODE  0
+#define MBSESSION_FLAGS_USERMODE 1
+  
+/* version for this header */
+#define MBSESSION_VERSION        200
+
+#ifndef __mbctl_defined
+#define __mbctl_defined   
+extern struct mbctl6 MBCTL_CLIENT;
+#endif
+
+// we may be able to optimise this a bit later -
+// if we manually create the veneers then we don't have the issue of having to 
+// get R12 with the right value.
+// we will also have the advantage of using the APCS a bit better without having
+// to load registers, stack and unstack them on call entry.
+// at the moment to use proven stuff we're using cmhg veneers so R12 has to be right!
+
+#define m_copym(a,b,c,d) MBCTL_CLIENT.m_copym(&MBCTL_CLIENT,(a),(b),(c),(d))
+#define m_free(m) MBCTL_CLIENT.m_free(&MBCTL_CLIENT,(m))
+#define m_get(a,b) MBCTL_CLIENT.m_get(&MBCTL_CLIENT,(a),(b))
+#define m_getclr(a,b) MBCTL_CLIENT.m_getclr(&MBCTL_CLIENT,(a),(b))
+#define m_gethdr(a,b) MBCTL_CLIENT.m_gethdr(&MBCTL_CLIENT,(a),(b))
+#define m_inithdr(a) MBCTL_CLIENT.m_inithdr(&MBCTL_CLIENT,(a))
+#define m_removehdr(a) MBCTL_CLIENT.m_removehdr(&MBCTL_CLIENT,(a))
+#define m_resethdr(a) MBCTL_CLIENT.m_resethdr(&MBCTL_CLIENT,(a))
+#define m_calchdrlen(a) MBCTL_CLIENT.m_calchdrlen(a)
+#define m_defrag(a,b) MBCTL_CLIENT.m_defrag(&MBCTL_CLIENT,(a),(b))
+#define m_prepend(a,b,c) MBCTL_CLIENT.m_prepend(&MBCTL_CLIENT,(a),(b),(c))
+#define m_pulldown(a,b,c,d) MBCTL_CLIENT.m_pulldown(&MBCTL_CLIENT,(a),(b),(c),(d))
+#define m_pullup(a,b) MBCTL_CLIENT.m_pullup(&MBCTL_CLIENT,(a),(b))
+#define m_split(a,b,c) MBCTL_CLIENT.m_split(&MBCTL_CLIENT,(a),(b),(c))
+#define m_makespace(a,b,c,d) MBCTL_CLIENT.m_makespace(&MBCTL_CLIENT,(a),(b),(c),(d))
+#define m_getptr(a,b,c) MBCTL_CLIENT.m_getptr((a),(b),(c))
+#define m_leadingspace(a) MBCTL_CLIENT.m_leadingspace(a)
+#define m_trailingspace(a) MBCTL_CLIENT.m_trailingspace(a)
+#define m_align(a,b) MBCTL_CLIENT.m_align((a),(b))
+#define m_clget(a,b,c) MBCTL_CLIENT.m_clget(&MBCTL_CLIENT,(a),(b),(c))
+#define m_extref(a,b) MBCTL_CLIENT.m_extref(&MBCTL_CLIENT,(a),(b))
+#define m_adj(a,b) MBCTL_CLIENT.m_adj((a),(b))
+#define m_copyback(a,b,c,d,e) MBCTL_CLIENT.m_copyback(&MBCTL_CLIENT,(a),(b),(c),(d),(e))
+#define m_freem(a) MBCTL_CLIENT.m_freem(&MBCTL_CLIENT,(a))
+#define m_purge(a) MBCTL_CLIENT.m_purge(&MBCTL_CLIENT,(a))
+#define m_reclaim(a,b) MBCTL_CLIENT.m_reclaim(&MBCTL_CLIENT,(a),(b))
+#define m_copydata(a,b,c,d) MBCTL_CLIENT.m_copydata(&MBCTL_CLIENT,(a),(b),(c),(d))
+#define m_cat(a,b) MBCTL_CLIENT.m_cat(&MBCTL_CLIENT,(a),(b))
+#define m_devget(a,b,c) MBCTL_CLIENT.m_devget(&MBCTL_CLIENT,(a),(b),(c))
+#define m_dup_pkt(a,b,c) MBCTL_CLIENT.m_dup_pkt(&MBCTL_CLIENT,(a),(b),(c))
+#define m_dup_pkthdr(a,b,c) MBCTL_CLIENT.m_dup_pkthdr(&MBCTL_CLIENT,(a),(b),(c))
+
+
+  /* packet tag routines */
+#define m_tag_get(a,b,c) MBCTL_CLIENT.m_tag_get(&MBCTL_CLIENT,(a),(b),(c))
+#define m_tag_prepend(a,b) MBCTL_CLIENT.m_tag_prepend((a),(b))
+#define m_tag_delete(a,b) MBCTL_CLIENT.m_tag_delete(&MBCTL_CLIENT,(a),(b))
+#define m_tag_delete_chain(a) MBCTL_CLIENT.m_tag_delete_chain(&MBCTL_CLIENT,(a))
+#define m_tag_find(a,b,c) MBCTL_CLIENT.m_tag_find((a),(b),(c))
+#define m_tag_copy(a,b) MBCTL_CLIENT.m_tag_copy(&MBCTL_CLIENT,(a),(b))
+#define m_tag_copy_chain(a,b,c) MBCTL_CLIENT.m_tag_copy_chain(&MBCTL_CLIENT,(a),(b),(c))
+#define m_tag_init(a) MBCTL_CLIENT.m_tag_init(a)
+#define m_tag_first(a) MBCTL_CLIENT.m_tag_first(a)
+#define m_tag_next(a,b) MBCTL_CLIENT.m_tag_next((a),(b))
+  
+/* mbuf list operations */
+#define ml_init(a) MBCTL_CLIENT.ml_init(a)
+#define ml_enqueue(a,b) MBCTL_CLIENT.ml_enqueue((a),(b))
+#define ml_dequeue(a) MBCTL_CLIENT.ml_dequeue(a)
+#define ml_enlist(a,b) MBCTL_CLIENT.ml_enlist(&MBCTL_CLIENT,(a),(b))
+#define ml_dechain(a) MBCTL_CLIENT.ml_dechain(&MBCTL_CLIENT,(a))
+#define ml_purge(a) MBCTL_CLIENT.ml_purge(&MBCTL_CLIENT,(a))
+#define ml_hdatalen(a) MBCTL_CLIENT.ml_hdatalen(a)
+
+/* mbuf queue control */
+#define mq_init(a,b,c) MBCTL_CLIENT.mq_init(&MBCTL_CLIENT,(a),(b),(c))
+#define mq_enqueue(a,b) MBCTL_CLIENT.mq_enqueue(&MBCTL_CLIENT,(a),(b))
+#define mq_dequeue(a) MBCTL_CLIENT.mq_dequeue(&MBCTL_CLIENT,(a))
+#define mq_enlist(a,b) MBCTL_CLIENT.mq_enlist(&MBCTL_CLIENT,(a),(b))
+#define mq_delist(a,b) MBCTL_CLIENT.mq_delist(&MBCTL_CLIENT,(a),(b))
+#define mq_dechain(a) MBCTL_CLIENT.mq_dechain(&MBCTL_CLIENT,(a))
+#define mq_purge(a) MBCTL_CLIENT.mq_purge(&MBCTL_CLIENT,(a))
+#define mq_push(a,b) MBCTL_CLIENT.mq_push(&MBCTL_CLIENT,(a),(b))
+#define mq_hdatalen(a) MBCTL_CLIENT.mq_hdatalen(&MBCTL_CLIENT,(a))
+
+
+  /* packet timestamp */
+#define m_microtime(a,b) MBCTL_CLIENT.m_microtime(&MBCTL_CLIENT,(a),(b))
+
+
+  /* memory pool allocation */
+#define pool_init(a,b,c,d,e,f,g) MBCTL_CLIENT.pool_init(&MBCTL_CLIENT,(a),(b),(c),(d),(e),(f),0)
+#define pool_get(a,b) MBCTL_CLIENT.pool_get((a),(b))
+#define pool_put(a,b) MBCTL_CLIENT.pool_put((a),(b))
+#define pool_destroy(a) MBCTL_CLIENT.pool_destroy(a)
+#define pool_prime(a,b) MBCTL_CLIENT.pool_prime((a),(b)
+#define pool_sethiwat(a,b) MBCTL_CLIENT.pool_sethiwat((a),(b))
+#define pool_setlowat(a,b) MBCTL_CLIENT.pool_setlowat((a),(b))
+#define pool_sethardlimit(a,b,c,d) MBCTL_CLIENT.pool_sethardlimit((a),(b),(c),(d))
+
+
+
+/* mbufqueue functions */
+
+/* from sys/mbuf.h - couldn't be set up there */
+static inline struct mbuf *
+m_freemp(struct mbuf **mp)
+{
+        struct mbuf *m = *mp;
+
+        *mp = 0;
+        return m_freem(m);
+}
+
+/* from sys/mbuf.c */
+/*
+ * Apply function f to the data in an mbuf chain starting "off" bytes from the
+ * beginning, continuing for "len" bytes.
+ */
+static inline int
+m_apply(struct mbuf *m, int off, int len,
+    int (*f)(void *, void *, unsigned int), void * fstate)
+{
+        int rval;       
+        unsigned int count;
+        
+        if (len < 0 || off < 0) return 0;
+        while (off > 0) {
+                if (m == 0) return 0;
+                if (off < m->m_len)
+                        break;
+                off -= m->m_len;
+                m = m->m_next;
+        }
+        while (len > 0) {
+                if (m == 0) return 0;
+                count = m->m_len - off < len ? m->m_len - off : len;
+                rval = f(fstate, mtod(m, char *) + off, count);
+                if (rval) return (rval);
+                len -= count;
+                off = 0;
+                m = m->m_next;
+        }
+        return (0);
+}
+
+
+/* module SWIs */
+/* Mbuf_SWI should match SWI_Base in s.defines */
+#ifndef Mbuf_SWI
+#define Mbuf_SWI           0x4a580
+#endif
+
+#ifndef Mbuf_OpenSession
+#define Mbuf_OpenSession   (Mbuf_SWI + 0)
+#define Mbuf_CloseSession  (Mbuf_SWI + 1)
+#define Mbuf_Memory        (Mbuf_SWI + 2)
+#define Mbuf_Statistic     (Mbuf_SWI + 3)
+#define Mbuf_Control       (Mbuf_SWI + 4)
+#define Mbuf_OpenSessionO  (Mbuf_SWI + 5)
+#define Mbuf_CloseSessionO (Mbuf_SWI + 6)
+#define Mbuf_Reserved7     (Mbuf_SWI + 7)
+#define Mbuf_Reserved8     (Mbuf_SWI + 8)
+#define Mbuf_ControlO      (Mbuf_SWI + 9)
+#endif
+
+/* Statistic SWI uses the statistic interface from "dci4stat.h" */
+
+/* Notification of arrival and depature of Mbuf Manager */
+
+#ifndef Service_MbufManagerStatus
+#define Service_MbufManagerStatus       (0xa2)
+#endif
+
+#define MbufManagerStatus_Started       0
+#define MbufManagerStatus_Stopping      1
+#define MbufManagerStatus_Scavenge      2
+#define MbufManagerStatus_WantsToStop   3
+
+#endif
