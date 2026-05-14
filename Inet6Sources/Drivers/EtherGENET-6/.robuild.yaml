@@ -5,6 +5,6 @@ format: 1
 jobs:
   build:
     script:
-      - amu standalone
+      - amu_machine standalone
 artifacts:
   - path: rm/EtherGENET
