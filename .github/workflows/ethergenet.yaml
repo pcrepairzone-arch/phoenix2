@@ -78,6 +78,13 @@ jobs:
           jobs:
             build:
               script:
+                - Echo ===ENV===
+                - Show Run$Path
+                - Show Makefile$Path
+                - Show File$Path
+                - Echo ===FILES===
+                - Cat Makefile,fe1
+                - Echo ===TRYAMU===
                 - amu_machine standalone BUILD64=1
           artifacts:
             - path: rm/EtherGENET
