@@ -35,7 +35,7 @@ jobs:
                 - Set Run$Path <Run$Path>,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Show Run$Path
-                - $.Library.amu standalone
+                - amu standalone
           artifacts:
             - path: rm32/EtherGENET
           ROBUILD
@@ -86,7 +86,7 @@ jobs:
                 - Set Run$Path <Run$Path>,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Show Run$Path
-                - $.Library.amu standalone BUILD64=1
+                - amu standalone BUILD64=1
           artifacts:
             - path: rm64/EtherGENET
           ROBUILD
@@ -99,7 +99,7 @@ jobs:
         run: |
           "$GITHUB_WORKSPACE/riscos-build-online" \
             -i /tmp/source64.zip \
-            -A aarch32 \
+            -A aarch64 \
             -t 120 \
             -o /tmp/EtherGENET-64 \
             2>&1 | tee "$GITHUB_WORKSPACE/build64.log"
