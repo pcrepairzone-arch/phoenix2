@@ -32,7 +32,7 @@ jobs:
             build:
               script:
                 - Set PyromaniacCC$Enable 1
-                - Set Run$Path ,%.$.Library.
+                - Set Run$Path ,%.,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - amu standalone
           artifacts:
@@ -82,7 +82,7 @@ jobs:
             build:
               script:
                 - Set PyromaniacCC$Enable 1
-                - Set Run$Path ,%.$.Library.
+                - Set Run$Path ,%.,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - amu standalone BUILD64=1
           artifacts:
