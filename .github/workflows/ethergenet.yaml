@@ -78,18 +78,19 @@ jobs:
           jobs:
             build:
               script:
-                - Echo ===SYSVAR===
-                - Show
-                - Echo ===ROOT===
-                - Cat $
-                - Echo ===UTILS===
-                - Cat $.Utilities
-                - Echo ===TOOLS===
-                - Cat $.Tools
-                - Echo ===APPS===
-                - Cat $.Apps
-                - Echo ===LOCALFILES===
+                - Echo ===LIBRARY===
+                - IfThere $.Library Then Cat $.Library Else Echo no Library
+                - Echo ===LIBRARY64===
+                - IfThere $.Library64 Then Cat $.Library64 Else Echo no Library64
+                - Echo ===LIBS===
+                - IfThere $.Libs Then Cat $.Libs Else Echo no Libs
+                - Echo ===WORK===
                 - Cat @
+                - Echo ===ENABLE_CC===
+                - Set PyromaniacCC$Enable 1
+                - Show PyromaniacCC$Enable
+                - Echo ===TRY_AMU===
+                - amu_machine standalone BUILD64=1
           artifacts:
             - path: rm/EtherGENET
           EOF
