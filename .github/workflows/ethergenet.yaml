@@ -15,7 +15,7 @@ jobs:
     name: Build EtherGENET-6 (AArch32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download riscos-build-online
         run: |
@@ -36,9 +36,12 @@ jobs:
             - path: rm/EtherGENET
           EOF
 
-      - name: Zip source
+      - name: Zip source (rename Makefile to Makefile,fe1 for RISC OS)
         working-directory: Inet6Sources/Drivers/EtherGENET-6
-        run: zip -q9r /tmp/source32.zip .
+        run: |
+          cp Makefile "Makefile,fe1"
+          zip -q9r /tmp/source32.zip .
+          rm "Makefile,fe1"
 
       - name: Build via RISC OS build service
         run: |
@@ -50,7 +53,7 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/build32.log"
 
       - name: Upload module
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: always()
         with:
           name: EtherGENET-aarch32
@@ -62,7 +65,7 @@ jobs:
     name: Build EtherGENET-6 (AArch64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download riscos-build-online
         run: |
@@ -78,21 +81,28 @@ jobs:
           jobs:
             build:
               script:
-                - Echo ===ENV===
-                - Show Run$Path
-                - Show Makefile$Path
-                - Show File$Path
-                - Echo ===FILES===
-                - Cat Makefile,fe1
-                - Echo ===TRYAMU===
-                - amu_machine standalone BUILD64=1
+                - Echo ===SYSVAR===
+                - Show
+                - Echo ===ROOT===
+                - Cat $
+                - Echo ===UTILS===
+                - Cat $.Utilities
+                - Echo ===TOOLS===
+                - Cat $.Tools
+                - Echo ===APPS===
+                - Cat $.Apps
+                - Echo ===LOCALFILES===
+                - Cat @
           artifacts:
             - path: rm/EtherGENET
           EOF
 
-      - name: Zip source
+      - name: Zip source (rename Makefile to Makefile,fe1 for RISC OS)
         working-directory: Inet6Sources/Drivers/EtherGENET-6
-        run: zip -q9r /tmp/source64.zip .
+        run: |
+          cp Makefile "Makefile,fe1"
+          zip -q9r /tmp/source64.zip .
+          rm "Makefile,fe1"
 
       - name: Build via RISC OS build service
         run: |
@@ -104,7 +114,7 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/build64.log"
 
       - name: Upload module
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: always()
         with:
           name: EtherGENET-aarch64
