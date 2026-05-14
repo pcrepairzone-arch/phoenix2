@@ -99,7 +99,7 @@ jobs:
         run: |
           "$GITHUB_WORKSPACE/riscos-build-online" \
             -i /tmp/source64.zip \
-            -A aarch64 \
+            -A aarch32 \
             -t 120 \
             -o /tmp/EtherGENET-64 \
             2>&1 | tee "$GITHUB_WORKSPACE/build64.log"
