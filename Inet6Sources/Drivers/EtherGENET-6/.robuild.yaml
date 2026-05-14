@@ -5,6 +5,6 @@ format: 1
 jobs:
   build:
     script:
-      - riscos-amu standalone
+      - amu standalone
 artifacts:
   - path: rm/EtherGENET

@@ -31,7 +31,7 @@ jobs:
           jobs:
             build:
               script:
-                - riscos-amu standalone
+                - amu standalone
           artifacts:
             - path: rm/EtherGENET
           EOF
@@ -78,7 +78,7 @@ jobs:
           jobs:
             build:
               script:
-                - riscos-amu standalone BUILD64=1
+                - amu standalone BUILD64=1
           artifacts:
             - path: rm/EtherGENET
           EOF
