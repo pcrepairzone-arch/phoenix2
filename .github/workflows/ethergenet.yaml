@@ -39,14 +39,10 @@ jobs:
                 - Set TCPIPLibs$Path $.Libs.C.TCPIPLibs.
                 - Echo ===CLIB===
                 - Cat $.Libs.C.CLib
-                - Echo ===CLIBS_DIR===
-                - Cat $.Libs.C
-                - Echo ===ASMUTILS===
-                - IfThere $.Libs.C.AsmUtils Then Cat $.Libs.C.AsmUtils Else Echo no AsmUtils dir
-                - Echo ===SYNCLIB===
-                - IfThere $.Libs.C.SyncLib Then Cat $.Libs.C.SyncLib Else Echo no SyncLib dir
-                - Echo ===TBOXLIBS===
-                - IfThere $.Libs.C.TBoxLibs Then Cat $.Libs.C.TBoxLibs Else Echo no TBoxLibs dir
+                - Echo ===ASM_DIR===
+                - Cat $.Libs.C.Asm
+                - Echo ===TBOXLIBS_H===
+                - Cat $.Libs.C.TBoxLibs.h
                 - Echo ===CHDIR===
                 - Dir Drivers.EtherGENET-6
                 - Echo ===BUILD===
@@ -102,21 +98,17 @@ jobs:
             build:
               script:
                 - Set PyromaniacCC$Enable 1
-                - Set Run$Path <Run$Path>,$.Library.
+                - Set Run$Path <Run$Path>,$.Library64.
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Set C$Path $.Libs.C.CLib.,$.Libs.C.
                 - Set Hdr$Path $.Libs.Hdr.
                 - Set TCPIPLibs$Path $.Libs.C.TCPIPLibs.
                 - Echo ===CLIB===
                 - Cat $.Libs.C.CLib
-                - Echo ===CLIBS_DIR===
-                - Cat $.Libs.C
-                - Echo ===ASMUTILS===
-                - IfThere $.Libs.C.AsmUtils Then Cat $.Libs.C.AsmUtils Else Echo no AsmUtils dir
-                - Echo ===SYNCLIB===
-                - IfThere $.Libs.C.SyncLib Then Cat $.Libs.C.SyncLib Else Echo no SyncLib dir
-                - Echo ===TBOXLIBS===
-                - IfThere $.Libs.C.TBoxLibs Then Cat $.Libs.C.TBoxLibs Else Echo no TBoxLibs dir
+                - Echo ===ASM_DIR===
+                - Cat $.Libs.C.Asm
+                - Echo ===TBOXLIBS_H===
+                - Cat $.Libs.C.TBoxLibs.h
                 - Echo ===CHDIR===
                 - Dir Drivers.EtherGENET-6
                 - Echo ===BUILD===
