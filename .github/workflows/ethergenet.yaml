@@ -26,18 +26,19 @@ jobs:
       - name: Write 32-bit .robuild.yaml
         working-directory: Inet6Sources/Drivers/EtherGENET-6
         run: |
-          cat > .robuild.yaml << 'EOF'
+          cat > .robuild.yaml << 'ROBUILD'
           format: 1
           jobs:
             build:
               script:
                 - Set PyromaniacCC$Enable 1
-                - Set Run$Path ,%.,$.Library.
+                - Set Run$Path <Run$Path>,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
-                - amu standalone
+                - Show Run$Path
+                - $.Library.amu standalone
           artifacts:
-            - path: rm/EtherGENET
-          EOF
+            - path: rm32/EtherGENET
+          ROBUILD
 
       - name: Zip source
         working-directory: Inet6Sources/Drivers/EtherGENET-6
@@ -76,18 +77,19 @@ jobs:
       - name: Write 64-bit .robuild.yaml
         working-directory: Inet6Sources/Drivers/EtherGENET-6
         run: |
-          cat > .robuild.yaml << 'EOF'
+          cat > .robuild.yaml << 'ROBUILD'
           format: 1
           jobs:
             build:
               script:
                 - Set PyromaniacCC$Enable 1
-                - Set Run$Path ,%.,$.Library.
+                - Set Run$Path <Run$Path>,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
-                - amu standalone BUILD64=1
+                - Show Run$Path
+                - $.Library.amu standalone BUILD64=1
           artifacts:
-            - path: rm/EtherGENET
-          EOF
+            - path: rm64/EtherGENET
+          ROBUILD
 
       - name: Zip source
         working-directory: Inet6Sources/Drivers/EtherGENET-6
