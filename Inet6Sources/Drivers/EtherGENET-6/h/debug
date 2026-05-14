@@ -56,18 +56,6 @@ void prmbdata(int level, char* comment, void* m);
 
 #else
 
-#ifdef __CC_NORCROFT
-/* Norcroft (C90) does not support variadic macros (...).
- * Use static no-op functions with the correct signatures instead.
- * C89 allows ... in function parameter lists, just not in #define. */
-static void debugf(unsigned int level, char *fmt, ...) { (void)level; (void)fmt; }
-static void memdump(unsigned int level, void *p, int n) { (void)level; (void)p; (void)n; }
-static void mbufdump(unsigned int level, void *p) { (void)level; (void)p; }
-static void mbufchain(unsigned int level, void *p) { (void)level; (void)p; }
-static void debuglog(unsigned int level, char *s) { (void)level; (void)s; }
-static void dbpmem(int level, char *c, void *x, int bytes) { (void)level; (void)c; (void)x; (void)bytes; }
-static void prmbdata(int level, char *comment, void *m) { (void)level; (void)comment; (void)m; }
-#else
 #define debugf(...) do {} while (0)
 #define memdump(...) do {} while (0)
 #define mbufdump(...) do {} while (0)
@@ -75,7 +63,6 @@ static void prmbdata(int level, char *comment, void *m) { (void)level; (void)com
 #define debuglog(...) do {} while (0)
 #define dbpmem(...) do {} while (0)
 #define prmbdata(...) do {} while (0)
-#endif
 
 #endif
 
