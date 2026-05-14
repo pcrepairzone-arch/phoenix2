@@ -38,9 +38,9 @@ jobs:
                 - Set Hdr$Path $.Libs.Hdr.
                 - Set TCPIPLibs$Path $.Libs.TCPIPLibs.
                 - Echo ===LIBS===
-                - Dir $.Libs
+                - Cat $.Libs
                 - Echo ===CMODULE===
-                - Cat $.Libs.Makefiles.CModule
+                - Type $.Libs.Makefiles.CModule
                 - Echo ===BUILD===
                 - amu rm32.EtherGENET
                 - Echo ===AFTER BUILD===
@@ -100,9 +100,9 @@ jobs:
                 - Set Hdr$Path $.Libs.Hdr.
                 - Set TCPIPLibs$Path $.Libs.TCPIPLibs.
                 - Echo ===LIBS===
-                - Dir $.Libs
+                - Cat $.Libs
                 - Echo ===CMODULE===
-                - Cat $.Libs.Makefiles.CModule
+                - Type $.Libs.Makefiles.CModule
                 - Echo ===BUILD===
                 - amu rm64.EtherGENET BUILD64=1
                 - Echo ===AFTER BUILD===
