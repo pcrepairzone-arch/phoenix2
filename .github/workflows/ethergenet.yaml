@@ -1,0 +1,72 @@
+name: EtherGENET-6 RISC OS Build
+
+on:
+  push:
+    paths:
+      - 'Inet6Sources/Drivers/EtherGENET-6/**'
+      - '.github/workflows/ethergenet.yaml'
+  pull_request:
+    paths:
+      - 'Inet6Sources/Drivers/EtherGENET-6/**'
+  workflow_dispatch:
+
+jobs:
+  build-32bit:
+    name: Build EtherGENET-6 (AArch32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build 32-bit module
+        id: robuild32
+        uses: gerph/riscos-build-service-action@v1
+        with:
+          architecture: aarch32
+          timeout: 120
+          directory: Inet6Sources/Drivers/EtherGENET-6
+          output: /tmp/EtherGENET-32
+          capture-filename: build32.log
+
+      - name: Upload 32-bit module
+        uses: actions/upload-artifact@v4
+        with:
+          name: EtherGENET-aarch32
+          path: /tmp/EtherGENET-32*
+          if-no-files-found: warn
+
+      - name: Upload 32-bit build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-aarch32
+          path: Inet6Sources/Drivers/EtherGENET-6/build32.log
+
+  build-64bit:
+    name: Build EtherGENET-6 (AArch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build 64-bit module
+        id: robuild64
+        uses: gerph/riscos-build-service-action@v1
+        with:
+          architecture: aarch64
+          timeout: 120
+          directory: Inet6Sources/Drivers/EtherGENET-6
+          output: /tmp/EtherGENET-64
+          capture-filename: build64.log
+
+      - name: Upload 64-bit module
+        uses: actions/upload-artifact@v4
+        with:
+          name: EtherGENET-aarch64
+          path: /tmp/EtherGENET-64*
+          if-no-files-found: warn
+
+      - name: Upload 64-bit build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-aarch64
+          path: Inet6Sources/Drivers/EtherGENET-6/build64.log
