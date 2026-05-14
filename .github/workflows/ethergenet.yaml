@@ -30,11 +30,10 @@ jobs:
           format: 1
           jobs:
             build:
-              steps:
-                - name: Build 32-bit RAM module
-                  run: riscos-amu standalone
+              script:
+                - riscos-amu standalone
           artifacts:
-            - rm/EtherGENET
+            - path: rm/EtherGENET
           EOF
 
       - name: Zip source
@@ -78,11 +77,10 @@ jobs:
           format: 1
           jobs:
             build:
-              steps:
-                - name: Build 64-bit RAM module
-                  run: riscos-amu standalone BUILD64=1
+              script:
+                - riscos-amu standalone BUILD64=1
           artifacts:
-            - rm/EtherGENET
+            - path: rm/EtherGENET
           EOF
 
       - name: Zip source
