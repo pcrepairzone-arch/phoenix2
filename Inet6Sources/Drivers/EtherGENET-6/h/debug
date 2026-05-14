@@ -1,0 +1,69 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * Licensing/CDDL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2022 Andy Vawer & John Ballance.  All rights reserved.
+ * Use is subject to license terms.
+ */
+ 
+#ifndef __debug_h
+#define __debug_h
+
+#ifdef INDEBUG
+
+#define D_SWI 1
+#define D_ALL 0xffffffff
+#define D_THREAD 2
+#define D_OTHER 4
+#define D_IFMODULE 8
+#define D_SOCKET 16
+#define D_STACK 32
+#define D_TASK 64
+#define D_LOCK 128
+#define D_IP6 256
+#define D_CLOCK 512
+#define D_YIELD 1024
+#define D_FRAG 2048
+
+#ifndef D_DEBUGLEVEL
+#define D_DEBUGLEVEL (D_OTHER+D_SOCKET)
+#endif
+
+void debugf(unsigned int, char *,...);
+void memdump(unsigned int, void *,int);
+void mbufdump(unsigned int, void *);
+void debuglog(unsigned int, char *);
+void mbufchain(unsigned int, void *);
+void dbpmem(int level,char* c,void* x, int bytes);
+void prmbdata(int level, char* comment, void* m);
+
+#else
+
+#define debugf(...) do {} while (0)
+#define memdump(...) do {} while (0)
+#define mbufdump(...) do {} while (0)
+#define mbufchain(...) do {} while (0)
+#define debuglog(...) do {} while (0)
+#define dbpmem(...) do {} while (0)
+#define prmbdata(...) do {} while (0)
+
+#endif
+
+#endif

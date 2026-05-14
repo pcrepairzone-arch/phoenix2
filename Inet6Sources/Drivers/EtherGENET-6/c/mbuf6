@@ -1,0 +1,63 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * Licensing/CDDL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2022 Andy Vawer & John Ballance.  All rights reserved.
+ * Use is subject to license terms.
+ */
+ 
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "mbuf6.h"
+
+#include "ro_mbuf.h"
+
+dci4_mbctl6 mbctl6;
+
+#ifndef Socket_MBuf
+#define Socket_MBuf 0x41228
+#endif
+
+_kernel_oserror *mbuf_register6(void **mbctl_inuse, size_t minubs, size_t maxubs, size_t mincontig)
+{
+  memset(&mbctl6,0,sizeof(dci4_mbctl6));
+  mbctl6.mbcsize = sizeof(mbctl6);
+  mbctl6.mbcvers = MBUF_MANAGER_VERSION;
+  mbctl6.flags   = 0;
+  mbctl6.advminubs = minubs;
+  mbctl6.advmaxubs = maxubs;
+  mbctl6.mincontig = mincontig;
+
+  _kernel_oserror* e = _swix(Socket_MBuf, _INR(0,2), 0x100, &mbctl6, "EtherUSB");
+  if (!e) {
+    *mbctl_inuse = &mbctl6;
+  }
+
+  return e;
+}
+
+_kernel_oserror *mbuf_deregister6(void **inuse)
+{
+  _swix(Socket_MBuf,_INR(0,1),0x101,*inuse);
+  return NULL;
+}

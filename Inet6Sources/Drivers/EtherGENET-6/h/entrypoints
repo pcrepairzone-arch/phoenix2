@@ -1,0 +1,48 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * Licensing/CDDL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2022 Andy Vawer & John Ballance.  All rights reserved.
+ * Use is subject to license terms.
+ */
+ 
+#ifndef __entrypoints_h
+#define __entrypoints_h
+
+#include <stdint.h>
+
+/* list of entry points for internet stack to directly call
+   our driver.
+
+   ep_flags states which points are supported (bitmask)
+*/
+
+#define EPFLAG_TXPACKET 1
+
+typedef struct {
+  int      ep_flags;
+  uintptr_t r12;           /* module private word — must be pointer-sized.
+                            * On AArch32 this is 32 bits; on AArch64 it is
+                            * 64 bits.  Never use plain int here: a 64-bit
+                            * workspace pointer would be silently truncated. */
+  void    *tx_packet_veneer;
+} if_entrypoint;
+
+#endif

@@ -29,7 +29,8 @@ endif
 # ── Flags ────────────────────────────────────────────────────────────────────
 CFLAGS  = -Wall -O2 -ffreestanding -mcpu=$(CPU) -mgeneral-regs-only \
           -nostdlib -fno-builtin -Ikernel -I. -Idrivers -Inet -Iwimp \
-          -DPI_MODEL=$(BOARD_ID)
+          -DPI_MODEL=$(BOARD_ID) \
+          -mno-outline-atomics
 
 ASFLAGS = -mcpu=$(CPU)
 
@@ -97,12 +98,20 @@ OBJS = \
     net/tcp.o \
     net/udp.o \
     net/arp.o \
+    net/dhcp.o \
     wimp/wimp.o \
     wimp/window.o \
     wimp/event.o \
     wimp/menu.o \
     apps/paint.o \
     apps/netsurf.o
+# boot368: dhcp_test_module removed from production build.
+# The unit test ran at every boot using a fake MAC (de:ad:be:ef:00:01) and
+# synthetic frames, binding the DHCP state machine to 192.168.0.145 before
+# genet_init() ran.  When real DHCP started with the hardware MAC the test
+# binding was discarded and the full discover/offer/request/ack cycle had to
+# run again from scratch.  Tests/dhcp_test_module.c can be built standalone
+# or linked into a debug image; it does not belong in production.
 
 TARGET = phoenix64.img
 

@@ -1,0 +1,412 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * Licensing/CDDL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2022 Andy Vawer & John Ballance.  All rights reserved.
+ * Use is subject to license terms.
+ */
+ 
+#include <stdbool.h>
+#include <stdlib.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include <sys/types.h>
+#include <sys/systm.h>
+#include <sys/errno.h>
+#include <sys/socket.h>
+
+#include "dcistructs.h"
+#include <sys/errno.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <net/ethernet.h>
+#include "filtering.h"
+#include "egemodule.h"
+#include "AsmUtils/irqs.h"
+
+#include "SyncLib/synclib.h"
+
+#include "glue.h"
+#undef MCLBYTES
+#include "bus.h"
+
+#include "mii.h"
+#include "miivar.h"
+#include "bcmgenetvar.h"
+
+#include "debug.h"
+
+#include "internet6.h"
+#include "ro_mbuf.h"
+
+
+#define TX_SKIP(n, o)           (((n) + (o)) & (GENET_DMA_DESC_COUNT - 1))
+#define TX_NEXT(n)              TX_SKIP(n, 1)
+#define RX_NEXT(n)              (((n) + 1) & (GENET_DMA_DESC_COUNT - 1))
+#define TX_DESC_COUNT           GENET_DMA_DESC_COUNT
+#define RX_DESC_COUNT           GENET_DMA_DESC_COUNT
+#define RD4(sc, reg)                    \
+        bus_space_read_4((sc)->sc_bst, (sc)->sc_bsh, (reg))
+#define WR4(sc, reg, val)               \
+        bus_space_write_4((sc)->sc_bst, (sc)->sc_bsh, (reg), (val))
+
+#define GENET_LOCK(sc)          mutex_enter(&(sc)->sc_lock)
+#define GENET_UNLOCK(sc)        mutex_exit(&(sc)->sc_lock)
+#define GENET_ASSERT_LOCKED(sc) KASSERT(mutex_owned(&(sc)->sc_lock))
+
+void internet6_enumerate_drivers(_kernel_swi_regs *r)
+{
+  struct {
+    void *next;
+    unsigned int svc_number;
+    unsigned int stack_dci;
+  } *a = (void *)r;
+
+  struct {
+    ChDib dib;
+    unsigned int driver_dci;
+  } *info;
+
+  int unit;
+
+  // can we cope with the given DCI version?
+  if (a->stack_dci < DCI6VERSION) return;
+  for (unit = 0; unit < units; unit++) {
+    /* It is the caller's responsibility to free the chain */
+    info = malloc(sizeof(*info));
+    if (info != NULL) {
+      info->dib.chd_dib = &nicunit[unit]->dib;
+      info->dib.chd_next = (ChDib *)a->next;
+      info->driver_dci=DCI6VERSION;
+      a->next = info;
+    }
+  }
+}
+
+_kernel_oserror *internet6_filter(_kernel_swi_regs *r)
+{
+    struct filter_params {
+    unsigned int flags;
+    unsigned int unit;
+    unsigned int stack_status_handler;
+    unsigned int stack_can_tx_handler;
+    unsigned int reserved;
+    unsigned int pw;
+    unsigned int stack_rx_handler;
+  } *a = (void *)r;
+  
+/* not yet implemented in new stack...
+  if ((a->flags & (1<<3))==0) {
+    // old stack filter request.  Pass this on to the new stack for filtering
+    return _kernel_swi(Internet_Filter,r,r);
+  }
+*/
+
+  // new-style filter needs attaching or detaching
+        
+  if (a->flags & FILTER_RELEASE) {
+    if (nicunit[a->unit]->stack_rx_handler==0) return etherge_error_lookup((etherge_err_t)EPERM);
+    if (nicunit[a->unit]->stack_pw!=a->pw || nicunit[a->unit]->stack_rx_handler!=a->stack_rx_handler) return etherge_error_lookup((etherge_err_t)EPERM);
+
+    // clear handlers
+    nicunit[a->unit]->stack_pw             = 0;
+    nicunit[a->unit]->stack_rx_handler     = 0;
+    nicunit[a->unit]->stack_status_handler = 0;
+    nicunit[a->unit]->stack_can_tx_handler = 0;
+
+    return NULL;
+  }
+
+  if ((a->flags&1) == FILTER_CLAIM) {
+    nicunit[a->unit]->stack_pw             = a->pw;
+    nicunit[a->unit]->stack_rx_handler     = a->stack_rx_handler;
+    nicunit[a->unit]->stack_status_handler = a->stack_status_handler;
+    nicunit[a->unit]->stack_can_tx_handler = a->stack_can_tx_handler;
+
+    // set promiscuous mode
+    uint8_t alevel = ADDRLVL_PROMISCUOUS;
+    uint8_t elevel = ERRLVL_NO_ERRORS;
+    nicifp->if_ioctl(nicifp, SIOCSETERRLVL, &elevel);
+    nicifp->if_ioctl(nicifp, SIOCSETPROMISC, &alevel);
+
+
+    return NULL;
+  }
+
+  return etherge_error_lookup((etherge_err_t)EINVAL);
+}
+
+
+
+/* TX stuff */
+
+
+static int bus_dmamap_load_mbuf6(bus_dma_tag_t tag, bus_dmamap_t dmam, struct mbuf *chain, int flags)
+{
+        /* Just copy the mbuf into the uncached area */
+        if ((dmam == NULL) ||
+            (dmam->dm_nsegs == 0))
+        {
+                return EINVAL;
+        }
+
+m_copydata(chain,0,chain->m_pkthdr.len, (void *)dmam->dm_segs[0].ds_logical);
+//      EXPORT(chain, dmam->dm_mapsize, (void *)dmam->dm_segs[0].ds_logical);
+//      dmam->dm_segs[0].ds_len = m_length(chain);
+dmam->dm_segs[0].ds_len=chain->m_pkthdr.len;
+//for (dmam->dm_segs[0].ds_len = 0; chain; chain=chain->m_next) dmam->dm_segs[0].ds_len+=chain->m_len;
+
+        UNUSED(tag);
+        UNUSED(flags);
+
+        return 0;
+}
+
+extern void
+genet_setup_txdesc(struct genet_softc *sc, int index, int flags, bus_addr_t paddr, u_int len);
+
+static int
+genet_setup_txbuf6(struct genet_softc *sc, int index, struct mbuf *m)
+{
+        bus_dma_segment_t *segs;
+        int error, nsegs, cur, i;
+        uint32_t flags;
+
+        error = bus_dmamap_load_mbuf6(sc->sc_tx.buf_tag,
+            sc->sc_tx.buf_map[index].map, m, BUS_DMA_WRITE | BUS_DMA_NOWAIT);
+        if (error == EFBIG) {
+                device_printf(sc->sc_dev,
+                    "TX packet needs too many DMA segments, dropping...\n");
+                return 0;
+        }
+        if (error != 0)
+                return 0;
+
+        segs = sc->sc_tx.buf_map[index].map->dm_segs;
+        nsegs = sc->sc_tx.buf_map[index].map->dm_nsegs;
+
+        if (sc->sc_tx.queued >= GENET_DMA_DESC_COUNT - nsegs) {
+                bus_dmamap_unload(sc->sc_tx.buf_tag,
+                    sc->sc_tx.buf_map[index].map);
+                return -1;
+        }
+
+        flags = GENET_TX_DESC_STATUS_SOP |
+                GENET_TX_DESC_STATUS_CRC |
+                GENET_TX_DESC_STATUS_QTAG;
+
+        for (cur = index, i = 0; i < nsegs; i++) {
+                sc->sc_tx.buf_map[cur].mbuf = (i == 0 ? m : NULL);
+                if (i == nsegs - 1)
+                        flags |= GENET_TX_DESC_STATUS_EOP;
+
+                genet_setup_txdesc(sc, cur, flags, segs[i].ds_addr,
+                    segs[i].ds_len);
+
+                if (i == 0) {
+                        flags &= ~GENET_TX_DESC_STATUS_SOP;
+                        flags &= ~GENET_TX_DESC_STATUS_CRC;
+                }
+                cur = TX_NEXT(cur);
+        }
+
+        bus_dmamap_sync(sc->sc_tx.buf_tag, sc->sc_tx.buf_map[index].map,
+            0, sc->sc_tx.buf_map[index].map->dm_mapsize, BUS_DMASYNC_PREWRITE);
+
+        return nsegs;
+}
+
+void internet6_feedme(void)
+{
+  if (nic[0].interface[0].stack_can_tx_handler) {
+    __asm
+    {
+      movs r12, nic[0].interface[0].stack_pw;
+      blxne nic[0].interface[0].stack_can_tx_handler,{r12},{},{R0-R3,R12,LR,PSR}
+    }   
+  }
+}
+
+_kernel_oserror *internet6_transmit(_kernel_swi_regs *r)
+{
+  struct {
+    int                   flags;
+    int                   if_unit;
+    unsigned int          type;                   // Ethernet packet type
+    struct mbuf *         mbuf_list;              // List of mbufs to send
+    const uint8_t*        dst_addr;               // Destination ethernet address
+    const uint8_t*        src_addr;               // Source ethernet address if
+                                                  // TX_FAKESOURCE flag set
+  } *args=(void *)r;
+
+  int error=-1,s;
+  struct genet_softc *sc = nicifp->if_softc;
+
+  struct mbuf *chain,*list,*mb;
+  if (nicunit[args->if_unit]->ctrl->faulty) error = ENETDOWN;
+
+  s = splnet();
+
+  // send this packet
+  int index = sc->sc_tx.pidx & (TX_DESC_COUNT - 1);
+  int nsegs = genet_setup_txbuf6(sc, index, args->mbuf_list);
+
+  if (nsegs<=0) {
+    if (nsegs==-1) error=EIO;
+  } else {
+    index = TX_SKIP(index, nsegs);
+
+    sc->sc_tx.pidx = (sc->sc_tx.pidx + nsegs) & 0xffff;
+    WR4(sc, GENET_TX_DMA_PROD_INDEX(GENET_DMA_DEFAULT_QUEUE), sc->sc_tx.pidx);
+  }
+
+  r->r[0]=sc->sc_tx.queued>=GENET_DMA_DESC_COUNT-2; // pause packet flow if we're about to run out of space...
+  m_freem(args->mbuf_list);
+  splx(s);
+
+  return etherge_error_lookup((etherge_err_t)error);
+}
+
+_kernel_oserror *dci_tx_handler(_kernel_swi_regs *r, void *pw)
+{
+  struct {
+    int                   if_unit;
+    struct mbuf *         mbuf_list;              // List of mbufs to send
+  } *args=(void *)r;
+
+  int error=-1,s;
+  struct genet_softc *sc = nicifp->if_softc;
+
+  struct mbuf *chain,*list,*mb;
+  if (nicunit[args->if_unit]->ctrl->faulty) {
+    r->r[0]=1; // pause
+    return NULL;
+  }
+
+  // send this packet
+  s = splnet();
+  int index = sc->sc_tx.pidx & (TX_DESC_COUNT - 1);
+  int nsegs = genet_setup_txbuf6(sc, index, args->mbuf_list);
+
+  if (nsegs<=0) {
+    if (nsegs==-1) error=EIO;
+  } else {
+    index = TX_SKIP(index, nsegs);
+
+    sc->sc_tx.pidx = (sc->sc_tx.pidx + nsegs) & 0xffff;
+    WR4(sc, GENET_TX_DMA_PROD_INDEX(GENET_DMA_DEFAULT_QUEUE), sc->sc_tx.pidx);
+  }
+
+  r->r[0]=sc->sc_tx.queued>=GENET_DMA_DESC_COUNT-2; // pause packet flow if we're about to run out of space...
+  m_freem(args->mbuf_list);
+  splx(s);
+
+  return NULL;//etherge_error_lookup((etherge_err_t)error);
+}
+
+
+/* RX stuff */
+
+void genet_rxintr6(struct genet_softc *sc, int qid)
+{
+        struct ifnet *ifp = &sc->sc_ec.ec_if;
+        int error, index, len, n;
+        struct mbuf *packethdr, *payload;
+        uint32_t status, pidx, total;
+        char *pk;
+
+        pidx = RD4(sc, GENET_RX_DMA_PROD_INDEX(qid)) & 0xffff;
+        total = (pidx - sc->sc_rx.cidx) & 0xffff;
+
+        index = sc->sc_rx.cidx & (RX_DESC_COUNT - 1);
+        for (n = 0; n < total; n++) {
+                status = RD4(sc, GENET_RX_DESC_STATUS(index));
+                len = __SHIFTOUT(status, GENET_RX_DESC_STATUS_BUFLEN);
+
+                /* XXX check for errors */
+
+                bus_dmamap_sync(sc->sc_rx.buf_tag, sc->sc_rx.buf_map[index].map,
+                    0, sc->sc_rx.buf_map[index].map->dm_mapsize,
+                    BUS_DMASYNC_POSTREAD);
+                bus_dmamap_unload(sc->sc_rx.buf_tag, sc->sc_rx.buf_map[index].map);
+
+
+
+                /* DMA controller's length includes GENET_RBUF_ALIGN_2B lost to word alignment */
+                len -= ETHER_ALIGN;
+
+                /* Get a single for the header so it's easier to ditch later */
+                packethdr = m_gethdr(M_DONTWAIT,MT_HEADER);
+                if (!packethdr) {
+                        glue_inc_rxerrors(ifp);
+                        goto next;
+                }
+
+                payload=m_get(M_DONTWAIT,MT_DATA);
+                if (!payload) {
+                  m_free(packethdr);
+                  glue_inc_rxerrors(ifp);
+                  goto next;
+                }
+                if (len-ETHER_HDR_LEN>MLEN) {
+                  m_clget(payload,M_DONTWAIT,len-ETHER_HDR_LEN); // larger packets need a cluster
+                  if ((payload->m_flags & M_EXT)==0) {
+                    m_free(payload);
+                    m_free(packethdr);
+                    glue_inc_rxerrors(ifp);
+                    goto next;
+                  }
+                }
+
+                // link the mbufs together
+                packethdr->m_next=payload;
+                packethdr->m_len=14; // size of ethernet header
+                payload->m_len=len-14; // payload size w/o header
+
+                /* Copy data from the uncached memory into the mbufs */
+                pk=(char *)(ETHER_ALIGN + (uintptr_t)sc->sc_rx.buf_map[index].map->dm_segs[0].ds_logical);
+                memcpy(mtod(packethdr,char *),pk,14);
+                memcpy(mtod(payload,char *),((char *)pk)+14,len-14);
+
+                /* Hand off to stack */
+                // note assumption there's only one controller, as per glue.c
+                // we're also assuming a single interface only...
+                if (nic[0].interface[0].stack_rx_handler) {
+                  __asm
+                  {
+                    mov r0,&nic[0].interface[0].dib
+                    mov r1,packethdr
+                    mov r12,nic[0].interface[0].stack_pw
+                    blx nic[0].interface[0].stack_rx_handler,{r0,r1,r12},{},{R0-R3,R12,LR,PSR}
+                  }
+                }
+                nic[0].interface[0].rx_packets++;
+                nic[0].interface[0].rx_bytes+=len;
+
+next:
+
+                index = RX_NEXT(index);
+
+                sc->sc_rx.cidx = (sc->sc_rx.cidx + 1) & 0xffff;
+                WR4(sc, GENET_RX_DMA_CONS_INDEX(qid), sc->sc_rx.cidx);
+        }
+}

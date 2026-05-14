@@ -1,8 +1,6 @@
 /*
  * genet.h — Phoenix interface for BCM2711 GENETv5 Ethernet driver.
  * boot302: polling-mode TX/RX, no IRQs.
- * boot343: IRQ-driven RX via GIC SPI 157 (INTID 189), INTRL2 RXDMA_DONE.
- * boot344: mask-on-entry / rearm pattern to fix level-triggered IRQ storm.
  */
 #ifndef GENET_H
 #define GENET_H
@@ -26,37 +24,30 @@ int  genet_send(const void *buf, uint32_t len);
  * Call before and after genet_send to confirm TDMA is consuming descriptors. */
 void genet_tx_diag(uint32_t *prod_out, uint32_t *cons_out);
 
-/* boot334: Diagnostic counters for the [WIMP] heartbeat.
- *   genet_rx_count_raw  — software count of frames successfully received.
- *   genet_tx_cons_raw   — hardware TX DMA consumer index (frames consumed).
- *   genet_rx_fcs_raw    — software count of frames dropped due to CRC error. */
-uint32_t genet_rx_count_raw(void);
-uint32_t genet_tx_cons_raw(void);
-uint32_t genet_rx_fcs_raw(void);
-
 /* Poll for a received frame.  Copies into buf (up to maxlen bytes).
- * Returns frame length on success, 0 if no frame waiting, -1 on error. */
+ * Returns frame length on success, 0 if no frame waiting or frame skipped
+ * (error/oversized — consumer index still advanced), -1 on driver not init. */
 int  genet_poll_rx(void *buf, uint32_t maxlen);
+
+/* boot347: Returns number of frames currently waiting in the RDMA ring.
+ * Use to distinguish "ring empty" from "frame skipped due to error":
+ *   poll_rx()==0 && rx_available()>0  -> frame was skipped (error/oversized)
+ *   poll_rx()==0 && rx_available()==0 -> ring is genuinely empty            */
+int  genet_rx_available(void);
 
 /* Returns 1 if PHY link is up (autoneg complete), 0 otherwise. */
 int  genet_link_up(void);
 
+/* Diagnostic counters and raw index reads (boot347) */
+uint32_t genet_rx_pidx_raw(void);   /* RX DMA producer index (hardware)        */
+uint32_t genet_rx_count_raw(void);  /* frames successfully delivered to caller  */
+uint32_t genet_rx_fcs_raw(void);    /* frames dropped due to CRC/FCS error      */
+uint32_t genet_tx_cons_raw(void);   /* TX DMA consumer index (mib= field)       */
+
+/* Apply negotiated PHY speed/duplex to the UMAC (call on link-up). */
+void genet_apply_link(void);
+
 /* Board MAC address populated by genet_init() */
 extern uint8_t g_genet_mac[6];
-
-/* boot343: IRQ-driven RX flag.
- * Set to 1 by the GENET RXDMA_DONE IRQ handler when a frame arrives.
- * Cleared by the WIMP drain loop after the RX ring is emptied.
- * Volatile: written in IRQ context (exc_irq_handler path), read in
- * task context (wimp_task).  On single-core bare-metal, volatile is
- * sufficient — no atomic needed.                                      */
-extern volatile int g_genet_rx_pending;
-
-/* boot344: Re-arm RXDMA_DONE IRQ after draining the RX ring.
- * Call after the drain while-loop exits (ring empty) to re-enable
- * INTRL2 RXDMA_DONE so the next arriving frame triggers a fresh IRQ.
- * Implements the mask-on-entry / unmask-after-drain pattern that
- * prevents the level-triggered IRQ storm seen in boot343.            */
-void genet_rx_irq_rearm(void);
 
 #endif /* GENET_H */

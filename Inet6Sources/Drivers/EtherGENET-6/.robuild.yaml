@@ -1,0 +1,10 @@
+# .robuild.yaml — EtherGENET-6 RISC OS build service configuration
+# The CI workflow overwrites this file per-job with the correct AMU command.
+# This default runs the 32-bit build; for 64-bit the workflow writes BUILD64=1.
+format: 1
+jobs:
+  build:
+    script:
+      - amu_machine standalone
+artifacts:
+  - path: rm/EtherGENET

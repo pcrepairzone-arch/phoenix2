@@ -27,8 +27,10 @@ typedef struct arp_hdr {
     uint32_t dst_ip;
 } arp_hdr_t;
 
-void arp_init(void);
-void arp_input(netdev_t *dev, void *data, size_t len);
-int arp_resolve(netdev_t *dev, uint32_t ip, uint8_t *mac);
+/* boot370: updated signatures — PhoenixARP uses raw byte arrays,
+ * no netdev_t dependency (genet_send() called directly).          */
+void arp_init    (void);
+void arp_input   (uint8_t *frame, int len);
+int  arp_resolve (const uint8_t ip[4], uint8_t mac_out[6]);
 
 #endif /* ARP_H */

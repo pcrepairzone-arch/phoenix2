@@ -1,0 +1,153 @@
+name: EtherGENET-6 RISC OS Build
+
+on:
+  push:
+    paths:
+      - 'Inet6Sources/Drivers/EtherGENET-6/**'
+      - '.github/workflows/ethergenet.yaml'
+  pull_request:
+    paths:
+      - 'Inet6Sources/Drivers/EtherGENET-6/**'
+  workflow_dispatch:
+
+jobs:
+  build-32bit:
+    name: Build EtherGENET-6 (AArch32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download riscos-build-online
+        run: |
+          curl -L -o "$GITHUB_WORKSPACE/riscos-build-online" \
+            "https://github.com/gerph/robuild-client/releases/download/v0.07/riscos-build-online"
+          chmod +x "$GITHUB_WORKSPACE/riscos-build-online"
+
+      - name: Write 32-bit .robuild.yaml
+        working-directory: Inet6Sources
+        run: |
+          cat > .robuild.yaml << 'ROBUILD'
+          format: 1
+          jobs:
+            build:
+              script:
+                - Set PyromaniacCC$Enable 1
+                - Set Run$Path <Run$Path>,$.Library.
+                - Set Makefiles$Path $.Libs.Makefiles.
+                - Set C$Path $.Libs.C.CLib.,$.Libs.C.
+                - Set Hdr$Path $.Libs.Hdr.
+                - Set TCPIPLibs$Path $.Libs.C.TCPIPLibs.
+                - Echo ===CLIB===
+                - Cat $.Libs.C.CLib
+                - Echo ===CLIBS_DIR===
+                - Cat $.Libs.C
+                - Echo ===ASMUTILS===
+                - IfThere $.Libs.C.AsmUtils Then Cat $.Libs.C.AsmUtils Else Echo no AsmUtils dir
+                - Echo ===SYNCLIB===
+                - IfThere $.Libs.C.SyncLib Then Cat $.Libs.C.SyncLib Else Echo no SyncLib dir
+                - Echo ===TBOXLIBS===
+                - IfThere $.Libs.C.TBoxLibs Then Cat $.Libs.C.TBoxLibs Else Echo no TBoxLibs dir
+                - Echo ===CHDIR===
+                - Dir Drivers.EtherGENET-6
+                - Echo ===BUILD===
+                - amu LIBS= CLIB_ZM= rm32.EtherGENET
+                - Echo ===AFTER BUILD===
+                - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
+                - IfThere rm Then Cat rm Else Echo no rm dir
+                - IfThere oz32 Then Cat oz32 Else Echo no oz32 dir
+          artifacts:
+            - path: Drivers/EtherGENET-6/rm32/EtherGENET
+          ROBUILD
+
+      - name: Zip source
+        working-directory: Inet6Sources
+        run: zip -q9r /tmp/source32.zip .
+
+      - name: Build via RISC OS build service
+        run: |
+          "$GITHUB_WORKSPACE/riscos-build-online" \
+            -i /tmp/source32.zip \
+            -A aarch32 \
+            -t 120 \
+            -o /tmp/EtherGENET-32 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build32.log"
+
+      - name: Upload module
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: EtherGENET-aarch32
+          path: |
+            /tmp/EtherGENET-32*
+            ${{ github.workspace }}/build32.log
+
+  build-64bit:
+    name: Build EtherGENET-6 (AArch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download riscos-build-online
+        run: |
+          curl -L -o "$GITHUB_WORKSPACE/riscos-build-online" \
+            "https://github.com/gerph/robuild-client/releases/download/v0.07/riscos-build-online"
+          chmod +x "$GITHUB_WORKSPACE/riscos-build-online"
+
+      - name: Write 64-bit .robuild.yaml
+        working-directory: Inet6Sources
+        run: |
+          cat > .robuild.yaml << 'ROBUILD'
+          format: 1
+          jobs:
+            build:
+              script:
+                - Set PyromaniacCC$Enable 1
+                - Set Run$Path <Run$Path>,$.Library.
+                - Set Makefiles$Path $.Libs.Makefiles.
+                - Set C$Path $.Libs.C.CLib.,$.Libs.C.
+                - Set Hdr$Path $.Libs.Hdr.
+                - Set TCPIPLibs$Path $.Libs.C.TCPIPLibs.
+                - Echo ===CLIB===
+                - Cat $.Libs.C.CLib
+                - Echo ===CLIBS_DIR===
+                - Cat $.Libs.C
+                - Echo ===ASMUTILS===
+                - IfThere $.Libs.C.AsmUtils Then Cat $.Libs.C.AsmUtils Else Echo no AsmUtils dir
+                - Echo ===SYNCLIB===
+                - IfThere $.Libs.C.SyncLib Then Cat $.Libs.C.SyncLib Else Echo no SyncLib dir
+                - Echo ===TBOXLIBS===
+                - IfThere $.Libs.C.TBoxLibs Then Cat $.Libs.C.TBoxLibs Else Echo no TBoxLibs dir
+                - Echo ===CHDIR===
+                - Dir Drivers.EtherGENET-6
+                - Echo ===BUILD===
+                - amu LIBS= CLIB_ZM= rm64.EtherGENET BUILD64=1
+                - Echo ===AFTER BUILD===
+                - IfThere rm64 Then Cat rm64 Else Echo no rm64 dir
+                - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
+                - IfThere rm Then Cat rm Else Echo no rm dir
+                - IfThere oz64 Then Cat oz64 Else Echo no oz64 dir
+          artifacts:
+            - path: Drivers/EtherGENET-6/rm64/EtherGENET
+          ROBUILD
+
+      - name: Zip source
+        working-directory: Inet6Sources
+        run: zip -q9r /tmp/source64.zip .
+
+      - name: Build via RISC OS build service
+        run: |
+          "$GITHUB_WORKSPACE/riscos-build-online" \
+            -i /tmp/source64.zip \
+            -A aarch64 \
+            -t 120 \
+            -o /tmp/EtherGENET-64 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build64.log"
+
+      - name: Upload module
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: EtherGENET-aarch64
+          path: |
+            /tmp/EtherGENET-64*
+            ${{ github.workspace }}/build64.log
