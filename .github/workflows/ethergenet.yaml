@@ -36,10 +36,13 @@ jobs:
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Set C$Path $.Libs.C.
                 - Set Hdr$Path $.Libs.Hdr.
-                - Echo ===MAKEFILES===
-                - Cat $.Libs.Makefiles
+                - Set TCPIPLibs$Path $.Libs.TCPIPLibs.
+                - Echo ===LIBS===
+                - Dir $.Libs
+                - Echo ===CMODULE===
+                - Cat $.Libs.Makefiles.CModule
                 - Echo ===BUILD===
-                - amu standalone
+                - amu rm32.EtherGENET
                 - Echo ===AFTER BUILD===
                 - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
                 - IfThere rm Then Cat rm Else Echo no rm dir
@@ -95,10 +98,13 @@ jobs:
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Set C$Path $.Libs.C.
                 - Set Hdr$Path $.Libs.Hdr.
-                - Echo ===MAKEFILES===
-                - Cat $.Libs.Makefiles
+                - Set TCPIPLibs$Path $.Libs.TCPIPLibs.
+                - Echo ===LIBS===
+                - Dir $.Libs
+                - Echo ===CMODULE===
+                - Cat $.Libs.Makefiles.CModule
                 - Echo ===BUILD===
-                - amu standalone BUILD64=1
+                - amu rm64.EtherGENET BUILD64=1
                 - Echo ===AFTER BUILD===
                 - IfThere rm64 Then Cat rm64 Else Echo no rm64 dir
                 - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
