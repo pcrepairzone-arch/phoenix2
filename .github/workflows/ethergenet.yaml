@@ -36,8 +36,9 @@ jobs:
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Set C$Path $.Libs.C.
                 - Set Hdr$Path $.Libs.Hdr.
-                - Echo ===C LIB DIR===
-                - Cat $.Libs.C
+                - Set TCPIPLibs$Path $.Libs.C.TCPIPLibs.
+                - Echo ===CLIB===
+                - Cat $.Libs.C.CLib
                 - Echo ===CHDIR===
                 - Dir Drivers.EtherGENET-6
                 - Echo ===BUILD===
@@ -97,8 +98,9 @@ jobs:
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Set C$Path $.Libs.C.
                 - Set Hdr$Path $.Libs.Hdr.
-                - Echo ===C LIB DIR===
-                - Cat $.Libs.C
+                - Set TCPIPLibs$Path $.Libs.C.TCPIPLibs.
+                - Echo ===CLIB===
+                - Cat $.Libs.C.CLib
                 - Echo ===CHDIR===
                 - Dir Drivers.EtherGENET-6
                 - Echo ===BUILD===
