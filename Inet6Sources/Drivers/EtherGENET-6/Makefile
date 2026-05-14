@@ -48,14 +48,14 @@ CDFLAGS     += -DDEBUG
 #
 # Specials for install (and standalone because they use the same override)
 #
-standalone_custom: rm.${SA_TARGET}
+standalone_custom: ${RMDIR}.${SA_TARGET}
 	@${ECHO} ${COMPONENT}: ram module built
 
 install_custom: install_${TARGET}; @
 
-install_EtherGENET: rm.${SA_TARGET}
+install_EtherGENET: ${RMDIR}.${SA_TARGET}
 	${MKDIR} ${INSTDIR}
-	${CP} rm.${SA_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
+	${CP} ${RMDIR}.${SA_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: ram module installed
 
 install_AutoSense: AutoSense.${COMPONENT}

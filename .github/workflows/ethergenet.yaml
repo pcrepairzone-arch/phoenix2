@@ -93,7 +93,11 @@ jobs:
                 - Set PyromaniacCC$Enable 1
                 - Set Run$Path <Run$Path>,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
-                - Show Run$Path
+                - Set C$Path $.Libs.C.
+                - Set Hdr$Path $.Libs.Hdr.
+                - Echo ===MAKEFILES===
+                - Cat $.Libs.Makefiles
+                - Echo ===BUILD===
                 - amu standalone BUILD64=1
                 - Echo ===AFTER BUILD===
                 - IfThere rm64 Then Cat rm64 Else Echo no rm64 dir
