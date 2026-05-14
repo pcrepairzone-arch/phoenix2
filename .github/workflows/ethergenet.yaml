@@ -40,7 +40,13 @@ jobs:
                 - Echo ===CLIB===
                 - Cat $.Libs.C.CLib
                 - Echo ===CLIBS_DIR===
-                - Dir $.Libs.C.
+                - Cat $.Libs.C
+                - Echo ===ASMUTILS===
+                - IfThere $.Libs.C.AsmUtils Then Cat $.Libs.C.AsmUtils Else Echo no AsmUtils dir
+                - Echo ===SYNCLIB===
+                - IfThere $.Libs.C.SyncLib Then Cat $.Libs.C.SyncLib Else Echo no SyncLib dir
+                - Echo ===TBOXLIBS===
+                - IfThere $.Libs.C.TBoxLibs Then Cat $.Libs.C.TBoxLibs Else Echo no TBoxLibs dir
                 - Echo ===CHDIR===
                 - Dir Drivers.EtherGENET-6
                 - Echo ===BUILD===
@@ -104,7 +110,13 @@ jobs:
                 - Echo ===CLIB===
                 - Cat $.Libs.C.CLib
                 - Echo ===CLIBS_DIR===
-                - Dir $.Libs.C.
+                - Cat $.Libs.C
+                - Echo ===ASMUTILS===
+                - IfThere $.Libs.C.AsmUtils Then Cat $.Libs.C.AsmUtils Else Echo no AsmUtils dir
+                - Echo ===SYNCLIB===
+                - IfThere $.Libs.C.SyncLib Then Cat $.Libs.C.SyncLib Else Echo no SyncLib dir
+                - Echo ===TBOXLIBS===
+                - IfThere $.Libs.C.TBoxLibs Then Cat $.Libs.C.TBoxLibs Else Echo no TBoxLibs dir
                 - Echo ===CHDIR===
                 - Dir Drivers.EtherGENET-6
                 - Echo ===BUILD===
