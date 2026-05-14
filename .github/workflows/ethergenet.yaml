@@ -34,7 +34,11 @@ jobs:
                 - Set PyromaniacCC$Enable 1
                 - Set Run$Path <Run$Path>,$.Library.
                 - Set Makefiles$Path $.Libs.Makefiles.
-                - Show Run$Path
+                - Set C$Path $.Libs.C.
+                - Set Hdr$Path $.Libs.Hdr.
+                - Echo ===MAKEFILES===
+                - Cat $.Libs.Makefiles
+                - Echo ===BUILD===
                 - amu standalone
                 - Echo ===AFTER BUILD===
                 - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
