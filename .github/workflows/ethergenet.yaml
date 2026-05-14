@@ -17,29 +17,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build 32-bit module
-        id: robuild32
-        uses: gerph/riscos-build-service-action@v1
-        with:
-          architecture: aarch32
-          timeout: 120
-          directory: Inet6Sources/Drivers/EtherGENET-6
-          output: /tmp/EtherGENET-32
-          capture-filename: build32.log
+      - name: Download riscos-build-online
+        run: |
+          curl -L -o "$GITHUB_WORKSPACE/riscos-build-online" \
+            "https://github.com/gerph/robuild-client/releases/download/v0.07/riscos-build-online"
+          chmod +x "$GITHUB_WORKSPACE/riscos-build-online"
 
-      - name: Upload 32-bit module
+      - name: Write 32-bit .robuild.yaml
+        working-directory: Inet6Sources/Drivers/EtherGENET-6
+        run: |
+          cat > .robuild.yaml << 'EOF'
+          format: 1
+          jobs:
+            build:
+              steps:
+                - name: Build 32-bit RAM module
+                  run: riscos-amu standalone
+          artifacts:
+            - rm/EtherGENET
+          EOF
+
+      - name: Zip source
+        working-directory: Inet6Sources/Drivers/EtherGENET-6
+        run: zip -q9r /tmp/source32.zip .
+
+      - name: Build via RISC OS build service
+        run: |
+          "$GITHUB_WORKSPACE/riscos-build-online" \
+            -i /tmp/source32.zip \
+            -A aarch32 \
+            -t 120 \
+            -o /tmp/EtherGENET-32 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build32.log"
+
+      - name: Upload module
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: EtherGENET-aarch32
-          path: /tmp/EtherGENET-32*
-          if-no-files-found: warn
-
-      - name: Upload 32-bit build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-aarch32
-          path: Inet6Sources/Drivers/EtherGENET-6/build32.log
+          path: |
+            /tmp/EtherGENET-32*
+            ${{ github.workspace }}/build32.log
 
   build-64bit:
     name: Build EtherGENET-6 (AArch64)
@@ -47,26 +65,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build 64-bit module
-        id: robuild64
-        uses: gerph/riscos-build-service-action@v1
-        with:
-          architecture: aarch64
-          timeout: 120
-          directory: Inet6Sources/Drivers/EtherGENET-6
-          output: /tmp/EtherGENET-64
-          capture-filename: build64.log
+      - name: Download riscos-build-online
+        run: |
+          curl -L -o "$GITHUB_WORKSPACE/riscos-build-online" \
+            "https://github.com/gerph/robuild-client/releases/download/v0.07/riscos-build-online"
+          chmod +x "$GITHUB_WORKSPACE/riscos-build-online"
 
-      - name: Upload 64-bit module
+      - name: Write 64-bit .robuild.yaml
+        working-directory: Inet6Sources/Drivers/EtherGENET-6
+        run: |
+          cat > .robuild.yaml << 'EOF'
+          format: 1
+          jobs:
+            build:
+              steps:
+                - name: Build 64-bit RAM module
+                  run: riscos-amu standalone BUILD64=1
+          artifacts:
+            - rm/EtherGENET
+          EOF
+
+      - name: Zip source
+        working-directory: Inet6Sources/Drivers/EtherGENET-6
+        run: zip -q9r /tmp/source64.zip .
+
+      - name: Build via RISC OS build service
+        run: |
+          "$GITHUB_WORKSPACE/riscos-build-online" \
+            -i /tmp/source64.zip \
+            -A aarch64 \
+            -t 120 \
+            -o /tmp/EtherGENET-64 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build64.log"
+
+      - name: Upload module
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: EtherGENET-aarch64
-          path: /tmp/EtherGENET-64*
-          if-no-files-found: warn
-
-      - name: Upload 64-bit build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-aarch64
-          path: Inet6Sources/Drivers/EtherGENET-6/build64.log
+          path: |
+            /tmp/EtherGENET-64*
+            ${{ github.workspace }}/build64.log
