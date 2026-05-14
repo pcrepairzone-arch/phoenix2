@@ -36,6 +36,10 @@ jobs:
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Show Run$Path
                 - amu standalone
+                - Echo ===AFTER BUILD===
+                - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
+                - IfThere rm Then Cat rm Else Echo no rm dir
+                - IfThere oz32 Then Cat oz32 Else Echo no oz32 dir
           artifacts:
             - path: rm32/EtherGENET
           ROBUILD
@@ -87,6 +91,11 @@ jobs:
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Show Run$Path
                 - amu standalone BUILD64=1
+                - Echo ===AFTER BUILD===
+                - IfThere rm64 Then Cat rm64 Else Echo no rm64 dir
+                - IfThere rm32 Then Cat rm32 Else Echo no rm32 dir
+                - IfThere rm Then Cat rm Else Echo no rm dir
+                - IfThere oz64 Then Cat oz64 Else Echo no oz64 dir
           artifacts:
             - path: rm64/EtherGENET
           ROBUILD
