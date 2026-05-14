@@ -30,7 +30,7 @@
 
 COMPONENT    = EtherGENET
 TARGET      ?= EtherGENET
-OBJS         = egemodule bcmgenet glue filtering filteringasm mbuf6 internet6
+OBJS         = o.egemodule o.bcmgenet o.glue o.filtering o.filteringasm o.mbuf6 o.internet6
 CMHGDEPENDS  = egemodule glue
 ROMCDEFINES  = -DROM
 RES_AREA     = etherge_messages
