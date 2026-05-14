@@ -36,12 +36,9 @@ jobs:
             - path: rm/EtherGENET
           EOF
 
-      - name: Zip source (rename Makefile to Makefile,fe1 for RISC OS)
+      - name: Zip source
         working-directory: Inet6Sources/Drivers/EtherGENET-6
-        run: |
-          cp Makefile "Makefile,fe1"
-          zip -q9r /tmp/source32.zip .
-          rm "Makefile,fe1"
+        run: zip -q9r /tmp/source32.zip .
 
       - name: Build via RISC OS build service
         run: |
@@ -97,12 +94,9 @@ jobs:
             - path: rm/EtherGENET
           EOF
 
-      - name: Zip source (rename Makefile to Makefile,fe1 for RISC OS)
+      - name: Zip source
         working-directory: Inet6Sources/Drivers/EtherGENET-6
-        run: |
-          cp Makefile "Makefile,fe1"
-          zip -q9r /tmp/source64.zip .
-          rm "Makefile,fe1"
+        run: zip -q9r /tmp/source64.zip .
 
       - name: Build via RISC OS build service
         run: |

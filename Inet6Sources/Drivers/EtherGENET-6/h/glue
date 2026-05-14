@@ -1,0 +1,246 @@
+/*
+ * Copyright (c) 2019, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#ifndef GLUE_H
+#define GLUE_H
+
+/* Debug switches, not really interrupt safe, use with caution */
+#define GLUE_DUMP_TX       0
+#define GLUE_DUMP_RX       0
+#define GLUE_DUMP_EUI48(k) do { size_t i; \
+                                for (i = 0; i < ETHER_ADDR_LEN; i++) printf("%02X ", k ## [i]); \
+                           } while (0);
+
+/* Interface to GENET backend driver */
+struct ifnet
+{
+	void    *if_softc;
+
+	char     if_xname[4];     /* Unused by RISC OS */
+	uint32_t if_flags;        /* Unused by RISC OS */
+	uint32_t if_capabilities; /* Unused by RISC OS */
+	uint32_t if_capenable;    /* Unused by RISC OS */
+
+	/* Link level structure just used as a pointer to EUI48 */
+	struct sockaddr_dl *if_sadl;
+
+	int (*if_init)        /* Initialise */
+	      (struct ifnet *);
+	int (*if_ioctl)       /* I/O control */
+	      (struct ifnet *, u_long, void *);
+	void (*if_watchdog)   /* Watchdog */
+	      (struct ifnet *);
+	void (*if_start)      /* Start interface */
+	      (struct ifnet *);
+	void (*if_stop)       /* Stop interface */
+	      (struct ifnet *, int);
+
+	/* Cache of latest PHY status */
+	uint16_t phy_auxsts;
+
+	/* Broadcom BCM54213 vendor specific */
+#define PHY_ID_BCM54213     0x84A0600D
+
+#define MII_BCM_AUXSTS      0x19
+#define AUXSTS_ACOMP        0x8000
+#define AUXSTS_AN_ACK       0x4000
+#define AUXSTS_AN_ACK_D     0x2000
+#define AUXSTS_AN_NPW       0x1000
+#define AUXSTS_AN_RES       0x0700
+#define AUXSTS_LINK         0x0004
+#define AUXSTS_RES_1000F    0x0700
+#define AUXSTS_RES_1000H    0x0600
+#define AUXSTS_RES_100F     0x0500
+#define AUXSTS_RES_100T4    0x0400
+#define AUXSTS_RES_100H     0x0300
+#define AUXSTS_RES_10F      0x0200
+#define AUXSTS_RES_10H      0x0100
+#define AUXSTS_RES_IS_FULL(r) (((r) == AUXSTS_RES_1000F) || ((r) == AUXSTS_RES_100F) || ((r) == AUXSTS_RES_10F))
+#define AUXSTS_RES_IS_1000(r) (((r) == AUXSTS_RES_1000F) || ((r) == AUXSTS_RES_1000H))
+#define AUXSTS_RES_IS_100(r)  (((r) == AUXSTS_RES_100F) || ((r) == AUXSTS_RES_100T4) || ((r) == AUXSTS_RES_100H))
+#define AUXSTS_RES_IS_10(r)   (((r) == AUXSTS_RES_10F) || ((r) == AUXSTS_RES_10H))
+
+#define MII_BCM_SHADOW      0x1C
+#define SHADOW_SELECT_SHIFT 10
+#define SHADOW_WRITE_EN     (1<<15)
+#define SHADOW_VALUE_MASK   0x3FF
+#define SHADOW_REG_LED_CTRL 9  /* LED control */
+#define SHADOW_REG_LEDS1    13 /* Even more LED control */
+
+	/* Micrel KSZ9131 vendor specific */
+#define PHY_ID_KSZ9131      0x16400022
+
+#define MII_KSZ_LEDSELECT   0x16
+
+#define MII_KSZ_LEDBEHAVE   0x17
+#define LEDBEHAVE_STRETCH1  (1<<5)
+#define LEDBEHAVE_STRETCH2  (1<<6)
+#define LEDBEHAVE_SPLIT1    (1<<0)
+#define LEDBEHAVE_SPLIT2    (1<<1)
+
+#define MII_KSZ_MDIODRV     0x19
+#define MDIODRV_PUSHPULL    (1<<1)
+
+#define MII_KSZ_LEDM9031    0x1A
+#define LEDM9031_NORMAL     (1<<14)
+
+#define MII_KSZ_CONTROL     0x1F
+#define CONTROL_1000T       64
+#define CONTROL_100TX       32
+#define CONTROL_10BT        16
+#define CONTROL_DUPLEX      8
+
+	/* Watchdog */
+	uint32_t if_timer;
+
+	/* Handover mbuf chain */
+	struct mbuf          *if_snd;
+};
+
+/* Just enough ethercom to make it compile */
+struct ethercom
+{
+	struct ifnet ec_if;
+	struct mii_data *ec_mii;
+	uint32_t ec_capabilities;
+};
+
+/* Porting definitions */
+#define KASSERT(k)                 /* Nothing */
+#define IFQ_SET_READY(q)           /* Nothing */
+#define IFQ_DEQUEUE(q,v)           do { v = *(q); *(q) = NULL; } while (0);
+#define IFQ_POLL(q,v)              do { v = *(q); } while (0);
+#define IFQ_SET_MAXLEN(q,v)        /* Nothing */
+#define m_length(m)                (MBCTL.count_bytes)(&MBCTL,(m))
+#define powerof2(x)                ((((x)-1)&(x))==0)
+#define CTASSERT(e)                CTASSERT0(e, __LINE__)
+#define CTASSERT0(e,n)             CTASSERT1(e,n)
+#define CTASSERT1(e,n)             typedef char _ct ## n[(e) ? 1 : -1]
+#define device_xname(k)            "ege"
+#define device_private(k)          (struct genet_softc *)(k)
+#define device_parent(k)           (device_t)(k)
+#define MCLBYTES                   2048
+#define hz                         1
+#define __BIT(k)                   ((k>=32) ? 0 : 1u<<((k)&31))
+#define __BITS(hi,lo)              ((__BIT((hi)+1)-1)^(__BIT((lo))-1))
+#define __SHIFTOUT(a,b)            shiftout(a,b)
+#define __SHIFTIN(a,b)             shiftin(a,b)
+#define ifmedia_init(a,b,c,d)      (a)->ifm_cur = (a)
+#define ifmedia_set(a,b)           /* Nothing */
+#define if_attach(a)               glue_attachif(a)
+#define if_detach(a)               /* Nothing */
+#define ether_ifattach(a,b)        /* Nothing */
+#define ether_ifdetach(a)          /* Nothing */
+#define ether_sprintf(k)           "Unused"
+#define ether_ioctl(a,b,c)         (0 * (int)(b) * (int)(c))
+#define ETHERCAP_VLAN_MTU          0 /* Unused by RISC OS */
+#define ETHER_LOCK(a)              /* Nothing */
+#define ETHER_UNLOCK(a)            /* Nothing */
+#define ETHER_ALIGN                2
+#define CLLADDR(a)                 (const uint8_t *)(a)
+#define bpf_mtap(a,b,c)            /* No Berkeley packet filter */
+#define splnet()                   irqs_off()
+#define splx(k)                    restore_irqs(k)
+#define UNUSED(k)                  (k)=(k)
+#define IFM_ETHER                  16  /* Unused by RISC OS */
+#define IFM_AUTO                   1   /* Unused by RISC OS */
+#define IFM_SUBTYPE(x)             ((x) & 0x1F00)
+#define IFM_1000_T                 0x100
+#define IFM_1000_SX                0x200
+#define IFM_100_TX                 0x300
+#define IFM_10_T                   0x400
+
+/* Some handy macros */
+#define MIN(a,b)                   ((a) < (b) ? (a) : (b))
+#define MAX(a,b)                   ((a) < (b) ? (b) : (a))
+#define FALSE                      0
+#define TRUE                       (!FALSE)
+
+/* Packet transmit and receive */
+int glue_transmit(bool, uint8_t, uint16_t, struct mbuf *, uint8_t *, uint8_t *, struct ifnet *);
+void glue_transmitted(uint8_t, size_t, bool);
+void glue_receive(struct ifnet *, struct mbuf *);
+void glue_inc_rxerrors(struct ifnet *);
+void glue_attachif(struct ifnet *);
+
+/* Dummy structure members */
+typedef enum devact
+{
+	DVACT_DEACTIVATE
+} devact_t;
+
+typedef int pmf_qual_t;
+
+typedef volatile int kcondvar_t;
+
+typedef struct
+{
+	int unused;
+} *device_t;
+
+struct ifmedia
+{
+	int             ifm_media;
+	struct ifmedia *ifm_cur;
+};
+
+/* I/O control extensions */
+#define SIOCSETERRLVL   8 /* arg = boolean TRUE to pass errors */
+#define SIOCSETPROMISC  9 /* arg = spec/normal/multi/promisc */
+
+/* Mutex mapped to SyncLib */
+#define kmutex_t          mutex_t
+#define mutex_enter(a)    mutex_lock(a)
+#define mutex_exit(a)     mutex_unlock(a)
+#define mutex_init(a,b,c) synclib_init(); \
+                          *(a) = MUTEX_UNLOCKED;
+
+/* Callouts */
+typedef void *callout_t;
+#define callout_init(a,b)       /* Nothing to do for OS_CallEvery */
+#define callout_destroy(a)      /* Nothing */
+void callout_schedule(callout_t *, int);
+void callout_setfunc(callout_t *, void(*)(void *), void *);
+bool callout_stop(callout_t *);
+void callout_callevery(void);
+
+/* Little helpers */
+uint32_t shiftout(uint32_t, uint32_t);
+uint32_t shiftin(uint32_t, uint32_t);
+
+/* Logging */
+void aprint_normal(void *, ...);
+#define aprint_naive            aprint_normal
+#define aprint_error            aprint_normal
+#define aprint_error_dev        aprint_normal
+#define aprint_normal_dev       aprint_normal
+#define device_printf           aprint_normal
+
+/* Micro delay */
+void delay(uint32_t);
+
+#endif

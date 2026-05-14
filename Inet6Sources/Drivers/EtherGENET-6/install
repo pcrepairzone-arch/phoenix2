@@ -1,0 +1,7 @@
+* Copy EtherGENET as SDFS::4te.$.!Boot.Resources.!OBSD.rm.EtherGENET (or wherever your boot path takes you).
+* Edit SDFS::4te.$.!Boot.Resources.!OBSD.!Run:
+  Add:
+   X RMEnsure EtherGENET 0.04 RMLoad OBSD:rm.EtherGENET
+  and save the file.
+* Reboot
+
