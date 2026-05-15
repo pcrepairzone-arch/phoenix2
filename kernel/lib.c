@@ -418,123 +418,297 @@ void wimp_task(void)
             }
         }
 
-        /* ── TCP connect test (boot372) ────────────────────────────────
-         * One-shot HTTP GET to the LAN router (192.168.0.1:80).
+        /* ── TCP test suite (boot374) ──────────────────────────────────
          *
-         * boot371 lesson: wimp_ms() counts from boot so now_t≥2000
-         * is already true at WIMP start — SYN fired before the router's
-         * ARP broadcast arrived, dropped on ARP miss, then timed out.
+         * Three sequential tests exercising different aspects of the
+         * TCP stack and GENET driver:
          *
-         * Two fixes applied here:
-         *  1. Track time since WIMP start (s_wimp_start), wait 5 s.
-         *     The router broadcasts an ARP within ~3 s of WIMP start
-         *     so this gives a comfortable margin.
-         *  2. Retransmit SYN every 1 s via tcp_tick() while in
-         *     SYN_SENT — if the first SYN still misses the ARP window,
-         *     the next tick will catch the now-cached MAC.
+         * Test A (boot372): single HTTP GET to router — baseline
+         * Test B (boot374): 4 simultaneous connections (all slots)
+         * Test C (boot374): RST/error path — connect to closed port
          *
-         * State machine (s_phase):
-         *   0 → waiting 5 s from WIMP start then fire tcp_connect()
-         *   1 → SYN_SENT: retransmit every 1 s, wait for ESTABLISHED
-         *   2 → ESTABLISHED: send HTTP/1.0 GET
-         *   3 → reading response chunks until connection closes
-         *   4 → done (success or timeout)
+         * s_test drives the overall sequence:
+         *   0 = Test A running / not yet started
+         *   1 = Test B running
+         *   2 = Test C running
+         *   3 = all done
          *
          * tcp_rx() is driven by net_rx_frame() in the drain loop
-         * above — state machine advances automatically.              */
+         * above — state machines advance automatically.              */
         {
-            static int      s_phase     = 0;
-            static int      s_handle    = -1;
-            static uint32_t s_t0        = 0;   /* time of tcp_connect call */
-            static uint32_t s_last_syn  = 0;   /* last SYN retransmit time */
-            static uint32_t s_wimp_start= 0;   /* time wimp loop started   */
+            static int      s_test      = 0;   /* which test is active     */
 
+            /* ── shared boot-time gate ─────────────────────────────── */
+            static uint32_t s_wimp_start= 0;
             uint32_t now_t = wimp_ms();
-
-            /* Record WIMP loop start time once */
             if (s_wimp_start == 0) s_wimp_start = now_t;
+            if ((now_t - s_wimp_start) < 5000u) goto tcp_tests_done;
 
-            /* Phase 0: wait 5 s from WIMP start then fire SYN */
-            if (s_phase == 0 &&
-                (now_t - s_wimp_start) >= 5000u) {
+            /* ════════════════════════════════════════════════════════
+             * TEST A — single HTTP/1.0 GET to 192.168.0.1:80
+             * State machine (a_phase):
+             *   0 → fire SYN
+             *   1 → SYN_SENT: retransmit 1 s, 15 s timeout
+             *   2 → ESTABLISHED: send GET
+             *   3 → reading response
+             *   4 → done
+             * ════════════════════════════════════════════════════════ */
+            if (s_test == 0) {
+                static int      a_phase    = 0;
+                static int      a_handle   = -1;
+                static uint32_t a_t0       = 0;
+                static uint32_t a_last_syn = 0;
+                static int      a_total    = 0;
+
+                if (a_phase == 0) {
+                    static const uint8_t router_ip[4] = {192, 168, 0, 1};
+                    a_handle   = tcp_connect(router_ip, 80);
+                    a_t0       = now_t;
+                    a_last_syn = now_t;
+                    if (a_handle >= 0) {
+                        a_phase = 1;
+                        debug_print("[TestA] SYN → 192.168.0.1:80 handle=%d\n",
+                            a_handle);
+                    } else {
+                        debug_print("[TestA] FAIL no free slot\n");
+                        a_phase = 4;
+                    }
+                }
+
+                if (a_phase == 1 && a_handle >= 0) {
+                    int st = tcp_state(a_handle);
+                    if (st == TCPS_ESTABLISHED) {
+                        static const char req[] =
+                            "GET / HTTP/1.0\r\n"
+                            "Host: 192.168.0.1\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+                        tcp_write(a_handle, (const uint8_t *)req,
+                                  sizeof(req) - 1);
+                        a_phase = 2;
+                        debug_print("[TestA] ESTABLISHED — GET sent\n");
+                    } else {
+                        if ((now_t - a_last_syn) >= 1000u) {
+                            a_last_syn = now_t;
+                            tcp_tick(a_handle);
+                        }
+                        if ((now_t - a_t0) > 15000u) {
+                            debug_print("[TestA] FAIL SYN timeout st=%d\n", st);
+                            tcp_close(a_handle);
+                            a_phase = 4;
+                        }
+                    }
+                }
+
+                if ((a_phase == 2 || a_phase == 3) && a_handle >= 0) {
+                    static uint8_t rxbuf[128];
+                    int n = tcp_read(a_handle, rxbuf, (int)sizeof(rxbuf) - 1);
+                    if (n > 0) { a_total += n; a_phase = 3; }
+                    int st = tcp_state(a_handle);
+                    if (st == TCPS_CLOSED || st == TCPS_TIME_WAIT) {
+                        debug_print("[TestA] PASS — %d bytes, clean close\n",
+                            a_total);
+                        tcp_close(a_handle);
+                        a_phase = 4;
+                    }
+                    if ((st == TCPS_FIN_WAIT_2 || st == TCPS_CLOSE_WAIT)
+                        && n <= 0) {
+                        debug_print("[TestA] PASS — %d bytes, peer FIN\n",
+                            a_total);
+                        tcp_close(a_handle);
+                        a_phase = 4;
+                    }
+                    if (a_phase != 4 && (now_t - a_t0) > 20000u) {
+                        debug_print("[TestA] FAIL rx timeout (%d bytes)\n",
+                            a_total);
+                        tcp_close(a_handle);
+                        a_phase = 4;
+                    }
+                }
+
+                if (a_phase == 4) s_test = 1;
+            }
+
+            /* ════════════════════════════════════════════════════════
+             * TEST B — 4 simultaneous connections (all TCP slots)
+             *
+             * Opens all 4 slots to 192.168.0.1:80 at once.  Each slot
+             * runs its own mini state machine: open → GET → drain →
+             * close.  The test measures total bytes per slot and
+             * verifies all 4 complete without corrupting each other.
+             *
+             * b_ph[i]: 0=opening  1=SYN_SENT  2=GET_sent  3=reading
+             *          4=done
+             * b_rx[i]: bytes received on slot i
+             * ════════════════════════════════════════════════════════ */
+            if (s_test == 1) {
+                static int      b_ph[4]     = {0,0,0,0};
+                static int      b_h[4]      = {-1,-1,-1,-1};
+                static uint32_t b_t0[4]     = {0,0,0,0};
+                static uint32_t b_lsyn[4]   = {0,0,0,0};
+                static int      b_rx[4]     = {0,0,0,0};
+                static int      b_started   = 0;
+                static uint8_t  b_buf[128];
                 static const uint8_t router_ip[4] = {192, 168, 0, 1};
-                s_handle = tcp_connect(router_ip, 80);
-                s_t0       = now_t;
-                s_last_syn = now_t;
-                if (s_handle >= 0) {
-                    s_phase = 1;
-                    debug_print("[TCPtest] SYN → 192.168.0.1:80 handle=%d\n",
-                        s_handle);
-                } else {
-                    debug_print("[TCPtest] tcp_connect failed (no free slot)\n");
-                    s_phase = 4;
+                static const char b_req[] =
+                    "GET / HTTP/1.0\r\n"
+                    "Host: 192.168.0.1\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+
+                /* Open all 4 slots simultaneously on first entry */
+                if (!b_started) {
+                    b_started = 1;
+                    debug_print("[TestB] opening 4 simultaneous connections\n");
+                    int i;
+                    for (i = 0; i < 4; i++) {
+                        b_h[i]    = tcp_connect(router_ip, 80);
+                        b_t0[i]   = now_t;
+                        b_lsyn[i] = now_t;
+                        if (b_h[i] >= 0) {
+                            b_ph[i] = 1;
+                            debug_print("[TestB] slot%d handle=%d SYN sent\n",
+                                i, b_h[i]);
+                        } else {
+                            debug_print("[TestB] slot%d FAIL no slot\n", i);
+                            b_ph[i] = 4;
+                        }
+                    }
+                }
+
+                /* Advance each slot's state machine */
+                int i;
+                for (i = 0; i < 4; i++) {
+                    if (b_ph[i] == 4 || b_h[i] < 0) continue;
+                    int st = tcp_state(b_h[i]);
+
+                    /* Phase 1: SYN_SENT */
+                    if (b_ph[i] == 1) {
+                        if (st == TCPS_ESTABLISHED) {
+                            tcp_write(b_h[i], (const uint8_t *)b_req,
+                                      sizeof(b_req) - 1);
+                            b_ph[i] = 2;
+                            debug_print("[TestB] slot%d ESTABLISHED GET sent\n",
+                                i);
+                        } else {
+                            if ((now_t - b_lsyn[i]) >= 1000u) {
+                                b_lsyn[i] = now_t;
+                                tcp_tick(b_h[i]);
+                            }
+                            if ((now_t - b_t0[i]) > 15000u) {
+                                debug_print("[TestB] slot%d FAIL SYN timeout\n",
+                                    i);
+                                tcp_close(b_h[i]);
+                                b_ph[i] = 4;
+                            }
+                        }
+                    }
+
+                    /* Phase 2/3: reading */
+                    if (b_ph[i] == 2 || b_ph[i] == 3) {
+                        int n = tcp_read(b_h[i], b_buf,
+                                         (int)sizeof(b_buf) - 1);
+                        if (n > 0) { b_rx[i] += n; b_ph[i] = 3; }
+                        if (st == TCPS_CLOSED || st == TCPS_TIME_WAIT) {
+                            debug_print("[TestB] slot%d PASS %d bytes\n",
+                                i, b_rx[i]);
+                            tcp_close(b_h[i]);
+                            b_ph[i] = 4;
+                        }
+                        if ((st == TCPS_FIN_WAIT_2 || st == TCPS_CLOSE_WAIT)
+                            && n <= 0) {
+                            debug_print("[TestB] slot%d PASS %d bytes peer FIN\n",
+                                i, b_rx[i]);
+                            tcp_close(b_h[i]);
+                            b_ph[i] = 4;
+                        }
+                        if (b_ph[i] != 4 && (now_t - b_t0[i]) > 20000u) {
+                            debug_print("[TestB] slot%d FAIL timeout %d bytes\n",
+                                i, b_rx[i]);
+                            tcp_close(b_h[i]);
+                            b_ph[i] = 4;
+                        }
+                    }
+                }
+
+                /* All slots done? */
+                int done = 1;
+                for (i = 0; i < 4; i++)
+                    if (b_ph[i] != 4) { done = 0; break; }
+                if (done) {
+                    debug_print("[TestB] complete — slots 0-3 rx: "
+                                "%d %d %d %d bytes\n",
+                                b_rx[0], b_rx[1], b_rx[2], b_rx[3]);
+                    s_test = 2;
                 }
             }
 
-            /* Phase 1: SYN sent.
-             * Retransmit every 1 s via tcp_tick() so an initial ARP miss
-             * is recovered once the router's ARP broadcast arrives.
-             * Give up after 15 s total.                               */
-            if (s_phase == 1 && s_handle >= 0) {
-                int st = tcp_state(s_handle);
-                if (st == TCPS_ESTABLISHED) {
-                    static const char req[] =
-                        "GET / HTTP/1.0\r\n"
-                        "Host: 192.168.0.1\r\n"
-                        "Connection: close\r\n"
-                        "\r\n";
-                    int sent = tcp_write(s_handle,
-                                         (const uint8_t *)req,
-                                         sizeof(req) - 1);
-                    s_phase = 2;
-                    debug_print("[TCPtest] ESTABLISHED — GET sent (%d bytes)\n",
-                        sent);
-                } else {
-                    /* Retransmit SYN every 1 s */
-                    if ((now_t - s_last_syn) >= 1000u) {
-                        s_last_syn = now_t;
-                        tcp_tick(s_handle);
+            /* ════════════════════════════════════════════════════════
+             * TEST C — RST / closed-port error path
+             *
+             * Connects to 192.168.0.1:81 (almost certainly closed).
+             * A well-behaved TCP stack returns RST → CLOSED within a
+             * few ms on a LAN.  We record time-to-close.
+             *
+             * Expected outcome:  CLOSED within 1 s
+             * Timeout:           5 s → FAIL
+             * ════════════════════════════════════════════════════════ */
+            if (s_test == 2) {
+                static int      c_phase     = 0;
+                static int      c_handle    = -1;
+                static uint32_t c_t0        = 0;
+                static uint32_t c_last_syn  = 0;
+
+                if (c_phase == 0) {
+                    static const uint8_t router_ip[4] = {192, 168, 0, 1};
+                    c_handle   = tcp_connect(router_ip, 81);
+                    c_t0       = now_t;
+                    c_last_syn = now_t;
+                    if (c_handle >= 0) {
+                        c_phase = 1;
+                        debug_print("[TestC] SYN → 192.168.0.1:81 (closed port)"
+                                    " handle=%d\n", c_handle);
+                    } else {
+                        debug_print("[TestC] FAIL no free slot\n");
+                        c_phase = 4;
                     }
-                    /* 15 s overall timeout */
-                    if ((now_t - s_t0) > 15000u) {
-                        debug_print("[TCPtest] SYN gave up state=%d\n", st);
-                        tcp_close(s_handle);
-                        s_phase = 4;
+                }
+
+                if (c_phase == 1 && c_handle >= 0) {
+                    int st = tcp_state(c_handle);
+                    /* Retransmit SYN every 500 ms — RST typically arrives
+                     * within the first SYN so retransmits are just insurance */
+                    if ((now_t - c_last_syn) >= 500u) {
+                        c_last_syn = now_t;
+                        tcp_tick(c_handle);
                     }
+                    if (st == TCPS_CLOSED) {
+                        uint32_t ms = now_t - c_t0;
+                        debug_print("[TestC] PASS — RST in %u ms\n", ms);
+                        tcp_close(c_handle);
+                        c_phase = 4;
+                    }
+                    if (st == TCPS_ESTABLISHED) {
+                        /* Port 81 unexpectedly open — close cleanly */
+                        debug_print("[TestC] INFO port 81 is open (unexpected)\n");
+                        tcp_close(c_handle);
+                        c_phase = 4;
+                    }
+                    if ((now_t - c_t0) > 5000u) {
+                        debug_print("[TestC] FAIL timeout st=%d"
+                                    " (no RST after 5s)\n", st);
+                        tcp_close(c_handle);
+                        c_phase = 4;
+                    }
+                }
+
+                if (c_phase == 4) {
+                    debug_print("[TCPtest] all tests complete\n");
+                    s_test = 3;
                 }
             }
 
-            /* Phase 2/3: read response chunks, log them, detect close */
-            if ((s_phase == 2 || s_phase == 3) && s_handle >= 0) {
-                static uint8_t rxbuf[128];
-                int n = tcp_read(s_handle, rxbuf, (int)sizeof(rxbuf) - 1);
-                if (n > 0) {
-                    rxbuf[n] = '\0';
-                    debug_print("[TCPtest] rx %d bytes\n", n);
-                    debug_print("[TCPtest] %s\n", (char *)rxbuf);
-                    s_phase = 3;
-                }
-                int st = tcp_state(s_handle);
-                if (st == TCPS_CLOSED || st == TCPS_TIME_WAIT) {
-                    debug_print("[TCPtest] connection closed — done\n");
-                    tcp_close(s_handle);
-                    s_phase = 4;
-                }
-                /* FIN_WAIT_2: our FIN was ACKed but no more FIN from peer
-                 * (already consumed in ESTABLISHED simultaneous close).
-                 * Only finalise when buffer is drained to avoid losing the
-                 * last data bytes that may have arrived with the server FIN. */
-                if ((st == TCPS_FIN_WAIT_2 || st == TCPS_CLOSE_WAIT) && n <= 0) {
-                    debug_print("[TCPtest] peer done (st=%d) — closing\n", st);
-                    tcp_close(s_handle);
-                    s_phase = 4;
-                }
-                if (s_phase != 4 && (now_t - s_t0) > 20000u) {
-                    debug_print("[TCPtest] rx timeout — closing\n");
-                    tcp_close(s_handle);
-                    s_phase = 4;
-                }
-            }
+            tcp_tests_done: ;
         }
 
         /* ── Mouse input (xHCI path): ~250 Hz (4 ms), non-blocking.
