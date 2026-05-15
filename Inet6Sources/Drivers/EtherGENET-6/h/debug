@@ -54,6 +54,17 @@ void mbufchain(unsigned int, void *);
 void dbpmem(int level,char* c,void* x, int bytes);
 void prmbdata(int level, char* comment, void* m);
 
+#elif defined(__CC_NORCROFT)
+
+/* Norcroft (C90) does not support variadic macros — use static stubs instead */
+static void debugf(unsigned int level, char *fmt, ...) { (void)level; (void)fmt; }
+static void memdump(unsigned int level, void *p, int n) { (void)level; (void)p; (void)n; }
+static void mbufdump(unsigned int level, void *p) { (void)level; (void)p; }
+static void mbufchain(unsigned int level, void *p) { (void)level; (void)p; }
+static void debuglog(unsigned int level, char *s) { (void)level; (void)s; }
+static void dbpmem(int level, char *c, void *x, int bytes) { (void)level; (void)c; (void)x; (void)bytes; }
+static void prmbdata(int level, char *comment, void *m) { (void)level; (void)comment; (void)m; }
+
 #else
 
 #define debugf(...) do {} while (0)

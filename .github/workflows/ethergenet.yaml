@@ -102,7 +102,7 @@ jobs:
             build:
               script:
                 - Set PyromaniacCC$Enable 1
-                - Set Run$Path <Run$Path>,$.Library.
+                - Set Run$Path <Run$Path>,$.Library64.
                 - Set Makefiles$Path $.Libs.Makefiles.
                 - Set C$Path $.Libs.C.CLib.,$.Libs.C.
                 - Set Hdr$Path $.Libs.Hdr.
