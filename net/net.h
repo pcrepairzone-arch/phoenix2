@@ -31,9 +31,12 @@ void  net_rx_frame (uint8_t *frame, int len);
 /* ----------------------------------------------------------------
  * PhoenixARP — RFC 826 ARP handler + 16-entry cache (net/arp.c)
  * ---------------------------------------------------------------- */
-void  arp_init     (void);
-void  arp_input    (uint8_t *frame, int len);
-int   arp_resolve  (const uint8_t ip[4], uint8_t mac_out[6]);
+void  arp_init              (void);
+void  arp_input             (uint8_t *frame, int len);
+int   arp_resolve           (const uint8_t ip[4], uint8_t mac_out[6]);
+void  arp_send_request      (const uint8_t target_ip[4]);
+int   arp_resolve_blocking  (const uint8_t ip[4], uint8_t mac_out[6],
+                              uint32_t timeout_ms);
 
 /* ----------------------------------------------------------------
  * PhoenixIPv4 — IPv4 input dispatch + ICMP echo + output (net/ipv4.c)
@@ -71,9 +74,14 @@ int   tcp_read     (int handle, uint8_t *buf, int bufsz);
 void  tcp_close    (int handle);
 
 /* ----------------------------------------------------------------
- * PhoenixUDP — stub, silently drops all UDP frames (net/udp.c)
+ * PhoenixUDP — TX + RX queue (net/udp.c)  boot379
  * ---------------------------------------------------------------- */
-void  udp_init     (void);
-void  udp_rx       (uint8_t *frame, int len);
+void  udp_init      (void);
+void  udp_rx        (uint8_t *frame, int len);
+void  udp_send      (const uint8_t dst_ip[4], uint16_t dst_port,
+                     uint16_t src_port, const uint8_t *data, int len);
+int   udp_recvfrom  (uint16_t local_port,
+                     uint8_t *buf, int maxlen,
+                     uint8_t src_ip_out[4], uint16_t *src_port_out);
 
 #endif /* NET_H */

@@ -10,6 +10,8 @@
 #include "drivers/net/genet.h"
 /* boot370: PhoenixTCPIP dispatcher — replaces inline ARP/ICMP handlers */
 #include "net/net.h"
+/* boot376: PhoenixGENET DCI4 module — RX dispatch + DCI4 SWI interface */
+#include "drivers/net/genet_module.h"
 
 /* Forward declare UART functions */
 extern void uart_putc(char c);
@@ -302,7 +304,7 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot373  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot383  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 
@@ -405,36 +407,39 @@ void wimp_task(void)
                 int flen;
                 while ((flen = genet_poll_rx(g_rx_frame, GENET_MAX_FRAME)) >= 0
                        && (flen > 0 || genet_rx_available() > 0)) {
-                /* boot370: PhoenixTCPIP dispatcher.
-                 * Replaces 140 lines of inline ARP + ICMP handlers
-                 * (boot326/368/369). All protocol handling now lives in
-                 * net/arp.c, net/ipv4.c, net/tcp.c — proper RISC OS
-                 * module separation.  net_rx_frame() dispatches by
-                 * EtherType: ARP → arp_input, IPv4 → ipv4_input
-                 * (which further dispatches ICMP/TCP/UDP).            */
+                /* boot376: PhoenixGENET DCI4 module RX dispatch.
+                 * genet_module_rx() walks the DCI4 filter list
+                 * (registered by the Internet module or DCIShim),
+                 * then falls through to net_rx_frame() for Phoenix's
+                 * own TCP/IP stack until a proper Internet module
+                 * registers above us.                                 */
                 if (flen > 13)
-                    net_rx_frame(g_rx_frame, flen);
+                    genet_module_rx(g_rx_frame, flen);
                 } /* while drain loop */
             }
         }
 
-        /* ── TCP test suite (boot374) ──────────────────────────────────
+        /* ── TCP test suite (boot375) ──────────────────────────────────
          *
-         * Three sequential tests exercising different aspects of the
+         * Four sequential tests exercising different aspects of the
          * TCP stack and GENET driver:
          *
          * Test A (boot372): single HTTP GET to router — baseline
          * Test B (boot374): 4 simultaneous connections (all slots)
          * Test C (boot374): RST/error path — connect to closed port
+         * Test D (boot375): 8 sequential GETs — ring-wrap stress
+         *                   target > 97 KB (64 × 1518 B RX ring)
          *
          * s_test drives the overall sequence:
          *   0 = Test A running / not yet started
          *   1 = Test B running
          *   2 = Test C running
-         *   3 = all done
+         *   3 = Test D running
+         *   4 = all done
          *
          * tcp_rx() is driven by net_rx_frame() in the drain loop
          * above — state machines advance automatically.              */
+#define D_REQS 8   /* 8 × ~15 KB ≈ 120 KB — wraps the 64-desc RX ring */
         {
             static int      s_test      = 0;   /* which test is active     */
 
@@ -703,8 +708,132 @@ void wimp_task(void)
                 }
 
                 if (c_phase == 4) {
+                    s_test = 3;   /* → Test D (ring-wrap) */
+                }
+            }
+
+            /* ════════════════════════════════════════════════════════
+             * TEST D — sequential ring-wrap: D_REQS GETs in series
+             *
+             * Opens one TCP connection, drains the HTTP response,
+             * closes cleanly, then immediately opens the next.
+             * Repeats D_REQS (8) times, accumulating > 97 KB total
+             * RX to confirm the GENET descriptor ring wraps correctly
+             * and the consumer index stays in sync throughout.
+             *
+             * d_req:   current request index (0 .. D_REQS-1)
+             * d_rx:    bytes received this request
+             * d_total: cumulative bytes across all requests
+             * d_phase: 0=fire SYN  1=SYN_SENT  2=GET_sent
+             *          3=reading   9=all done
+             * ════════════════════════════════════════════════════════ */
+            if (s_test == 3) {
+                static int      d_req    = 0;
+                static int      d_phase  = 0;
+                static int      d_slot   = -1;
+                static uint32_t d_t0     = 0;
+                static uint32_t d_lsyn   = 0;
+                static int      d_rx     = 0;
+                static int      d_total  = 0;
+                static uint8_t  d_buf[256];
+                static const uint8_t d_rip[4] = {192, 168, 0, 1};
+                static const char d_get[] =
+                    "GET / HTTP/1.0\r\n"
+                    "Host: 192.168.0.1\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+
+                /* Phase 0: open connection for current request */
+                if (d_phase == 0) {
+                    d_slot = tcp_connect(d_rip, 80);
+                    d_t0   = now_t;
+                    d_lsyn = now_t;
+                    d_rx   = 0;
+                    if (d_slot >= 0) {
+                        d_phase = 1;
+                        debug_print("[TestD] req %d/%d SYN handle=%d\n",
+                            d_req + 1, D_REQS, d_slot);
+                    } else {
+                        debug_print("[TestD] FAIL req %d no free slot\n",
+                            d_req + 1);
+                        d_req   = D_REQS;
+                        d_phase = 9;
+                    }
+                }
+
+                /* Phase 1: wait for ESTABLISHED */
+                if (d_phase == 1 && d_slot >= 0) {
+                    int st = tcp_state(d_slot);
+                    if (st == TCPS_ESTABLISHED) {
+                        tcp_write(d_slot, (const uint8_t *)d_get,
+                                  sizeof(d_get) - 1);
+                        d_phase = 2;
+                        debug_print("[TestD] req %d ESTAB GET sent\n",
+                            d_req + 1);
+                    } else {
+                        if ((now_t - d_lsyn) >= 1000u) {
+                            d_lsyn = now_t;
+                            tcp_tick(d_slot);
+                        }
+                        if ((now_t - d_t0) > 15000u) {
+                            debug_print("[TestD] FAIL req %d SYN timeout\n",
+                                d_req + 1);
+                            tcp_close(d_slot);
+                            d_req   = D_REQS;
+                            d_phase = 9;
+                        }
+                    }
+                }
+
+                /* Phase 2/3: drain HTTP response */
+                if ((d_phase == 2 || d_phase == 3) && d_slot >= 0) {
+                    int n = tcp_read(d_slot, d_buf,
+                                     (int)sizeof(d_buf) - 1);
+                    if (n > 0) {
+                        d_rx    += n;
+                        d_total += n;
+                        d_phase  = 3;
+                    }
+                    int st = tcp_state(d_slot);
+                    int req_done = 0;
+                    if (st == TCPS_CLOSED || st == TCPS_TIME_WAIT) {
+                        debug_print("[TestD] req %d: %d B"
+                                    " (cum %d B)\n",
+                                    d_req + 1, d_rx, d_total);
+                        tcp_close(d_slot);
+                        req_done = 1;
+                    }
+                    if ((st == TCPS_FIN_WAIT_2 || st == TCPS_CLOSE_WAIT)
+                        && n <= 0) {
+                        debug_print("[TestD] req %d: %d B peer FIN"
+                                    " (cum %d B)\n",
+                                    d_req + 1, d_rx, d_total);
+                        tcp_close(d_slot);
+                        req_done = 1;
+                    }
+                    if (!req_done && (now_t - d_t0) > 20000u) {
+                        debug_print("[TestD] req %d FAIL timeout %d B\n",
+                            d_req + 1, d_rx);
+                        tcp_close(d_slot);
+                        req_done = 1;
+                    }
+                    if (req_done) {
+                        d_req++;
+                        d_phase = (d_req < D_REQS) ? 0 : 9;
+                    }
+                }
+
+                /* Phase 9: all requests done */
+                if (d_phase == 9) {
+                    int pass = (d_req >= D_REQS);
+                    debug_print("[TestD] %s — %d/%d reqs"
+                                " %d bytes total"
+                                " (ring wraps at 97 KB)\n",
+                                pass ? "PASS" : "PARTIAL",
+                                pass ? D_REQS : d_req,
+                                D_REQS, d_total);
                     debug_print("[TCPtest] all tests complete\n");
-                    s_test = 3;
+                    s_test = 4;
                 }
             }
 

@@ -91,12 +91,14 @@ OBJS = \
     drivers/gpu/font8x8.o \
     drivers/mmc/mmc.o \
     drivers/net/genet.o \
+    drivers/net/genet_module.o \
     net/tcpip.o \
     net/socket.o \
     net/ipv4.o \
     net/ipv6.o \
     net/tcp.o \
     net/udp.o \
+    net/resolver_module.o \
     net/arp.o \
     net/dhcp.o \
     wimp/wimp.o \

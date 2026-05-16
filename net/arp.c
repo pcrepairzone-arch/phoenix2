@@ -19,6 +19,7 @@
 #include "net/ethernet.h"
 #include "net/arp.h"
 #include "net/dhcp.h"
+#include "net/net.h"
 #include "drivers/net/genet.h"
 
 /* ----------------------------------------------------------------
@@ -79,8 +80,6 @@ static void table_update(const uint8_t ip[4], const uint8_t mac[6])
 /*
  * arp_resolve — look up cached MAC for IP
  * Returns 1 and fills mac_out if found, returns 0 if not cached.
- * Callers (tcp_send_segment, ipv4_output) should check the return
- * value and drop the packet on miss — no ARP request is sent yet.
  */
 int arp_resolve(const uint8_t ip[4], uint8_t mac_out[6])
 {
@@ -92,6 +91,94 @@ int arp_resolve(const uint8_t ip[4], uint8_t mac_out[6])
             return 1;
         }
     }
+    return 0;
+}
+
+/*
+ * arp_send_request — transmit an ARP who-has for target_ip
+ * boot380: used by arp_resolve_blocking() to populate the cache for IPs
+ * that were never ARP'd directly (e.g. the gateway after DHCP broadcast).
+ *
+ * Wire format (60-byte minimum Ethernet frame):
+ *   Eth dst = broadcast  Eth src = g_genet_mac  EtherType = 0x0806
+ *   ARP op = 1 (request)
+ *   SHA = g_genet_mac   SPA = g_our_ip
+ *   THA = 00:00:00:00:00:00   TPA = target_ip
+ */
+void arp_send_request(const uint8_t target_ip[4])
+{
+    static uint8_t req[60];
+    for (int i = 0; i < 60; i++) req[i] = 0;
+
+    /* Ethernet header */
+    for (int i = 0; i < 6; i++) req[i]     = 0xFF;              /* dst = broadcast  */
+    for (int i = 0; i < 6; i++) req[6 + i] = g_genet_mac[i];   /* src = us         */
+    req[12] = 0x08; req[13] = 0x06;   /* EtherType = ARP */
+
+    /* ARP header */
+    req[14] = 0x00; req[15] = 0x01;   /* HW type = Ethernet     */
+    req[16] = 0x08; req[17] = 0x00;   /* Protocol = IPv4         */
+    req[18] = 6;    req[19] = 4;       /* HW len, proto len       */
+    req[20] = 0x00; req[21] = 0x01;   /* Op = request (1)        */
+
+    /* SHA = our MAC, SPA = our IP */
+    for (int i = 0; i < 6; i++) req[22 + i] = g_genet_mac[i];
+    for (int i = 0; i < 4; i++) req[28 + i] = g_our_ip[i];
+    /* THA = zeroes (unknown), TPA = target */
+    for (int i = 0; i < 4; i++) req[38 + i] = target_ip[i];
+
+    genet_send(req, 60);
+    debug_print("[ARP] who-has %d.%d.%d.%d (request sent)\n",
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
+}
+
+/*
+ * arp_resolve_blocking — resolve MAC for ip, sending an ARP request if needed.
+ * boot380: mirrors the dhcp.c poll pattern (genet_poll_rx → net_rx_frame).
+ *
+ * Algorithm:
+ *   1. Cache hit → return immediately (common case after first resolution).
+ *   2. Cache miss → send ARP who-has, then poll GENET for up to timeout_ms.
+ *      Each received frame is fed to net_rx_frame() which calls arp_input()
+ *      which calls table_update() on any ARP reply → cache hit on next check.
+ *   3. Returns 1 on success (mac_out filled), 0 on timeout.
+ */
+int arp_resolve_blocking(const uint8_t ip[4], uint8_t mac_out[6],
+                         uint32_t timeout_ms)
+{
+    /* Fast path — already cached */
+    if (arp_resolve(ip, mac_out)) return 1;
+
+    /* Send ARP request and poll for reply */
+    arp_send_request(ip);
+
+    /* ARM Generic Timer for timeout */
+    uint64_t freq, t0;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+
+    static uint8_t s_rx_buf[GENET_MAX_FRAME];
+    while (1) {
+        /* Check elapsed time */
+        uint64_t now;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        if (((now - t0) * 1000u) >= ((uint64_t)timeout_ms * freq)) break;
+
+        /* Drain one frame — arp_input() will update cache on ARP reply */
+        int flen = genet_poll_rx(s_rx_buf, GENET_MAX_FRAME);
+        if (flen > 0)
+            net_rx_frame(s_rx_buf, flen);
+
+        /* Check cache again */
+        if (arp_resolve(ip, mac_out)) {
+            debug_print("[ARP] resolve_blocking: %d.%d.%d.%d resolved\n",
+                ip[0], ip[1], ip[2], ip[3]);
+            return 1;
+        }
+    }
+
+    debug_print("[ARP] resolve_blocking: timeout for %d.%d.%d.%d\n",
+        ip[0], ip[1], ip[2], ip[3]);
     return 0;
 }
 

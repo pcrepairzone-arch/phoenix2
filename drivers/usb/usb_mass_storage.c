@@ -459,6 +459,11 @@ static int usb_storage_probe(usb_device_t *dev, usb_interface_t *intf)
      * CSW → "bad CSW signature" → all subsequent CBW sends fail because
      * bulk-OUT ends up HALTED.  A full reset here clears both pipes cleanly.
      * wIndex = interface number (BOT spec §3.1).                            */
+    /* boot383: quiet timeouts across the entire BOT reset + TUR phase.
+     * BOT reset itself triggers xhci_ep_recover which can produce many
+     * expected timeout lines on slow bridges (RTL9210 cold start).
+     * Quiet zone starts here and ends after TUR success/fail below.     */
+    xhci_set_quiet_timeouts(1);
     uart_puts("[MSC] BOT reset (pre-TUR flush)...\n");
     usb_control_transfer(drive->dev,
         0x21u,           /* bmRequestType: class | interface | host→dev */

@@ -70,17 +70,24 @@ static int module_call_with_r12(void *code_entry, void *workspace,
 }
 
 /* ── module_register_native ──────────────────────────────────────────────── */
+/* boot379: extended with swi_base + swi_fn so native C modules can handle
+ * SWIs without needing a binary module header.  Pass 0/NULL for modules that
+ * expose no SWIs.                                                            */
 int module_register_native(const char *name,
                             int (*init)(void),
                             int (*final)(void),
-                            int (*service)(uint32_t reason, uint32_t *regs))
+                            int (*service)(uint32_t reason, uint32_t *regs),
+                            uint32_t swi_base,
+                            int (*swi_fn)(uint32_t swi_offset, uint32_t *regs))
 {
     (void)final; (void)service;
 
     risc_os_module_t *mod = (risc_os_module_t *)kmalloc(sizeof(risc_os_module_t));
     if (!mod) return -ENOMEM;
     memset(mod, 0, sizeof(*mod));
-    mod->name = name;
+    mod->name     = name;
+    mod->swi_base = swi_base;
+    mod->swi_fn   = swi_fn;
 
     int rc = module_register(mod);
     if (rc == 0 && init) {
@@ -221,29 +228,41 @@ int module_load_from_file(const char *path)
 }
 
 /* ── swi_dispatch ────────────────────────────────────────────────────────── */
+/* boot379: check swi_fn first for native C modules; then fall through to
+ * binary module header path for AArch64 binary modules.                     */
 int swi_dispatch(uint32_t swi_number, uint32_t *regs)
 {
-    uint32_t chunk = swi_number & 0xFFFFFF00u;
+    uint32_t chunk  = swi_number & 0xFFFFFF00u;
+    uint32_t offset = swi_number & 0x000000FFu;
     risc_os_module_t *mod = g_module_list;
     while (mod) {
-        if (mod->swi_base == chunk && mod->header && mod->header->swi_handler) {
-            uart_puts("[SWI] "); uart_puts(mod->name);
-            uart_puts(" 0x"); mod_hex32(swi_number); uart_puts("\n");
-            void *handler = (uint8_t *)mod->base_addr + mod->header->swi_handler;
-            return module_call_with_r12(handler, mod->workspace,
-                                         (uint64_t)swi_number,
-                                         (uint64_t)(uintptr_t)regs);
+        if (mod->swi_base == chunk) {
+            /* Native C module path (boot379) */
+            if (mod->swi_fn) {
+                uart_puts("[SWI] "); uart_puts(mod->name);
+                uart_puts(" "); mod_hex32(swi_number); uart_puts("\n");
+                return mod->swi_fn(offset, regs);
+            }
+            /* Binary AArch64 module path */
+            if (mod->header && mod->header->swi_handler) {
+                uart_puts("[SWI] "); uart_puts(mod->name);
+                uart_puts(" "); mod_hex32(swi_number); uart_puts("\n");
+                void *handler = (uint8_t *)mod->base_addr + mod->header->swi_handler;
+                return module_call_with_r12(handler, mod->workspace,
+                                             (uint64_t)swi_number,
+                                             (uint64_t)(uintptr_t)regs);
+            }
         }
         mod = mod->next;
     }
-    uart_puts("[SWI] Unhandled: 0x"); mod_hex32(swi_number); uart_puts("\n");
+    uart_puts("[SWI] Unhandled: "); mod_hex32(swi_number); uart_puts("\n");
     return -ENOSYS;
 }
 
 /* ── module_broadcast_service ────────────────────────────────────────────── */
 int module_broadcast_service(uint32_t service_reason, uint32_t *regs)
 {
-    uart_puts("[Service] 0x"); mod_hex32(service_reason); uart_puts("\n");
+    uart_puts("[Service] "); mod_hex32(service_reason); uart_puts("\n");
     risc_os_module_t *mod = g_module_list;
     while (mod) {
         if (mod->header && mod->header->service_entry && mod->initialised) {
@@ -282,6 +301,25 @@ void module_dump_list(void)
 /* PhoenixDHCP is a plain C module registered via module_register_native(). */
 extern int dhcp_module_init(void);
 extern int dhcp_module_final(void);
+
+/* PhoenixGENET — DCI4 network driver module (boot376).
+ * Wraps BCM GENET as a proper RISC OS DCI4 driver module.  Must be
+ * registered AFTER PhoenixDHCP because DHCP waits for link-up and
+ * sets g_our_ip; by the time PhoenixGENET announces DCIDRIVER_STARTING
+ * the hardware is already initialised and the IP is bound.                 */
+extern int genet_module_init(void);
+extern int genet_module_final(void);
+extern int genet_module_swi(uint32_t offset, uint32_t *regs);
+#define ETHERGE_SWI_BASE  0x59F00u   /* DCI4 EtherGENET SWI chunk */
+
+/* PhoenixResolver — DNS stub resolver module (boot379).
+ * Implements Inet6Sources Resolver SWI chunk 0x46000.
+ * Registered AFTER PhoenixGENET/DHCP so g_our_ip and DNS server
+ * are already populated when resolver_module_init() tests a lookup.       */
+extern int resolver_module_init(void);
+extern int resolver_module_final(void);
+extern int resolver_module_swi(uint32_t offset, uint32_t *regs);
+#define RESOLVER_SWI_BASE  0x46000u
 /* boot368: dhcp_test_module_init removed — test module no longer linked into
  * production build.  See Makefile comment and Tests/dhcp_test_module.c.     */
 
@@ -305,28 +343,42 @@ void module_init_all(void)
 {
     uart_puts("[Module] Module system initialising...\n");
 
-    /* ── Load embedded PhoenixTest module ──────────────────────────── */
+    /* ── Load embedded AArch64 binary modules ──────────────────────────
+     * boot382: guard size == 0 before attempting load.  cursor_module.c
+     * and test_module are stubs (no binary payload linked in yet); the
+     * linker.ld PROVIDE symbols resolve to the same address so size = 0.
+     * module_load_from_memory rejects them with "Buffer too small" (size
+     * < 0x34 header minimum) — confusing but harmless.  Skip cleanly.   */
     uart_puts("[Module] Loading embedded AArch64 modules...\n");
 
+    int rc = 0;
+
     uint32_t tm_size = (uint32_t)(test_module_end - test_module_start);
-    uart_puts("[Module] test_module: size="); mod_dec(tm_size); uart_puts(" bytes\n");
-    int rc = module_load_from_memory(test_module_start, tm_size, "PhoenixTest");
-    if (rc == 0)
-        uart_puts("[Module] *** PhoenixTest — first AArch64 module executed ***\n");
-    else {
-        uart_puts("[Module] PhoenixTest load failed rc="); mod_dec((uint32_t)rc);
-        uart_puts("\n");
+    if (tm_size == 0) {
+        uart_puts("[Module] PhoenixTest: not embedded (stub), skipping\n");
+    } else {
+        uart_puts("[Module] test_module: size="); mod_dec(tm_size); uart_puts(" bytes\n");
+        rc = module_load_from_memory(test_module_start, tm_size, "PhoenixTest");
+        if (rc == 0)
+            uart_puts("[Module] *** PhoenixTest — first AArch64 module executed ***\n");
+        else {
+            uart_puts("[Module] PhoenixTest load failed rc="); mod_dec((uint32_t)rc);
+            uart_puts("\n");
+        }
     }
 
-    /* ── Load embedded CursorMod module ────────────────────────────── */
     uint32_t cm_size = (uint32_t)(cursor_module_end - cursor_module_start);
-    uart_puts("[Module] cursor_module: size="); mod_dec(cm_size); uart_puts(" bytes\n");
-    rc = module_load_from_memory(cursor_module_start, cm_size, "PhoenixCursor");
-    if (rc == 0)
-        uart_puts("[Module] *** PhoenixCursor — caret + pointer active ***\n");
-    else {
-        uart_puts("[Module] PhoenixCursor load failed rc="); mod_dec((uint32_t)rc);
-        uart_puts("\n");
+    if (cm_size == 0) {
+        uart_puts("[Module] PhoenixCursor: not embedded (stub), skipping\n");
+    } else {
+        uart_puts("[Module] cursor_module: size="); mod_dec(cm_size); uart_puts(" bytes\n");
+        rc = module_load_from_memory(cursor_module_start, cm_size, "PhoenixCursor");
+        if (rc == 0)
+            uart_puts("[Module] *** PhoenixCursor — caret + pointer active ***\n");
+        else {
+            uart_puts("[Module] PhoenixCursor load failed rc="); mod_dec((uint32_t)rc);
+            uart_puts("\n");
+        }
     }
 
     uart_puts("[Module] Embedded modules done\n");
@@ -335,9 +387,34 @@ void module_init_all(void)
     rc = module_register_native("PhoenixDHCP",
                                  dhcp_module_init,
                                  dhcp_module_final,
-                                 NULL);
+                                 NULL,
+                                 0, NULL);   /* no SWIs */
     if (rc != 0) {
         uart_puts("[Module] PhoenixDHCP registration failed rc=");
+        mod_dec((uint32_t)rc); uart_puts("\n");
+    }
+
+    /* ── Register PhoenixGENET DCI4 module (boot376) ──────────────────────── */
+    rc = module_register_native("PhoenixGENET",
+                                 genet_module_init,
+                                 genet_module_final,
+                                 NULL,
+                                 ETHERGE_SWI_BASE,
+                                 genet_module_swi);
+    if (rc != 0) {
+        uart_puts("[Module] PhoenixGENET registration failed rc=");
+        mod_dec((uint32_t)rc); uart_puts("\n");
+    }
+
+    /* ── Register PhoenixResolver DNS module (boot379) ─────────────────────── */
+    rc = module_register_native("PhoenixResolver",
+                                 resolver_module_init,
+                                 resolver_module_final,
+                                 NULL,
+                                 RESOLVER_SWI_BASE,
+                                 resolver_module_swi);
+    if (rc != 0) {
+        uart_puts("[Module] PhoenixResolver registration failed rc=");
         mod_dec((uint32_t)rc); uart_puts("\n");
     }
 

@@ -269,6 +269,11 @@ static int xhci_quiet_timeouts = 0;
 
 void xhci_set_quiet_timeouts(int q) { xhci_quiet_timeouts = q; }
 
+/* boot383: compile-time verbose flag.  Set to 1 to restore all diagnostic
+ * detail (ring dumps, context dumps, readbacks) for deep debugging.
+ * Set to 0 for clean boot logs — only errors and key milestones remain.   */
+#define XHCI_VERBOSE 0
+
 static uint64_t cmd_ring_dma  = 0;
 static uint64_t evt_ring_dma  = 0;
 static uint64_t erst_dma_addr = 0;
@@ -318,7 +323,7 @@ static inline uint64_t phys_to_dma(uint64_t phys) {
  *
  * Call before memset() so the original firmware state is logged.
  */
-static void mem_hexdump(const char *label, uint64_t addr, size_t len) {
+static void __attribute__((unused)) mem_hexdump(const char *label, uint64_t addr, size_t len) {
     uart_puts(label);
     uart_puts(" @ 0x");
     print_hex32((uint32_t)(addr >> 32)); print_hex32((uint32_t)addr);
@@ -901,6 +906,7 @@ static int run_controller(void) {
     writel(0x00000000U, ir0 + IR_IMOD);
     asm volatile("dsb sy; isb" ::: "memory");
 
+#if XHCI_VERBOSE
     /* Diagnostic readback: verify all ring pointers landed */
     uart_puts("[xHCI] Rings programmed (Linux order). Readback:\n");
     uart_puts("[xHCI]   DCBAAP=");  print_hex32(readl(op + OP_DCBAAP_LO));
@@ -915,6 +921,7 @@ static int run_controller(void) {
     uart_puts("  (boot108: =0)\n");
     uart_puts("[xHCI]   USBSTS=");  print_hex32(readl(op + OP_USBSTS));
     uart_puts("  USBCMD=");  print_hex32(readl(op + OP_USBCMD)); uart_puts("\n");
+#endif /* XHCI_VERBOSE */
 
     /* boot116: CANARY REMOVED.
      *
@@ -936,8 +943,10 @@ static int run_controller(void) {
      * The ring is already zeroed by dma_zero() above.  No sentinel needed.
      * evt_ring_poll() uses the cycle bit correctly — this is the right way.
      */
+#if XHCI_VERBOSE
     uart_puts("[xHCI] [CYCLE] Event ring zeroed — cycle bit protocol active (boot116)\n");
     uart_puts("[xHCI]   Polling: TRB.word3.bit0 == evt_cycle(1) signals MCU wrote event\n");
+#endif /* XHCI_VERBOSE */
 
     /* Step 4: RS=1 with minimal HSE retry loop.
      *
@@ -1056,6 +1065,7 @@ static int run_controller(void) {
                  * In boots 105-108 it was read at t≈5ms and showed running fine.
                  * Read it here at t≈1ms to get a clean pre-poll baseline, then
                  * again after the tight poll to see if it's still running.       */
+#if XHCI_VERBOSE
                 {
                     volatile uint32_t *mf = (volatile uint32_t *)xhci_ctrl.runtime_regs;
                     asm volatile("dsb sy; isb" ::: "memory");
@@ -1066,6 +1076,7 @@ static int run_controller(void) {
                     uart_puts(" t5ms="); print_hex32(mf1);
                     uart_puts(mf1 != mf0 ? "  (running OK)\n" : "  (STATIC — frame timer not started)\n");
                 }
+#endif /* XHCI_VERBOSE */
 
                 /* boot116: TIGHT EVENT RING POLL — immediately after TRUE RUNNING. */
                 {
@@ -1073,7 +1084,9 @@ static int run_controller(void) {
                     int     evts_found = 0;
                     uint32_t poll_start = get_time_ms();
 
+#if XHCI_VERBOSE
                     uart_puts("[BOOT116] Tight event ring poll (50ms window)...\n");
+#endif /* XHCI_VERBOSE */
 
                     while ((get_time_ms() - poll_start) < 50U) {
                         asm volatile("dsb sy; isb" ::: "memory");
@@ -1089,6 +1102,7 @@ static int run_controller(void) {
                         /* Drain all available events */
                         while (evt_ring_poll(ev)) {
                             evts_found++;
+#if XHCI_VERBOSE
                             uint32_t trb_type = (ev[3] >> 10) & 0x3FU;
                             uint32_t cc       = (ev[2] >> 24) & 0xFFU;
                             uart_puts("[BOOT116]   evt type=");
@@ -1097,6 +1111,7 @@ static int run_controller(void) {
                             uart_puts(" dw0="); print_hex32(ev[0]);
                             uart_puts(" dw2="); print_hex32(ev[2]);
                             uart_puts("\n");
+#endif /* XHCI_VERBOSE */
                         }
 
                         if (evts_found > 0) break; /* got events — stop tight loop */
@@ -1112,12 +1127,14 @@ static int run_controller(void) {
                     }
 
                     if (evts_found > 0) {
+#if XHCI_VERBOSE
                         uart_puts("[BOOT116]   *** ");
                         print_hex32((uint32_t)evts_found);
                         uart_puts(" event(s) received — event ring WORKING! ***\n");
+#endif /* XHCI_VERBOSE */
                     } else {
-                        uart_puts("[BOOT116]   No events in 50ms — MCU not posting events\n");
-                        uart_puts("[BOOT116]   USBSTS="); print_hex32(readl(op + OP_USBSTS));
+                        uart_puts("[xHCI] WARNING: No events in 50ms — MCU not posting events\n");
+                        uart_puts("[xHCI]   USBSTS="); print_hex32(readl(op + OP_USBSTS));
                         uart_puts("  IMAN="); print_hex32(readl(ir0 + IR_IMAN));
                         uart_puts("  TRB[0].w3=");
                         print_hex32(((volatile uint32_t *)(xhci_dma_buf + DMA_EVT_RING_OFF))[3]);
@@ -1410,6 +1427,7 @@ static int run_controller(void) {
         uart_puts("[xHCI] Sending No-op keepalive to MCU...\n");
         cmd_ring_submit(0, 0, 0, TRB_TYPE_NOOP_CMD, 0);
 
+#if XHCI_VERBOSE
         /* Verify No-op TRB landed at the expected physical location.
          * cmd_enqueue was incremented by cmd_ring_submit; the TRB we just
          * wrote is at index (cmd_enqueue-1), wrapping at CMD_RING_TRBS-1.
@@ -1431,6 +1449,7 @@ static int run_controller(void) {
             uart_puts("[xHCI]   CRCR_LO(VL805_write-only)=");
             print_hex32(readl(op + OP_CRCR_LO)); uart_puts("\n");
         }
+#endif /* XHCI_VERBOSE */
 
         uint32_t noop_ev[4];
         /* BOOT91-C: Timestamped USBSTS snapshots during No-op wait.
@@ -1593,19 +1612,20 @@ static int run_controller(void) {
             asm volatile("dsb sy; isb" ::: "memory");
         }
     }
-    uart_puts("[xHCI] Settle done: USBSTS="); print_hex32(readl(op + OP_USBSTS));
-    uart_puts(" evts="); print_hex32((uint32_t)_settle_evts);
-    uart_puts(" hse="); print_hex32((uint32_t)_settle_hse); uart_puts("\n");
+    uart_puts("[xHCI] Controller running. USBSTS="); print_hex32(readl(op + OP_USBSTS));
+    uart_puts("\n");
 
     /* Drain any startup PSCEv events from the settle period */
     {
         uint32_t _dev[4];
         int _drained = 0;
         while (evt_ring_poll(_dev)) _drained++;
+#if XHCI_VERBOSE
         uart_puts("[xHCI] PSCEv drain: ");
         print_hex32((uint32_t)_drained);
         uart_puts(" events  deq="); print_hex32(evt_dequeue);
         uart_puts(" cycle="); print_hex32(evt_cycle); uart_puts("\n");
+#endif /* XHCI_VERBOSE */
     }
 
     /* boot81: Final ring re-arm before port scan.
@@ -1689,6 +1709,7 @@ static int run_controller(void) {
             uart_puts("[xHCI] [TRB0] Non-zero but cycle=0 — unexpected content\n");
         }
 
+#if XHCI_VERBOSE
         /* boot116: full ring dump — look for any TRB with cycle=1 written by MCU */
         uart_puts("[xHCI] [RING-DUMP] Full event ring (64 TRBs):\n");
         asm volatile("dsb sy; isb" ::: "memory");
@@ -1717,6 +1738,7 @@ static int run_controller(void) {
         }
         if (!any_mcu_wrote)
             uart_puts("[xHCI] [RING-DUMP] No MCU-written TRBs found (all cycle=0 or zero).\n");
+#endif /* XHCI_VERBOSE */
     }
 
     /* Event ring self-test REMOVED (boot 53 confirmed PASS every run).
@@ -1729,11 +1751,7 @@ static int run_controller(void) {
         asm volatile("" : "+r"(pa));
         volatile uint32_t *p = (volatile uint32_t *)pa;
         asm volatile("dsb sy; isb" ::: "memory"); /* phys 0 = Normal memory */
-        uart_puts("[xHCI] phys0 ERST check: [");
-        print_hex32(p[0]); uart_puts(","); print_hex32(p[1]);
-        uart_puts(","); print_hex32(p[2]); uart_puts(","); print_hex32(p[3]);
-        uart_puts("]\n");
-        /* Verify against expected values */
+        /* Verify against expected values — only report on error */
         uint32_t exp0 = (uint32_t)(evt_dma & 0xFFFFFFFFULL);
         uint32_t exp2 = EVT_RING_TRBS;
         if (p[0] != exp0 || p[2] != exp2) {
@@ -1742,9 +1760,15 @@ static int run_controller(void) {
             uart_puts(" got="); print_hex32(p[0]); uart_puts("\n");
             uart_puts("[xHCI]   expected[2]="); print_hex32(exp2);
             uart_puts(" got="); print_hex32(p[2]); uart_puts("\n");
-        } else {
-            uart_puts("[xHCI] phys0 ERST intact\n");
         }
+#if XHCI_VERBOSE
+        else {
+            uart_puts("[xHCI] phys0 ERST check: [");
+            print_hex32(p[0]); uart_puts(","); print_hex32(p[1]);
+            uart_puts(","); print_hex32(p[2]); uart_puts(","); print_hex32(p[3]);
+            uart_puts("] intact\n");
+        }
+#endif /* XHCI_VERBOSE */
     }
 
     return 0;
@@ -1772,6 +1796,7 @@ int xhci_init(void *base_addr) {
     extern char __xhci_dma_end[];
     size_t dma_region_size = (size_t)((uintptr_t)__xhci_dma_end -
                                       (uintptr_t)__xhci_dma_start);
+#if XHCI_VERBOSE
     uart_puts("[xHCI] DMA region: 0x");
     print_hex32((uint32_t)((uint64_t)(uintptr_t)xhci_dma_buf >> 32));
     print_hex32((uint32_t)((uint64_t)(uintptr_t)xhci_dma_buf));
@@ -1783,6 +1808,7 @@ int xhci_init(void *base_addr) {
     /* Inspect first 256 bytes BEFORE zeroing — shows what firmware left. */
     mem_hexdump("[xHCI] pre-zero DMA[0..255]",
                 (uint64_t)(uintptr_t)xhci_dma_buf, 256);
+#endif /* XHCI_VERBOSE */
 
     /* Explicit zero — NOBITS section; ring cycle bits must start at 0.
      * Normal-NC mapping: dma_zero uses volatile 32-bit writes (no LDP/STP).
@@ -1818,6 +1844,7 @@ int xhci_init(void *base_addr) {
         uint8_t fault = par & 0x1U;
         uint8_t sh    = (uint8_t)((par >> 7) & 0x3U);   /* PAR_EL1[8:7] = SH */
         uint8_t attr  = (uint8_t)((par >> 56) & 0xFFU); /* PAR_EL1[63:56] = ATTR */
+        (void)sh; /* unused when XHCI_VERBOSE=0; present in verbose attr dump above */
         /* Note: PAR_EL1 layout on success (F=0):
          *   bits[11:0]   = lower attributes / ignored
          *   bits[47:12]  = PA[47:12]
@@ -1859,7 +1886,9 @@ int xhci_init(void *base_addr) {
      * WAIT — setup_event_ring zeros the ring again.  So we write the canary
      * AFTER setup_event_ring() returns in run_controller().  See the canary
      * write point marked [CANARY-WRITE] below in run_controller(). */
+#if XHCI_VERBOSE
     uart_puts("[xHCI] Canary will be written to evt_ring TRB 0 after ring setup.\n");
+#endif /* XHCI_VERBOSE */
 
     /* ── MSI landing pad diagnostic (user boot 66 request) ─────────────────
      * DMA_MSI_PAGE_OFF = 0x1000 into the DMA buffer.  pci.c programs the RC
@@ -2397,6 +2426,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
 
     uint64_t in_dma = phys_to_dma((uint64_t)virt_to_phys((void *)in_ctx));
 
+#if XHCI_VERBOSE
     /* boot150: full input context dump + TRB dump so we can verify exactly
      * what the MCU reads.  CC=17 "Parameter Error" persists despite correct-
      * looking field values — this dump will confirm whether the data is
@@ -2425,7 +2455,9 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
     uart_puts("  out_dma="); print_hex32((uint32_t)out_dma);
     uart_puts("  DCBAA[slot]=");
     print_hex32((uint32_t)(dcbaa[slot_id] & 0xFFFFFFFFU)); uart_puts("\n");
+#endif /* XHCI_VERBOSE */
 
+#if XHCI_VERBOSE
     /* boot151: dump the OUTPUT context before Address Device to see what the
      * MCU wrote during Enable Slot.  If DCBAA pre-allocation is working, the
      * MCU should have written Slot State to out_slot[3] bits[26:24].
@@ -2442,6 +2474,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
         uart_puts("  SlotState="); print_hex32((out_slot_pre[3] >> 24) & 0x1FU);
         uart_puts("\n");
     }
+#endif /* XHCI_VERBOSE */
 
     /* boot154: BSR=1 diagnostic block removed — it served its purpose in boot152/153.
      * boot152 confirmed CC=17 was pure firmware parameter validation (not USB-level).
@@ -2451,11 +2484,13 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
 
     /* Record cmd_enqueue before submission to log the exact TRB written. */
     uint32_t trb_idx = cmd_enqueue;
+    (void)trb_idx; /* used only in XHCI_VERBOSE blocks */
 
     /* DW3 bits[31:24] = Slot ID (xHCI §6.4.3.4). BSR=0: issue USB SET_ADDRESS. */
     cmd_ring_submit((uint32_t)in_dma, (uint32_t)(in_dma >> 32), 0, TRB_TYPE_ADDR_DEV,
                     (uint32_t)slot_id << 24);
 
+#if XHCI_VERBOSE
     /* boot150: read back the TRB from cmd_ring to confirm what was written. */
     {
         uint32_t b = trb_idx * 4;
@@ -2466,6 +2501,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
         uart_puts(" dw3="); print_hex32(cmd_ring[b+3]);
         uart_puts("\n");
     }
+#endif /* XHCI_VERBOSE */
 
     /* boot145: drain-loop until we get the Address Device CCE (type=0x21).
      * The event ring may still have PSCEs (type=0x22) or Transfer Events
@@ -2480,9 +2516,12 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
         if (xhci_wait_event(ev, 20) != 0) break;       /* no more events */
         uint32_t trb_type = (ev[3] >> 10) & 0x3FU;
         cc = (ev[2] >> 24) & 0xFF;
+#if XHCI_VERBOSE
         uart_puts("[xHCI] AddrDev drain: type="); print_hex32(trb_type);
         uart_puts(" cc="); print_hex32(cc); uart_puts("\n");
+#endif /* XHCI_VERBOSE */
         if (trb_type == 0x21U) {
+#if XHCI_VERBOSE
             /* boot152: dump full CCE to verify MCU ACK'd the right TRB.
              * CCE DW0-DW1 = physical addr of the command TRB that was completed.
              * expected_dw0 = (uint32_t)(cmd_ring_dma + trb_idx*16).
@@ -2497,6 +2536,7 @@ static int cmd_address_device(uint8_t slot_id, uint8_t rh_port_1based,
             uart_puts("  match="); uart_puts(ev[0] == expected_dw0 ? "YES" : "NO!");
             uart_puts("  SlotID_from_CCE="); print_hex32((ev[3] >> 24) & 0xFF);
             uart_puts("\n");
+#endif /* XHCI_VERBOSE */
             got_cce = 1; break;
         } /* CCE — done */
         /* type=0x22 PSCE or type=0x20 Transfer Event — drain and retry */
@@ -3057,18 +3097,20 @@ static void port_scan(void) {
      *   at init).  The MCU can then write Slot State to the right address
      *   during Enable Slot.  cmd_address_device no longer zeroes the output
      *   context (see below), preserving the MCU's Slot State write.          */
-    uart_puts("[boot151] Pre-allocating DCBAA[1..");
+    uart_puts("[xHCI] Pre-allocating output contexts (DCBAA[1..");
     print_hex32(MAX_SLOTS_ALLOC);
-    uart_puts("] before port scan...\n");
+    uart_puts("])...\n");
     for (uint8_t s = 1; s <= MAX_SLOTS_ALLOC; s++) {
         volatile uint8_t *oc_pre = slot_out_ctx(s);
         uint64_t oc_dma = phys_to_dma((uint64_t)virt_to_phys((void *)oc_pre));
         dcbaa[s] = oc_dma;
+#if XHCI_VERBOSE
         uart_puts("[boot151]   DCBAA["); print_hex32(s); uart_puts("]=");
         print_hex32((uint32_t)oc_dma); uart_puts("\n");
+#endif /* XHCI_VERBOSE */
     }
     asm volatile("dsb sy" ::: "memory");
-    uart_puts("[boot151] DCBAA pre-allocation done.\n");
+    uart_puts("[xHCI] DCBAA pre-allocation done.\n");
 
     uart_puts("[xHCI] Port scan ("); print_hex32(n); uart_puts(" port(s)):\n");
     for (int p = 0; p < n; p++)
@@ -3190,12 +3232,14 @@ int xhci_configure_endpoints(usb_device_t *dev)
             ep_ctx[3] = (uint32_t)(ring_dma >> 32);
             ep_ctx[4] = mps;                            /* Average TRB Length */
 
+#if XHCI_VERBOSE
             uart_puts("[xHCI] ConfigureEP:  addr="); print_hex32(ep->bEndpointAddress);
             uart_puts(" dci="); print_hex32(dci);
             uart_puts(" mps="); print_hex32(mps);
             uart_puts(" ring="); print_hex32((uint32_t)ring_dma);
             uart_puts(" DW1="); print_hex32(ep_ctx[1]);
             uart_puts("\n");
+#endif /* XHCI_VERBOSE */
             } /* ── end bulk ─── */
 
             /* ── Interrupt IN endpoints (HID keyboard / mouse) ──────────── */

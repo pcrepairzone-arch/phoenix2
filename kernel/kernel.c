@@ -194,6 +194,12 @@ void kernel_main(uint64_t dtb_ptr)
     uart_set_quiet(1);   /* boot256: silence FileCore/IDA verbose scan */
     filecore_list_root();
     filecore_show_results();
+    uart_set_quiet(0);   /* boot377: re-enable uart_puts before genet/module init
+                          * so [Module] Registered:, [Service] 0x9d, and
+                          * module_dump_list() output are visible on serial.
+                          * Previously uart_set_quiet(0) happened after
+                          * module_init_all() so the entire module system was
+                          * silent (uart_puts returns early when quiet=1).      */
     genet_init();           /* boot369: GENET MUST init before module_init_all()
                              * so g_genet_mac is populated before PhoenixDHCP
                              * module_init runs.  boot302–368 had this reversed:
@@ -205,7 +211,7 @@ void kernel_main(uint64_t dtb_ptr)
                              * completes DISCOVER→BOUND, stores full lease.
                              * wimp_task() starts with IP already bound.       */
     register_default_handlers();
-    uart_set_quiet(0);   /* boot256: re-enable for boot-complete banner */
+    /* uart_set_quiet(0) already called before genet_init() — boot377 */
     debug_print("Subsystems ready\n");
 
     /* Final screen status */

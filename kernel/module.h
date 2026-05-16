@@ -49,13 +49,19 @@ typedef struct risc_os_module {
     void                       *workspace;       /* private workspace (x12)    */
     uint32_t                    workspace_size;
     void                       *private_data;
+    /* boot379: native C SWI handler — set for C modules, NULL for binary ones */
+    int                       (*swi_fn)(uint32_t swi_offset, uint32_t *regs);
 } risc_os_module_t;
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
+/* boot379: swi_base + swi_fn added so native C modules can handle SWIs.
+ * Pass 0 / NULL for modules that expose no SWIs (e.g. PhoenixDHCP).        */
 int  module_register_native(const char *name,
                              int (*init)(void),
                              int (*final)(void),
-                             int (*service)(uint32_t reason, uint32_t *regs));
+                             int (*service)(uint32_t reason, uint32_t *regs),
+                             uint32_t swi_base,
+                             int (*swi_fn)(uint32_t swi_offset, uint32_t *regs));
 int  module_register(risc_os_module_t *mod);
 int  module_load_from_file(const char *path);
 int  module_load_from_memory(void *buffer, uint32_t size,

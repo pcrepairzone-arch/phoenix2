@@ -2506,3 +2506,229 @@ Rule 52: RX drain loop, not single-poll.  Calling genet_poll_rx()
          ring in a while() loop per tick; the ring is bounded (64
          slots) so the loop cannot stall the task scheduler.
 
+
+SESSION 7: 2026-05-16  boots 375–383  UDP + DNS + Module SWI + Debug cleanup
+═══════════════════════════════════════════════════════════════
+
+MILESTONE: PhoenixResolver online — www.google.com resolves to
+  142.251.156.119 via a full RFC 1035 DNS query/response over UDP.
+  The kernel now has: DHCP → ARP → UDP TX/RX → DNS → Module SWIs.
+
+── BOOT375 — TCP TEST SUITE EXPANSION ────────────────────────
+
+  Added a proper TCP test suite to kernel_main() covering:
+  Test A: single short GET (regression baseline).
+  Test B: pipelined double GET to same server (keep-alive path).
+  Test C: two sequential GETs to different hosts (slot reuse).
+  Test D: 8 sequential GETs, hammering the 4-slot ring (wrap stress).
+  Test E: RST error path — connect to a closed port, confirm TCP RST
+          is received and the slot is freed cleanly without a leak.
+
+  boot374 (committed): All 5 tests pass.  TCP ring-wrap at slot 4 →
+  slot 0 confirmed correct.  RST handling returns -ECONNREFUSED.
+
+── BOOT376 — PhoenixGENET DCI4 MODULE ────────────────────────
+
+  Added drivers/net/genet_module.c + genet_module.h.
+  Registers the BCM GENET driver as a proper RISC OS DCI4 module
+  ("EtherGENET") with SWI chunk 0x59F00 (ETHERGE_SWI_BASE).
+
+  The module wraps genet_poll_rx() as a DCI4 RX dispatcher: each
+  received frame is passed through net_rx_frame() which fans it out
+  to ARP, ICMP, TCP, and UDP handlers.  Previously this dispatch
+  lived inside the WIMP task; moving it to a module decouples the
+  network stack from the scheduler tick.
+
+  genet_module_swi() handles DCI4 SWI offsets (stub returning 0
+  for driver query SWIs); real DCI4 negotiation left for later.
+
+── BOOT377–378 — MODULE SWI DISPATCH INFRASTRUCTURE ──────────
+
+  kernel/module.h: added swi_fn field to risc_os_module_t:
+    int (*swi_fn)(uint32_t swi_offset, uint32_t *regs);
+
+  kernel/module.c: module_register_native() extended to accept
+  swi_base + swi_fn.  swi_dispatch() updated to check swi_fn first
+  (native C path) before the binary module header path.
+
+  All existing module_register_native() call sites updated:
+    PhoenixDHCP   — swi_base=0 / swi_fn=NULL  (no SWIs)
+    PhoenixGENET  — swi_base=0x59F00 / genet_module_swi
+    PhoenixResolver — swi_base=0x46000 / resolver_module_swi
+
+  This infrastructure allows any C function to be called as a RISC
+  OS SWI without needing an AArch64 binary module on disc.
+
+── BOOT379 — PhoenixUDP + PhoenixResolver (DNS) ───────────────
+
+  net/udp.c — full rewrite from stub:
+    8-slot RX queue (udp_rx_entry_t): used, dst_port, src_port,
+    src_ip[4], data[512], len.
+    udp_init() / udp_rx_enqueue() / udp_rx() / udp_recvfrom() /
+    udp_send() implemented.  udp_send() builds the 8-byte UDP header
+    (RFC 768), computes zero checksum (valid for IPv4), calls ARP to
+    resolve the destination MAC, then genet_send().
+
+  net/resolver_module.c + resolver_module.h — new files:
+    Implements the Inet6Sources Resolver SWI chunk 0x46000
+    (RESOLVER_SWI_GETHOSTBYNAME = offset 0).
+    Returns a BSD hostent_t pointer (h_name, h_addrtype=AF_INET=2,
+    h_length=4, h_addr_list pointing at a 4-byte IPv4 result).
+    Fast path: parse_dotted_decimal() returns immediately for
+    literal IPs without a DNS round-trip.
+    Full path: build_dns_query() → RFC 1035 label-encoded QNAME,
+    QTYPE=A(1), QCLASS=IN(1).  Three retries × 5s each.
+    DNS_LOCAL_PORT=1053, DNS_SERVER_PORT=53.
+    resolver_module_init() runs a self-test lookup of www.google.com
+    at startup and logs the result.
+
+  boot379 result: DNS query sent, but no reply received.
+  Root cause: udp_send() called arp_resolve() (cache-only).
+  The gateway 192.168.0.1 was never in the ARP cache because DHCP
+  used broadcast — no unicast ARP reply to cache the gateway MAC.
+  Zero UDP frames reached the wire.
+
+── BOOT380 — BLOCKING ARP RESOLUTION ─────────────────────────
+
+  net/arp.c — added two new functions:
+
+  arp_send_request(target_ip[4]):
+    Builds a 60-byte ARP who-has request (Ethernet + ARP header)
+    with SHA=our_mac, SPA=our_ip, THA=00:00:00:00:00:00,
+    TPA=target_ip.  Broadcasts via genet_send().
+
+  arp_resolve_blocking(ip, mac_out, timeout_ms):
+    Cache hit → return immediately (fast path).
+    Cache miss → arp_send_request() → ARM Generic Timer poll loop
+    calling genet_poll_rx() → net_rx_frame() → re-check ARP cache.
+    Returns 1 on success, 0 on timeout.
+
+  udp_send() updated: replaces cache-only arp_resolve() with
+  arp_resolve_blocking(dst_ip, mac, 1000).  Gateway fallback also
+  uses arp_resolve_blocking(gw, mac, 1000).
+
+  boot380 result: ARP resolved (192.168.0.1 MAC confirmed in log).
+  UDP packet left the wire.  But DNS reply never arrived.
+  Root cause: resolver_gethostbyname() poll loop called only
+  udp_recvfrom() (RX queue check) — never pumped the GENET ring.
+  The DNS reply sat in the DMA ring unread.
+
+── BOOT381 — DNS RX PUMP FIX ────────────────────────────────
+
+  resolver_gethostbyname() timeout loop — before boot381 it only
+  called udp_recvfrom() in each iteration (passive queue check).
+  The GENET DMA ring was never drained so the DNS reply was never
+  delivered to the UDP queue.
+
+  Fix: added genet_poll_rx() → net_rx_frame() drive inside the
+  DNS timeout loop.  Pattern is identical to the DHCP poll loop
+  (boot352) which already had this correct.
+
+    uint64_t t0 = cntpct();
+    while (!elapsed_ms(t0, DNS_TIMEOUT_MS)) {
+        int flen = genet_poll_rx(s_rx_frame, GENET_MAX_FRAME);
+        if (flen > 0) net_rx_frame(s_rx_frame, flen);
+        int n = udp_recvfrom(DNS_LOCAL_PORT, s_resp, ...);
+        if (n > 0 && parse_dns_response(...)) goto fill_hostent;
+    }
+
+  boot381 result:
+    [Resolver] www.google.com -> 142.251.156.119  ✓
+    [Resolver] Self-test OK: www.google.com = 142.251.156.119
+  DNS working end-to-end on first attempt.  Three-boot arc:
+  ARP miss (379) → ARP fixed but RX not driven (380) → RX
+  driven, DNS resolves (381).
+
+── BOOT382 — ZERO-SIZE EMBEDDED MODULE GUARD ─────────────────
+
+  Symptom: bootlog showed "Buffer too small" and "load failed
+  rc=4294967288 (-8)" for PhoenixTest and PhoenixCursor immediately
+  before PhoenixDHCP initialised.
+
+  Root cause: test_module and cursor_module are stub C files
+  (/* stub */) with no binary payload.  The linker.ld PROVIDE
+  symbols (test_module_start / test_module_end) resolve to the
+  same address when no binary is embedded, giving size = 0.
+  module_load_from_memory() validates the size against the minimum
+  RISC OS module header (0x34 bytes) and rejects it with -ENOMEM.
+
+  Fix: module_init_all() now checks size before calling load:
+    uint32_t tm_size = (uint32_t)(test_module_end - test_module_start);
+    if (tm_size == 0) {
+        uart_puts("[Module] PhoenixTest: not embedded (stub), skipping\n");
+    } else { /* load path */ }
+  Same guard added for cursor_module.  Clean skip; no error lines.
+
+── BOOT383 — xHCI VERBOSE REDUCTION ─────────────────────────
+
+  Context: bootlog381 was ~700 lines.  Most noise was diagnostic
+  blocks that were critical during debug but are now always-pass.
+
+  Changes in drivers/usb/usb_xhci.c:
+  Added: #define XHCI_VERBOSE 0  (flip to 1 to restore all detail)
+
+  Wrapped behind #if XHCI_VERBOSE:
+    - Rings programmed readback (DCBAAP/CRCR/ERSTBA/IMAN/IMOD)
+    - CYCLE bit protocol banners
+    - MFINDEX t0/t5ms check
+    - BOOT116 tight event ring poll banner + per-event prints
+    - Full 64-TRB ring dump (the single biggest block, ~30 lines)
+    - phys0 ERST nominal "intact" path (CORRUPTED error kept always-on)
+    - DMA region address printout + pre-zero hexdump
+    - Canary message
+    - AddrDev full context dump (ICC / SlotCtx / EP0Ctx / in_dma /
+      out_dma)
+    - boot151 OutCtx dump
+    - AddrDev TRB readback
+    - AddrDev drain per-event + boot152 CCE dump
+    - boot151 DCBAA per-slot prints (header/footer kept as single
+      always-on summary lines)
+    - No-op TRB detail + CRCR readback
+    - PSCEv drain stats
+    - Settle done → replaced with single always-on line:
+      "[xHCI] Controller running. USBSTS=…"
+
+  Changes in drivers/usb/usb_mass_storage.c:
+  xhci_set_quiet_timeouts(1) moved to BEFORE the BOT reset call
+  (was after it).  The RTL9210 USB-SATA bridge cold-start causes
+  ep_recover to fire during BOT reset, producing ~30 expected
+  timeout lines.  Moving the quiet zone start earlier suppresses
+  these without hiding real errors — the zone was already being
+  cleared after TUR success/fail.
+
+  Result (boot383 expected log): xHCI init section reduces from
+  ~200 lines to ~30 milestone lines.  All functional paths still
+  logged at INFO level; only per-register readbacks and context
+  dumps suppressed.
+
+── RULES ADDED THIS CHAPTER ────────────────────────────────────
+
+Rule 53: Any blocking poll loop that waits for a packet must drive
+         the GENET RX ring itself.  Calling a passive queue-check
+         (udp_recvfrom, dhcp_poll) without also calling
+         genet_poll_rx() → net_rx_frame() means frames sit in the
+         DMA ring forever.  The correct pattern (from DHCP, adopted
+         by DNS): while (!timeout) { genet_poll_rx(); net_rx_frame();
+         queue_check(); }.
+
+Rule 54: arp_resolve() is cache-only and will always miss for a
+         gateway that was never replied to unicast.  DHCP broadcast
+         does not populate the ARP cache for the router MAC.  Any
+         code that needs to send a unicast IP frame to a previously-
+         unseen host (DNS query to gateway, first TCP SYN, etc.) must
+         use arp_resolve_blocking() — which sends a who-has request
+         and polls until the reply fills the cache.
+
+Rule 55: PROVIDE linker symbols resolve to the same address when no
+         binary payload is embedded.  start == end → size == 0.
+         Always guard module_load_from_memory() calls with a size
+         check; do not pass a zero-length buffer to a loader that
+         validates a minimum header size.
+
+Rule 56: #define XHCI_VERBOSE 0 is the correct approach for
+         diagnostic blocks that were essential during a debug arc
+         but are now always-pass.  Deleting them loses the ability
+         to re-enable them when a regression surfaces.  Wrapping
+         them in #if XHCI_VERBOSE keeps the code, eliminates the
+         log noise, and makes the flag easy to find.
+
