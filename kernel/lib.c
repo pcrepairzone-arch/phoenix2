@@ -304,7 +304,7 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot383  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot384  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 

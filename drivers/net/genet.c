@@ -27,6 +27,11 @@
 #include "drivers/net/genet.h"
 #include "drivers/net/bcmgenetreg.h"
 
+/* boot384: compile-time verbose flag.  Set to 1 to restore all per-frame
+ * TX/RX dumps and register readbacks for deep debugging.
+ * Set to 0 for clean boot logs — errors and milestones only.               */
+#define GENET_VERBOSE 0
+
 /* ── Bit-field helpers (from bcmgenetreg.h convention) ─────────────────── */
 #define __BIT(n)          (1u << (n))
 #define __BITS(hi,lo)     (((2u << (hi)) - 1u) & ~((1u << (lo)) - 1u))
@@ -230,7 +235,9 @@ static void genet_reset(void)
      * boot314 (boots 333/334 confirmed RDMA OK, DHCP bound) had RBUF_CTRL=0x2.
      * Adding BAD_DIS (bit 2) in boot328 broke RDMA — do not set it. */
     GW4(GENET_RBUF_CTRL, GENET_RBUF_ALIGN_2B);
+#if GENET_VERBOSE
     debug_print("[GENET] RBUF_CTRL=0x%x (expect 0x2)\n", (unsigned)GR4(GENET_RBUF_CTRL));
+#endif
     GW4(GENET_RBUF_TBUF_SIZE_CTRL, 1);
 }
 
@@ -386,6 +393,7 @@ static void genet_init_rings(int qid)
     g_tx_pidx = 0;
     g_tx_cidx = 0;
 
+#if GENET_VERBOSE
     /* Diagnostic readback — mirrors boot314 output so we can compare logs  */
     debug_print("[GENET] RX ring: WRITE_PTR=%u PROD=%u CONS=%u\n",
         (unsigned)(GR4(GENET_RX_DMA_WRITE_PTR_LO(qid)) & 0xffff),
@@ -394,6 +402,7 @@ static void genet_init_rings(int qid)
     debug_print("[GENET] RX desc[0] addr_lo=0x%08x status=0x%08x\n",
         (unsigned)GR4(GENET_RX_DESC_ADDRESS_LO(0)),
         (unsigned)GR4(GENET_RX_DESC_STATUS(0)));
+#endif
 }
 
 /* ── IRQ mask: mask everything (polling mode) ───────────────────────────── */
@@ -599,7 +608,9 @@ void genet_apply_link(void)
      *     to RDMA, so PROD_INDEX never advances regardless of other fixes.
      * boot341: prints OOB before/after to confirm correct bits at runtime.  */
     uint32_t oob = GR4(GENET_EXT_RGMII_OOB_CTRL);
+#if GENET_VERBOSE
     debug_print("[GENET] apply_link: OOB before=0x%08x\n", (unsigned)oob);
+#endif
     if (spd == GENET_UMAC_CMD_SPEED_1000)
         oob |= GENET_EXT_RGMII_OOB_ID_MODE_DISABLE;
     else
@@ -607,14 +618,17 @@ void genet_apply_link(void)
     oob &= ~GENET_EXT_RGMII_OOB_OOB_DISABLE;  /* enable OOB signalling   */
     oob |=  GENET_EXT_RGMII_OOB_RGMII_LINK;   /* assert link-up to MAC   */
     GW4(GENET_EXT_RGMII_OOB_CTRL, oob);
+#if GENET_VERBOSE
     debug_print("[GENET] apply_link: OOB after=0x%08x UMAC_CMD=0x%08x\n",
         (unsigned)GR4(GENET_EXT_RGMII_OOB_CTRL),
         (unsigned)GR4(GENET_UMAC_CMD));
+#endif
 
     /* boot313/327: post-link RDMA state dump.
      * Key values: CTRL=0x00020001 (EN+RBUF_EN), CFG=0x00010000 (ring16 enabled)
      * d0_stat=0x08000000 = BUFLEN=2048 (untouched = no frame yet received)
      * If d0_stat changed = hardware wrote a frame into slot 0.              */
+#if GENET_VERBOSE
     {
         const int qid2 = GENET_DMA_DEFAULT_QUEUE;
         debug_print("[GENET] post-link RDMA: CTRL=0x%08x CFG=0x%08x"
@@ -626,6 +640,7 @@ void genet_apply_link(void)
             (unsigned)GR4(GENET_RX_DESC_STATUS(0)),
             (unsigned)GR4(GENET_RX_DESC_ADDRESS_LO(0)));
     }
+#endif
 }
 
 /* ── Public: genet_send ────────────────────────────────────────────────── */
@@ -659,6 +674,7 @@ int genet_send(const void *buf, uint32_t len)
     /* boot339: log first 32 TX frames for diagnostics.
      * Split into two calls (≤7 args each) — bare-metal debug_print va_list
      * does not reliably read stack-spilled args beyond 7 registers.            */
+#if GENET_VERBOSE
     if (g_tx_pidx < 32) {
         const uint8_t *f = g_tx_buf[idx];
         uint16_t etype = (uint16_t)((f[12] << 8) | f[13]);
@@ -670,6 +686,7 @@ int genet_send(const void *buf, uint32_t len)
             f[0],f[1],f[2],f[3],f[4],f[5],
             etype, (unsigned)len);
     }
+#endif
 
     uint32_t paddr = (uint32_t)(uintptr_t)g_tx_buf[idx];
     uint32_t status = (len << 16) |
@@ -735,12 +752,14 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
 
     /* boot349: log STATUS so we can see what hardware wrote.
      * Only log first 16 calls to avoid spamming the UART.               */
+#if GENET_VERBOSE
     static uint32_t s_rx_log_count = 0;
     if (s_rx_log_count < 16) {
         s_rx_log_count++;
         debug_print("[GENET] poll_rx idx=%d status=0x%08x raw_len=%u total=%u\n",
                     idx, (unsigned)status, (unsigned)raw_len, (unsigned)total);
     }
+#endif
 
     /* Advance consumer — this is the ONLY re-arm operation needed.
      *
@@ -784,6 +803,7 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
 
     memcpy(buf, g_rx_buf[idx] + ETHER_ALIGN, frame_len);
 
+#if GENET_VERBOSE
     if (g_rx_count < 32) {
         const uint8_t *f = (const uint8_t *)buf;
         uint16_t etype = (uint16_t)((f[12] << 8) | f[13]);
@@ -795,6 +815,7 @@ int genet_poll_rx(void *buf, uint32_t maxlen)
             f[0],f[1],f[2],f[3],f[4],f[5],
             etype, (unsigned)frame_len);
     }
+#endif
 
     g_rx_count++;
     return (int)frame_len;

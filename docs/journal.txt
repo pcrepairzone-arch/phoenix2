@@ -2701,6 +2701,43 @@ MILESTONE: PhoenixResolver online — www.google.com resolves to
   logged at INFO level; only per-register readbacks and context
   dumps suppressed.
 
+── SESSION 8 — boot384 ─────────────────────────────────────────
+Date: 2026-05-17
+Focus: GENET verbose reduction
+
+  boot384: GENET verbose reduction
+  ─────────────────────────────────
+  Applied GENET_VERBOSE 0 pattern to drivers/net/genet.c, mirroring
+  the XHCI_VERBOSE approach from boot383.
+
+  Added after bcmgenetreg.h include:
+    /* boot384: compile-time verbose flag. Set to 1 to restore all
+     * per-frame TX/RX dumps and register readbacks for deep debugging.
+     * Set to 0 for clean boot logs — errors and milestones only.     */
+    #define GENET_VERBOSE 0
+
+  Wrapped in #if GENET_VERBOSE / #endif (diagnostic-only, not errors):
+    - RBUF_CTRL readback after GW4(GENET_RBUF_CTRL, GENET_RBUF_ALIGN_2B)
+    - RX ring state readback (WRITE_PTR / PROD / CONS + desc[0] addr/status)
+    - apply_link OOB before/after prints (boot341 diagnostics)
+    - post-link RDMA state dump (CTRL/CFG/PROD/CONS/d0_stat, boot313/327)
+    - TX#N per-frame dump, first 32 frames (boot339 — src/dst/type/len)
+    - poll_rx per-frame STATUS log, first 16 calls (boot349, s_rx_log_count)
+    - RX#N per-frame dump, first 32 frames (boot339 pattern)
+
+  Always-on (errors + milestones, never wrapped):
+    - MDIO timeout / PHY not found / PHY id line
+    - autoneg started / link speed selection
+    - GENETv%u.%u detected / unsupported version
+    - MAC address print
+    - TX ring full (error path)
+    - RX hw error (error path, status bits)
+    - RX oversized (error path)
+    - UMAC TX+RX enabled / init complete
+
+  lib.c splash: boot383 → boot384
+  Build: clean, zero warnings.
+
 ── RULES ADDED THIS CHAPTER ────────────────────────────────────
 
 Rule 53: Any blocking poll loop that waits for a packet must drive
@@ -2731,4 +2768,13 @@ Rule 56: #define XHCI_VERBOSE 0 is the correct approach for
          to re-enable them when a regression surfaces.  Wrapping
          them in #if XHCI_VERBOSE keeps the code, eliminates the
          log noise, and makes the flag easy to find.
+
+Rule 57: Apply the VERBOSE flag pattern consistently across all
+         drivers.  Each driver gets its own flag (#define GENET_VERBOSE,
+         #define XHCI_VERBOSE, etc.) so individual subsystems can be
+         re-enabled independently during debugging.  The flag belongs
+         at the top of the .c file immediately after its last #include.
+         Error paths, milestone prints, and version/capability lines
+         are always-on; per-register readbacks, per-frame dumps, and
+         state readbacks after each init step go behind the flag.
 
