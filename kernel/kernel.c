@@ -191,7 +191,7 @@ void kernel_main(uint64_t dtb_ptr)
     debug_print("\n[10/10] VFS / Network / Signals...\n");
     vfs_init();
     filecore_init();
-    uart_set_quiet(1);   /* boot256: silence FileCore/IDA verbose scan */
+    uart_set_quiet(1);   /* boot256/387: silence FileCore IDA verbose scan */
     filecore_list_root();
     filecore_show_results();
     uart_set_quiet(0);   /* boot377: re-enable uart_puts before genet/module init

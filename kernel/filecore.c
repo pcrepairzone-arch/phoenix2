@@ -179,6 +179,12 @@
 #include "blockdriver.h"
 #include "errno.h"
 
+/* boot387: compile-time verbose flag for FileCore/IDA diagnostics.
+ * Set to 1 to restore per-IDA-resolution prints, Step 6 per-entry
+ * listing, and zone-scan detail for deep debugging.
+ * Set to 0 for clean boot logs — errors and milestones only.       */
+#define FILECORE_VERBOSE 0
+
 extern void uart_puts(const char *s);
 extern blockdev_t *blockdev_list[];
 extern int blockdev_count;
@@ -1721,123 +1727,33 @@ void filecore_list_root(void)
             uart_puts("[FileCore] === Step 4 done ===\n\n");
         }
 
-        /* ── Step 5 (boot268): Read a real file via filecore_get_child_entry ──
+        /* ── Step 5 (boot387): Execute PreDesk boot obey via filecore_find_path ──
          *
-         * Locate '!Boot' in the root cache, then use filecore_get_child_entry()
-         * to walk its entries and find the '!Boot' obey script (len=561).
-         * Read the file data and dump the first 128 bytes to UART to prove
-         * the full chain works: root → child dir → file data.               */
+         * boot386 revealed $.!Boot.!Boot is release notes text, not a boot script.
+         * The real desktop boot obey is $.!Boot.Choices.Boot.PreDesk (boot387).
+         * Use filecore_find_path() so the path walk is driven by a single string.  */
         if (g_root_cache_valid && g_root_cache_count > 0u) {
-            uart_puts("[FileCore] === Step 5: Read !Boot/!Boot file ===\n");
+            uart_puts("[FileCore] === Step 5: Execute $.!Boot.Choices.Boot.PreDesk ===\n");
 
-            /* Find '!Boot' directory in root cache (search by name, not type,
-             * because type classification depended on attr byte fix above).  */
-            uint32_t boot_sin = 0u;
-            for (uint32_t ri = 0u; ri < g_root_cache_count; ri++) {
-                const char *n = g_root_cache[ri].name;
-                if (n[0]=='!' && n[1]=='B' && n[2]=='o' && n[3]=='o' &&
-                    n[4]=='t' && n[5]=='\0') {
-                    boot_sin = g_root_cache[ri].sin;
-                    uart_puts("[Step5] Found !Boot  sin=");
-                    fc_hex32(boot_sin);
-                    uart_puts("  type=");
-                    fc_dec((uint32_t)g_root_cache[ri].type);
-                    uart_puts("\n");
-                    break;
-                }
-            }
-
-            if (boot_sin == 0u) {
-                uart_puts("[Step5] !Boot not in root cache\n");
+            vfs_dirent_t fent;
+            const char *predesk = "$.!Boot.Choices.Boot.PreDesk";
+            if (filecore_find_path(predesk, &fent) != 0 ||
+                    fent.type != VFS_DIRENT_FILE) {
+                uart_puts("[Step5] PreDesk not found (path: ");
+                uart_puts(predesk); uart_puts(")\n");
             } else {
-                /* Scan entries of !Boot dir to find '!Boot' file */
-                vfs_dirent_t fent;
-                uint32_t fidx = 0u;
-                int found_boot_file = 0;
+                uart_puts("[Step5] PreDesk sin="); fc_hex32(fent.sin);
+                uart_puts("  size="); fc_dec((uint32_t)fent.size); uart_puts("\n");
 
-                /* We know from SCAN log !Boot dir has 204 entries; search first 256 */
-                uart_puts("[Step5] Scanning !Boot dir entries...\n");
-                for (fidx = 0u; fidx < 256u; fidx++) {
-                    if (filecore_get_child_entry(boot_sin, fidx, &fent) != 0) {
-                        uart_puts("[Step5] get_child_entry end at idx=");
-                        fc_dec(fidx); uart_puts("\n");
-                        break;
-                    }
-                    /* Check for the '!Boot' file by name */
-                    const char *fn = fent.name;
-                    if (fn[0]=='!' && fn[1]=='B' && fn[2]=='o' && fn[3]=='o' &&
-                        fn[4]=='t' && fn[5]=='\0') {
-                        uart_puts("[Step5] Found !Boot file  idx="); fc_dec(fidx);
-                        uart_puts("  sin="); fc_hex32(fent.sin);
-                        uart_puts("  len="); fc_dec((uint32_t)fent.size);
-                        uart_puts("\n");
-                        found_boot_file = 1;
-                        break;
-                    }
-                }
-
-                if (!found_boot_file) {
-                    uart_puts("[Step5] !Boot file not found in !Boot dir\n");
+                uint8_t *fbuf = filecore_read_file(fent.sin, (uint32_t)fent.size);
+                if (!fbuf) {
+                    uart_puts("[Step5] read failed\n");
                 } else {
-                    /* Resolve file IDA → data LBA */
-                    uint32_t sector_size2 = 1u << g_dr_log2ss;
-                    uint32_t bpmb2        = 1u << g_dr_log2bpmb;
-                    uint32_t secperlfau2  = bpmb2 / sector_size2;
-                    uint32_t used_bits2   = (sector_size2 * 8u) - g_dr_zone_spare;
-                    uint32_t dr_size2     = 60u * 8u;
-                    uint32_t nzones2      = g_dr_nzones;
-                    if (g_dr_big_flag) nzones2 += (uint32_t)g_dr_nzones_hi << 8u;
-                    uint32_t mid2         = nzones2 / 2u;
-                    uint32_t dml2         = g_fc_lba_base
-                                          + (mid2 * used_bits2 - dr_size2) * secperlfau2;
-
-                    uint32_t file_lba = 0u;
-                    if (fc_ida_to_data_lba(fent.sin,
-                                            g_fc_lba_base, dml2,
-                                            g_dr_zone_spare, used_bits2,
-                                            dr_size2, g_dr_id_len,
-                                            secperlfau2, nzones2,
-                                            &file_lba) != 0) {
-                        uart_puts("[Step5] file IDA resolve FAILED\n");
-                    } else {
-                        uart_puts("[Step5] file_lba="); fc_hex32(file_lba);
-                        uart_puts("  size="); fc_dec((uint32_t)fent.size);
-                        uart_puts(" bytes\n");
-
-                        /* boot385: read entire file via filecore_read_file
-                         * (handles multi-sector files) then execute as obey. */
-                        uint8_t *fbuf = filecore_read_file(fent.sin,
-                                                           (uint32_t)fent.size);
-                        if (!fbuf) {
-                            uart_puts("[Step5] read failed\n");
-                        } else {
-                            uint32_t dump_len = (uint32_t)fent.size;
-                            if (dump_len > 128u) dump_len = 128u;
-
-                            uart_puts("[Step5] File content (first ");
-                            fc_dec(dump_len); uart_puts(" bytes):\n[Step5] ");
-
-                            for (uint32_t b = 0u; b < dump_len; b++) {
-                                if (fbuf[b] >= 0x20u && fbuf[b] < 0x7Fu) {
-                                    char cs[2] = {(char)fbuf[b], '\0'};
-                                    uart_puts(cs);
-                                } else if (fbuf[b] == 0x0Au || fbuf[b] == 0x0Du) {
-                                    /* newline → print as \n in log */
-                                    uart_puts("\n[Step5] ");
-                                } else {
-                                    uart_puts("["); fc_hex8(fbuf[b]); uart_puts("]");
-                                }
-                            }
-                            uart_puts("\n[Step5] === file read OK ===\n");
-
-                            /* boot385: Step 5b — execute !Boot as obey */
-                            uart_puts("[FileCore] === Step 5b: Execute !Boot obey ===\n");
-                            filecore_exec_obey(fbuf, (uint32_t)fent.size);
-                            uart_puts("[FileCore] === Step 5b done ===\n\n");
-
-                            kfree(fbuf);
-                        }
-                    }
+                    /* boot385: Step 5b — execute PreDesk as obey */
+                    uart_puts("[FileCore] === Step 5b: Execute PreDesk obey ===\n");
+                    filecore_exec_obey(fbuf, (uint32_t)fent.size);
+                    uart_puts("[FileCore] === Step 5b done ===\n\n");
+                    kfree(fbuf);
                 }
             }
             uart_puts("[FileCore] === Step 5 done ===\n\n");
@@ -1949,10 +1865,12 @@ static int fc_try_load_modules_from_dir(uint32_t dir_sin, const char *label,
             uart_puts("[Step6]   ("); fc_dec(i); uart_puts(" entries)\n");
             break;
         }
+#if FILECORE_VERBOSE
         uart_puts("[Step6]   ["); fc_dec(i); uart_puts("] '");
         uart_puts(ent.name);
         uart_puts(ent.type == VFS_DIRENT_DIR ? "'  DIR" : "'  FILE");
         uart_puts("  sz="); fc_dec((uint32_t)ent.size); uart_puts("\n");
+#endif
 
         if (ent.type != VFS_DIRENT_FILE) continue;
         if (ent.size < 0x34u || ent.size > 4u * 1024u * 1024u) continue;
@@ -2207,10 +2125,12 @@ static int fc_ida_to_data_lba(uint32_t ida,
         return -1;
     }
 
+#if FILECORE_VERBOSE
     uart_puts("[IDA] ida="); fc_hex32(ida);
     uart_puts("  id="); fc_dec(id);
     uart_puts("  ids_pz="); fc_dec(ids_pz);
     uart_puts("  home_zone="); fc_dec(home_zone); uart_puts("\n");
+#endif
 
     /* Read the home zone's map sector from the contiguous map copy */
     uint8_t *zbuf = (uint8_t *)kmalloc(512);
@@ -2240,8 +2160,10 @@ static int fc_ida_to_data_lba(uint32_t ida,
 
         if (entry_id == id) {
             found_start = start;
+#if FILECORE_VERBOSE
             uart_puts("[IDA] found id="); fc_dec(id);
             uart_puts(" at alloc_bit="); fc_dec(found_start); uart_puts("\n");
+#endif
             break;
         }
 
@@ -2276,11 +2198,13 @@ static int fc_ida_to_data_lba(uint32_t ida,
                        + chain_lfau;
     *out_lba         = lba_base + lfauno * secperlfau;
 
+#if FILECORE_VERBOSE
     uart_puts("[IDA] zone="); fc_dec(home_zone);
     uart_puts("  start="); fc_dec(found_start);
     uart_puts("  chain_lfau="); fc_dec(chain_lfau);
     uart_puts("  lfauno="); fc_dec(lfauno);
     uart_puts("  data_lba="); fc_hex32(*out_lba); uart_puts("\n");
+#endif
 
     return 0;
 }
