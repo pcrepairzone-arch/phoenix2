@@ -2738,6 +2738,66 @@ Focus: GENET verbose reduction
   lib.c splash: boot383 → boot384
   Build: clean, zero warnings.
 
+── SESSION 9 — boot385 ─────────────────────────────────────────
+Date: 2026-05-18
+Focus: filecore_find_path + obey file executor
+
+  boot385: filecore_find_path + obey file executor
+  ──────────────────────────────────────────────────
+  Two major additions to kernel/filecore.c:
+
+  1. filecore_find_path (replaces boot299 stub)
+     ────────────────────────────────────────────
+     Full path resolver for RISC OS paths.  Accepted forms:
+       $.!Boot                      (root-relative)
+       HardDisc4.$.!Boot            (with disc name)
+       ADFS::HardDisc4.$.!Boot      (with FS + disc name prefix)
+       $.!Boot.Resources.!System    (multi-level)
+       $.                           (root itself)
+
+     Algorithm:
+       1. Strip optional "ADFS::" FS prefix.
+       2. Advance past disc name to "$." (first occurrence).
+       3. First component: case-sensitive search in g_root_cache.
+       4. Subsequent components: fc_find_in_dir() on current SIN.
+       Returns synthetic root dirent (type=DIR, sin=g_dr_root_dir)
+       for bare "$" path.
+
+  2. filecore_exec_obey / obey_exec_line (new)
+     ──────────────────────────────────────────
+     Parse and execute a byte buffer as a RISC OS obey file.
+     Each line (CR/LF terminated) dispatched as a star command.
+     Variable table: 64-entry name/value array (g_obey_vars).
+
+     Commands implemented:
+       |          — comment, silently ignored
+       Set        — obey_var_set() stores in g_obey_vars, UART log
+       Unset      — stub (logged)
+       RMLoad     — filecore_find_path + filecore_read_file +
+                    module_load_from_memory; logs [loaded OK] or error
+       RMEnsure   — version check stub; always executes fallback cmd
+       IfThere    — filecore_find_path existence test; executes "Then"
+                    clause if path found
+       Run        — recursive filecore_exec_obey, depth capped at 3
+       everything else — logged as [stub]
+
+     String helpers: ob_skip_sp, ob_copy_word, ob_kw_eq
+       (case-insensitive keyword compare — star commands are CI)
+
+  3. Step 5 wiring
+     ──────────────
+     filecore_list_root Step 5 now uses filecore_read_file(sin, size)
+     instead of a raw single-sector read.  After the 128-byte dump,
+     the full file buffer is passed to filecore_exec_obey — boot logs
+     will show each line of !Boot/!Boot with its dispatch result.
+
+  4. adfs_chain_traverse + adfs_hugo_brute_scan
+     ────────────────────────────────────────────
+     Pre-existing unused-function warnings suppressed with
+     __attribute__((unused)) on their forward declarations.
+
+  Build: clean, zero warnings.
+
 ── RULES ADDED THIS CHAPTER ────────────────────────────────────
 
 Rule 53: Any blocking poll loop that waits for a packet must drive
@@ -2777,4 +2837,12 @@ Rule 57: Apply the VERBOSE flag pattern consistently across all
          Error paths, milestone prints, and version/capability lines
          are always-on; per-register readbacks, per-frame dumps, and
          state readbacks after each init step go behind the flag.
+
+Rule 58: filecore_find_path is the correct abstraction for all disc
+         access above the IDA/SIN layer.  Any code that needs a file
+         or directory should call filecore_find_path(path, &ent) and
+         then filecore_read_file(ent.sin, (uint32_t)ent.size).  Never
+         call fc_ida_to_data_lba or g_fc_bdev->ops->read directly
+         from new code — those are implementation details that belong
+         inside filecore.c.
 

@@ -876,9 +876,11 @@ static int  adfs_chain_traverse(uint32_t frag_id, uint32_t chain_offset,
                                  uint32_t lba_base,  uint32_t disc_map_lba,
                                  uint32_t zone_spare, uint32_t used_bits,
                                  uint32_t dr_size,    uint32_t id_len,
-                                 uint32_t secperlfau, uint32_t total_nzones);
+                                 uint32_t secperlfau, uint32_t total_nzones)
+    __attribute__((unused));
 static void adfs_hugo_brute_scan(uint32_t start_lba, uint32_t scan_lbas,
-                                  uint32_t secperlfau);
+                                  uint32_t secperlfau)
+    __attribute__((unused));
 static void filecore_step6_load_module(uint32_t disc_map_lba, uint32_t used_bits,
                                         uint32_t dr_size, uint32_t secperlfau,
                                         uint32_t total_nzones);
@@ -891,6 +893,9 @@ int filecore_get_child_entry(uint32_t dir_sin, uint32_t idx, vfs_dirent_t *out);
  * avoid pulling the full module.h include into filecore.c's scope.          */
 extern int module_load_from_memory(void *buffer, uint32_t size,
                                     const char *suggested_name);
+
+/* boot385: obey file executor — defined at end of file */
+void filecore_exec_obey(const uint8_t *buf, uint32_t size);
 
 /* ── filecore_list_root ──────────────────────────────────────────────────────
  * Reads the Full DiscRec from zone 0 and zone (nzones_total / 2).
@@ -1799,34 +1804,37 @@ void filecore_list_root(void)
                         uart_puts("  size="); fc_dec((uint32_t)fent.size);
                         uart_puts(" bytes\n");
 
-                        /* Read up to 512 bytes (one sector) */
-                        uint8_t *fbuf = (uint8_t *)kmalloc(512u);
+                        /* boot385: read entire file via filecore_read_file
+                         * (handles multi-sector files) then execute as obey. */
+                        uint8_t *fbuf = filecore_read_file(fent.sin,
+                                                           (uint32_t)fent.size);
                         if (!fbuf) {
-                            uart_puts("[Step5] kmalloc fail\n");
+                            uart_puts("[Step5] read failed\n");
                         } else {
-                            if (g_fc_bdev->ops->read(g_fc_bdev,
-                                    (uint64_t)file_lba, 1, fbuf) < 0) {
-                                uart_puts("[Step5] read error\n");
-                            } else {
-                                uint32_t dump_len = (uint32_t)fent.size;
-                                if (dump_len > 128u) dump_len = 128u;
+                            uint32_t dump_len = (uint32_t)fent.size;
+                            if (dump_len > 128u) dump_len = 128u;
 
-                                uart_puts("[Step5] File content (first ");
-                                fc_dec(dump_len); uart_puts(" bytes):\n[Step5] ");
+                            uart_puts("[Step5] File content (first ");
+                            fc_dec(dump_len); uart_puts(" bytes):\n[Step5] ");
 
-                                for (uint32_t b = 0u; b < dump_len; b++) {
-                                    if (fbuf[b] >= 0x20u && fbuf[b] < 0x7Fu) {
-                                        char cs[2] = {(char)fbuf[b], '\0'};
-                                        uart_puts(cs);
-                                    } else if (fbuf[b] == 0x0Au || fbuf[b] == 0x0Du) {
-                                        /* newline → print as \n in log */
-                                        uart_puts("\n[Step5] ");
-                                    } else {
-                                        uart_puts("["); fc_hex8(fbuf[b]); uart_puts("]");
-                                    }
+                            for (uint32_t b = 0u; b < dump_len; b++) {
+                                if (fbuf[b] >= 0x20u && fbuf[b] < 0x7Fu) {
+                                    char cs[2] = {(char)fbuf[b], '\0'};
+                                    uart_puts(cs);
+                                } else if (fbuf[b] == 0x0Au || fbuf[b] == 0x0Du) {
+                                    /* newline → print as \n in log */
+                                    uart_puts("\n[Step5] ");
+                                } else {
+                                    uart_puts("["); fc_hex8(fbuf[b]); uart_puts("]");
                                 }
-                                uart_puts("\n[Step5] === file read OK ===\n");
                             }
+                            uart_puts("\n[Step5] === file read OK ===\n");
+
+                            /* boot385: Step 5b — execute !Boot as obey */
+                            uart_puts("[FileCore] === Step 5b: Execute !Boot obey ===\n");
+                            filecore_exec_obey(fbuf, (uint32_t)fent.size);
+                            uart_puts("[FileCore] === Step 5b done ===\n\n");
+
                             kfree(fbuf);
                         }
                     }
@@ -2856,16 +2864,320 @@ static void adfs_hugo_brute_scan(uint32_t start_lba, uint32_t scan_lbas,
 }
 
 /* ── filecore_find_path ──────────────────────────────────────────────────────
- * Resolve a path string of the form "HardDisc0.$.name1.name2" into a
- * vfs_dirent_t.  Strips the optional "HardDisc0.$." prefix, then walks
- * path components through root cache and child directories.
+ * Resolve a RISC OS path to a vfs_dirent_t.  Accepted path forms:
+ *   $.!Boot                          (root-relative)
+ *   HardDisc4.$.!Boot                (with disc name)
+ *   ADFS::HardDisc4.$.!Boot          (with FS + disc name)
+ *   $.!Boot.Resources.!System        (multi-level)
+ *   $.                               (root itself)
+ *
+ * Algorithm:
+ *   1. Strip optional "ADFS::" FS prefix.
+ *   2. Advance past disc name to "$." (first "$.").
+ *   3. First component: search g_root_cache.
+ *   4. Subsequent components: fc_find_in_dir() on the current SIN.
  *
  * Returns 0 and fills *out on success, -1 if not found.
- * (boot299 stub — path walk not yet exercised in boot300)                   */
+ * boot385: full implementation replacing boot299 stub.                      */
 int filecore_find_path(const char *path, vfs_dirent_t *out)
 {
-    (void)path; (void)out;
-    return -1;
+    if (!path || !out || !g_root_cache_valid) return -1;
+
+    const char *p = path;
+
+    /* Strip "ADFS::" or "adfs::" FS prefix */
+    if ((p[0]=='A'||p[0]=='a') && p[1]=='D' && p[2]=='F' &&
+        p[3]=='S' && p[4]==':' && p[5]==':')
+        p += 6;
+
+    /* Advance to "$." — skip disc name if present */
+    {
+        const char *q = p;
+        while (*q && !(*q == '$' && *(q+1) == '.')) q++;
+        if (*q == '$' && *(q+1) == '.') p = q + 2;   /* skip past "$." */
+        /* If no "$." found, treat remaining string as root-relative */
+    }
+
+    /* Path is just "$" or "$." — return synthetic root dirent */
+    if (*p == '\0') {
+        out->type       = VFS_DIRENT_DIR;
+        out->sin        = g_dr_root_dir;
+        out->size       = 0;
+        out->load_addr  = 0;
+        out->exec_addr  = 0;
+        out->riscos_type = 0;
+        out->name[0]    = '$';
+        out->name[1]    = '\0';
+        return 0;
+    }
+
+    /* Extract first component and search root cache */
+    char comp[VFS_NAME_MAX];
+    int  ci = 0;
+    while (*p && *p != '.' && ci < (int)VFS_NAME_MAX - 1)
+        comp[ci++] = *p++;
+    comp[ci] = '\0';
+    if (*p == '.') p++;
+
+    vfs_dirent_t cur;
+    int found = 0;
+    for (uint32_t ri = 0u; ri < g_root_cache_count; ri++) {
+        if (fc_name_eq(g_root_cache[ri].name, comp)) {
+            cur = g_root_cache[ri];
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return -1;
+
+    /* Walk remaining path components */
+    while (*p != '\0') {
+        if (cur.type != VFS_DIRENT_DIR) return -1;   /* can't enter a file */
+        ci = 0;
+        while (*p && *p != '.' && ci < (int)VFS_NAME_MAX - 1)
+            comp[ci++] = *p++;
+        comp[ci] = '\0';
+        if (*p == '.') p++;
+        if (fc_find_in_dir(cur.sin, comp, &cur) != 0) return -1;
+    }
+
+    *out = cur;
+    return 0;
+}
+
+/* ── Obey file executor ──────────────────────────────────────────────────────
+ * boot385: parse and execute an ADFS !Boot obey file byte buffer.
+ *
+ * Supported commands:
+ *   |              — comment line (ignored)
+ *   Set <var> <v>  — store in local variable table (UART logged)
+ *   Unset <var>    — remove variable (stub — just logs)
+ *   RMLoad <path>  — filecore_find_path + filecore_read_file +
+ *                    module_load_from_memory
+ *   RMEnsure <m> <ver> [<cmd>]  — stub (always runs fallback cmd if present)
+ *   IfThere <path> Then <cmd>   — filecore_find_path existence test
+ *   Run <path>     — read obey file and execute recursively (depth-limited)
+ *   WimpSlot / Set Wimp$... / anything else — logged as [stub]
+ *
+ * Limitations (boot385):
+ *   • No variable expansion ($ substitution).
+ *   • RMEnsure version check not implemented — always executes fallback.
+ *   • Recursive Run depth capped at 3.                                      */
+
+/* ── Variable table ─────────────────────────────────────────────────────── */
+#define OBEY_VAR_MAX  64
+#define OBEY_VAR_NLEN 64
+#define OBEY_VAR_VLEN 128
+
+typedef struct {
+    char name[OBEY_VAR_NLEN];
+    char val [OBEY_VAR_VLEN];
+} obey_var_t;
+
+static obey_var_t g_obey_vars[OBEY_VAR_MAX];
+static uint32_t   g_obey_nvar = 0u;
+
+static void obey_var_set(const char *name, const char *val)
+{
+    for (uint32_t i = 0u; i < g_obey_nvar; i++) {
+        if (fc_name_eq(g_obey_vars[i].name, name)) {
+            uint32_t v = 0u;
+            while (val[v] && v < OBEY_VAR_VLEN - 1u) {
+                g_obey_vars[i].val[v] = val[v]; v++;
+            }
+            g_obey_vars[i].val[v] = '\0';
+            return;
+        }
+    }
+    if (g_obey_nvar >= OBEY_VAR_MAX) return;
+    uint32_t n = 0u;
+    while (name[n] && n < OBEY_VAR_NLEN - 1u)
+        { g_obey_vars[g_obey_nvar].name[n] = name[n]; n++; }
+    g_obey_vars[g_obey_nvar].name[n] = '\0';
+    uint32_t v = 0u;
+    while (val[v] && v < OBEY_VAR_VLEN - 1u)
+        { g_obey_vars[g_obey_nvar].val[v] = val[v]; v++; }
+    g_obey_vars[g_obey_nvar].val[v] = '\0';
+    g_obey_nvar++;
+}
+
+/* ── String helpers ─────────────────────────────────────────────────────── */
+static const char *ob_skip_sp(const char *s)
+    { while (*s == ' ' || *s == '\t') s++; return s; }
+
+static const char *ob_copy_word(const char *s, char *buf, int maxlen)
+{
+    int i = 0;
+    while (*s && *s != ' ' && *s != '\t' && i < maxlen - 1)
+        buf[i++] = *s++;
+    buf[i] = '\0';
+    return s;
+}
+
+/* Case-insensitive keyword compare (star commands are case-insensitive) */
+static int ob_kw_eq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* ── Single-line dispatcher ─────────────────────────────────────────────── */
+static int g_obey_depth = 0;    /* recursion guard for Run */
+
+static void obey_exec_line(const char *line)
+{
+    line = ob_skip_sp(line);
+    if (*line == '\0' || *line == '|') return;   /* blank or comment */
+
+    /* Strip leading '*' (star command form in obey files) */
+    if (*line == '*') { line++; line = ob_skip_sp(line); }
+
+    char cmd[48];
+    const char *rest = ob_copy_word(line, cmd, (int)sizeof(cmd));
+    rest = ob_skip_sp(rest);
+
+    uart_puts("[Obey] ");
+
+    /* ── Set ─────────────────────────────────────────────────────────── */
+    if (ob_kw_eq(cmd, "Set")) {
+        char varname[OBEY_VAR_NLEN];
+        const char *after = ob_copy_word(rest, varname, (int)sizeof(varname));
+        after = ob_skip_sp(after);
+        obey_var_set(varname, after);
+        uart_puts("Set "); uart_puts(varname); uart_puts(" = "); uart_puts(after);
+
+    /* ── Unset ───────────────────────────────────────────────────────── */
+    } else if (ob_kw_eq(cmd, "Unset")) {
+        uart_puts("Unset "); uart_puts(rest); uart_puts(" [stub]");
+
+    /* ── RMLoad ──────────────────────────────────────────────────────── */
+    } else if (ob_kw_eq(cmd, "RMLoad")) {
+        uart_puts("RMLoad "); uart_puts(rest);
+        vfs_dirent_t ent;
+        if (filecore_find_path(rest, &ent) != 0 || ent.type != VFS_DIRENT_FILE) {
+            uart_puts(" [not found]");
+        } else {
+            uint8_t *buf = filecore_read_file(ent.sin, (uint32_t)ent.size);
+            if (!buf) {
+                uart_puts(" [read fail]");
+            } else {
+                int rc = module_load_from_memory(buf, (uint32_t)ent.size, ent.name);
+                if (rc == 0) {
+                    uart_puts(" [loaded OK]");
+                    /* buffer now owned by module manager — do NOT kfree */
+                } else {
+                    uart_puts(" [load fail rc="); fc_dec((uint32_t)(-(int)rc));
+                    uart_puts("]");
+                    kfree(buf);
+                }
+            }
+        }
+
+    /* ── RMEnsure ────────────────────────────────────────────────────── */
+    } else if (ob_kw_eq(cmd, "RMEnsure")) {
+        /* Format: RMEnsure <ModuleName> <MinVer> [<FallbackCmd>] */
+        char modname[48], minver[16];
+        const char *p2 = ob_copy_word(rest, modname, (int)sizeof(modname));
+        p2 = ob_skip_sp(p2);
+        p2 = ob_copy_word(p2, minver, (int)sizeof(minver));
+        p2 = ob_skip_sp(p2);
+        uart_puts("RMEnsure "); uart_puts(modname);
+        uart_puts(" "); uart_puts(minver);
+        if (*p2 != '\0') {
+            uart_puts(" → ");
+            /* Version check not implemented: always run fallback command */
+            obey_exec_line(p2);
+            return;   /* obey_exec_line already printed \n */
+        } else {
+            uart_puts(" [stub]");
+        }
+
+    /* ── IfThere ─────────────────────────────────────────────────────── */
+    } else if (ob_kw_eq(cmd, "IfThere")) {
+        /* Format: IfThere <path> Then <cmd> */
+        char ipath[VFS_NAME_MAX];
+        const char *p2 = ob_copy_word(rest, ipath, (int)sizeof(ipath));
+        p2 = ob_skip_sp(p2);
+        /* skip "Then" keyword */
+        if (ob_kw_eq("Then", "") == 0) {
+            char kw[8];
+            p2 = ob_copy_word(p2, kw, (int)sizeof(kw));
+            p2 = ob_skip_sp(p2);
+        }
+        vfs_dirent_t ent2;
+        int exists = (filecore_find_path(ipath, &ent2) == 0) ? 1 : 0;
+        uart_puts("IfThere "); uart_puts(ipath);
+        uart_puts(exists ? " [found]" : " [absent]");
+        if (exists && *p2 != '\0') {
+            uart_puts(" → ");
+            obey_exec_line(p2);
+            return;
+        }
+
+    /* ── Run ─────────────────────────────────────────────────────────── */
+    } else if (ob_kw_eq(cmd, "Run")) {
+        uart_puts("Run "); uart_puts(rest);
+        if (g_obey_depth >= 3) {
+            uart_puts(" [depth limit]");
+        } else {
+            vfs_dirent_t rent;
+            if (filecore_find_path(rest, &rent) != 0 ||
+                    rent.type != VFS_DIRENT_FILE) {
+                uart_puts(" [not found]");
+            } else {
+                uint8_t *rbuf = filecore_read_file(rent.sin, (uint32_t)rent.size);
+                if (!rbuf) {
+                    uart_puts(" [read fail]");
+                } else {
+                    uart_puts(" [exec]\n");
+                    g_obey_depth++;
+                    filecore_exec_obey(rbuf, (uint32_t)rent.size);
+                    g_obey_depth--;
+                    kfree(rbuf);
+                    return;   /* filecore_exec_obey already printed \n at end */
+                }
+            }
+        }
+
+    /* ── Everything else — stub ──────────────────────────────────────── */
+    } else {
+        uart_puts(cmd);
+        if (*rest != '\0') { uart_puts(" "); uart_puts(rest); }
+        uart_puts(" [stub]");
+    }
+
+    uart_puts("\n");
+}
+
+/* filecore_exec_obey: parse and execute an ADFS obey file buffer line by line.
+ * boot385: Set and RMLoad are implemented; all others are stubs.             */
+void filecore_exec_obey(const uint8_t *buf, uint32_t size)
+{
+    uart_puts("[Obey] --- executing obey ("); fc_dec(size);
+    uart_puts(" bytes, depth="); fc_dec((uint32_t)g_obey_depth); uart_puts(") ---\n");
+
+    uint32_t i = 0u;
+    char line[256];
+
+    while (i < size) {
+        /* Collect one line */
+        uint32_t li = 0u;
+        while (i < size && buf[i] != 0x0Au && buf[i] != 0x0Du && li < 255u)
+            line[li++] = (char)buf[i++];
+        line[li] = '\0';
+        /* Skip CR/LF terminator(s) */
+        while (i < size && (buf[i] == 0x0Au || buf[i] == 0x0Du)) i++;
+
+        obey_exec_line(line);
+    }
+
+    uart_puts("[Obey] --- done ---\n");
 }
 
 /* ── filecore_read_file ──────────────────────────────────────────────────────
