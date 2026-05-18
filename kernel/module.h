@@ -1,14 +1,20 @@
 /* module.h — RISC OS Module support for Phoenix OS (AArch64)
  *
  * Module header layout per RISC OS PRM 1-31 with 64-bit extensions
- * from Charles Ferguson's RISC OS 64 / Pyromaniac work.
+ * from Charles Ferguson's RISC OS 64 / riscos64-clib (modhead.s).
  *
- * Key addition for AArch64: module_flags field at +0x30.
- *   bit 24 set = AArch64 native module (Phoenix target).
- *   bit 24 clear = 32-bit ARM module (future AArch32 EL0 compat path).
+ * 64-bit module discriminator (boot388):
+ *   init_entry (+0x04) bit 30 SET  → AArch64 native module.
+ *     Actual init offset = init_entry & ~(3u<<30).
+ *   init_entry bit 30 CLEAR        → 32-bit ARM module (or old-style).
+ *
+ * module_flags (+0x30) for 64-bit modules:
+ *   bits 4–7 = 1 → AArch64 ISA (from riscos64-clib modhead.s).
+ *   bit  2   = 1 → zero-init size present at +0x34.
+ *   (Not used for discriminating — bit 30 of init_entry is the gate.)
  *
  * Author: Phoenix OS project
- * Updated: boot268, April 2026
+ * Updated: boot388, May 2026
  */
 
 #ifndef MODULE_H
@@ -34,8 +40,10 @@ typedef struct __attribute__((packed)) risc_os_module_header {
     uint32_t module_flags;      /* +0x30: bit 24 = AArch64 native (RO64)      */
 } risc_os_module_header_t;
 
-/* module_flags bit 24: set = AArch64, clear = 32-bit ARM */
-#define MODULE_FLAG_AARCH64     (1u << 24)
+/* init_entry bit 30: set = AArch64 native (strip before use as offset).
+ * module_flags bits 4-7 = 1: AArch64 ISA (secondary confirmation only). */
+#define MODULE_INIT_64BIT       (1u << 30)   /* bit 30 of +0x04 init_entry  */
+#define MODULE_FLAG_AARCH64     (1u << 24)   /* old Phoenix guess — kept for compat */
 
 /* ── Module instance ─────────────────────────────────────────────────────── */
 typedef struct risc_os_module {

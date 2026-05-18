@@ -117,8 +117,18 @@ int module_load_from_memory(void *buffer, uint32_t size, const char *suggested_n
 
     risc_os_module_header_t *hdr = (risc_os_module_header_t *)buffer;
 
-    /* start_offset==0 means NO start code. Non-zero IS valid — has start.
-     * Both are acceptable — do NOT reject either case.                       */
+    /* ── boot388: 64-bit discriminator ──────────────────────────────────────
+     * Per riscos64-clib/modules/modhead.s, the init_entry word at +0x04 has
+     * bit 30 SET for AArch64 native modules ("not ARM32").  The actual init
+     * code offset is the word with bits 30-31 cleared.  32-bit ARM modules
+     * (and old-style modules) have bit 30 = 0.
+     *
+     * module_flags (+0x30) bits 4–7 further classify the ISA (value 1 =
+     * AArch64), but bit 30 of init_entry is the primary gate.              */
+    uint32_t raw_init = hdr->init_entry;
+    int      is_64bit = (raw_init & MODULE_INIT_64BIT) ? 1 : 0;
+    /* Actual offset strips bits 30-31 */
+    uint32_t init_off = raw_init & ~(3u << 30);
 
     /* Resolve module title from header.  title_ptr is an offset from the
      * start of the module; must be within the buffer.                       */
@@ -126,21 +136,19 @@ int module_load_from_memory(void *buffer, uint32_t size, const char *suggested_n
     if (hdr->title_ptr && hdr->title_ptr < size)
         mod_name = (const char *)((uint8_t *)buffer + hdr->title_ptr);
 
-    /* Detect 32-bit ARM vs AArch64-native.
-     * module_flags==0  → old-style module (no explicit flag) — attempt load.
-     * bit 24 set       → explicitly AArch64-native — full init call.
-     * bit 24 clear AND flags!=0 → explicit 32-bit ARM RISC OS 5 module.
-     *                   Register as a named stub (metadata + workspace only);
-     *                   skip init_entry — AArch32 EL0 is future work.        */
-    int is_32bit_arm = (hdr->module_flags != 0 &&
-                        !(hdr->module_flags & MODULE_FLAG_AARCH64));
+    uart_puts("[Module] '"); uart_puts(mod_name);
+    uart_puts("' "); mod_dec(size); uart_puts(" bytes  ");
+    uart_puts(is_64bit ? "AArch64" : "ARM32");
+    uart_puts("  init_raw="); mod_hex32(raw_init);
+    uart_puts("  flags="); mod_hex32(hdr->module_flags); uart_puts("\n");
 
-    if (is_32bit_arm) {
+    if (!is_64bit) {
         /* 32-bit ARM stub path — register so *Modules shows the disc module,
-         * but don't attempt to execute ARM Thumb/ARM32 init code.           */
+         * but don't attempt to execute ARM32 init code on AArch64 kernel.
+         * Exception: old-style module with flags==0 AND init_off==0 has no
+         * init code to call anyway — still register as stub (safe).         */
         uart_puts("[Module] 32-bit ARM stub: '"); uart_puts(mod_name);
-        uart_puts("' ("); mod_dec(size); uart_puts(" bytes, flags=");
-        mod_hex32(hdr->module_flags); uart_puts(")\n");
+        uart_puts("' registered (AArch32 init deferred)\n");
 
         risc_os_module_t *mod = (risc_os_module_t *)kmalloc(sizeof(risc_os_module_t));
         if (!mod) return -ENOMEM;
@@ -165,9 +173,9 @@ int module_load_from_memory(void *buffer, uint32_t size, const char *suggested_n
         return 0;
     }
 
-    /* AArch64-native (or old-style flags==0) — full load path. */
-    uart_puts("[Module] Loading '"); uart_puts(mod_name);
-    uart_puts("' ("); mod_dec(size); uart_puts(" bytes)\n");
+    /* ── AArch64 native — full load path ──────────────────────────────────── */
+    uart_puts("[Module] AArch64 loading '"); uart_puts(mod_name);
+    uart_puts("' init_off="); mod_hex32(init_off); uart_puts("\n");
 
     risc_os_module_t *mod = (risc_os_module_t *)kmalloc(sizeof(risc_os_module_t));
     if (!mod) return -ENOMEM;
@@ -187,9 +195,11 @@ int module_load_from_memory(void *buffer, uint32_t size, const char *suggested_n
     int rc = module_register(mod);
     if (rc != 0) { kfree(mod->workspace); kfree(mod); return rc; }
 
-    if (hdr->init_entry && hdr->init_entry < size) {
+    /* Call init entry — use stripped offset (bits 30-31 removed).
+     * AArch64 ABI: x0 = tail word/regs, x1 = instance, x12 = private word. */
+    if (init_off && init_off < size) {
         uart_puts("[Module] Calling Init() for "); uart_puts(mod_name); uart_puts("\n");
-        void *init_fn = (uint8_t *)buffer + hdr->init_entry;
+        void *init_fn = (uint8_t *)buffer + init_off;
         int init_rc = module_call_with_r12(init_fn, mod->workspace, 0, 0);
         mod->initialised = (init_rc == 0);
         if (!mod->initialised) {

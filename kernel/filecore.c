@@ -1727,13 +1727,16 @@ void filecore_list_root(void)
             uart_puts("[FileCore] === Step 4 done ===\n\n");
         }
 
-        /* ── Step 5 (boot387): Execute PreDesk boot obey via filecore_find_path ──
+        /* ── Step 5 (boot387/boot388): Execute PreDesk boot obey ───────────────
          *
          * boot386 revealed $.!Boot.!Boot is release notes text, not a boot script.
          * The real desktop boot obey is $.!Boot.Choices.Boot.PreDesk (boot387).
-         * Use filecore_find_path() so the path walk is driven by a single string.  */
+         * boot388: also report find result on framebuffer via con_printf.        */
         if (g_root_cache_valid && g_root_cache_count > 0u) {
             uart_puts("[FileCore] === Step 5: Execute $.!Boot.Choices.Boot.PreDesk ===\n");
+
+            extern void con_printf(const char *fmt, ...);
+            extern void con_set_colours(uint32_t fg, uint32_t bg);
 
             vfs_dirent_t fent;
             const char *predesk = "$.!Boot.Choices.Boot.PreDesk";
@@ -1741,13 +1744,27 @@ void filecore_list_root(void)
                     fent.type != VFS_DIRENT_FILE) {
                 uart_puts("[Step5] PreDesk not found (path: ");
                 uart_puts(predesk); uart_puts(")\n");
+
+                /* boot388: report on framebuffer */
+                con_set_colours(0xFFFFFFFFu, 0xFF800000u);   /* white on dark red */
+                con_printf("  PreDesk: NOT FOUND\n");
+                con_printf("  Path: %s\n", predesk);
+                con_set_colours(0xFF202020u, 0xFFE0E0E0u);
             } else {
                 uart_puts("[Step5] PreDesk sin="); fc_hex32(fent.sin);
                 uart_puts("  size="); fc_dec((uint32_t)fent.size); uart_puts("\n");
 
+                /* boot388: report on framebuffer */
+                con_set_colours(0xFF004000u, 0xFFE0E0E0u);   /* dark green */
+                con_printf("  PreDesk: FOUND  size=%u\n", (unsigned)fent.size);
+                con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+
                 uint8_t *fbuf = filecore_read_file(fent.sin, (uint32_t)fent.size);
                 if (!fbuf) {
                     uart_puts("[Step5] read failed\n");
+                    con_set_colours(0xFFFFFFFFu, 0xFF800000u);
+                    con_printf("  PreDesk: read FAILED\n");
+                    con_set_colours(0xFF202020u, 0xFFE0E0E0u);
                 } else {
                     /* boot385: Step 5b — execute PreDesk as obey */
                     uart_puts("[FileCore] === Step 5b: Execute PreDesk obey ===\n");
