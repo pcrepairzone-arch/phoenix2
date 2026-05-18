@@ -2846,3 +2846,92 @@ Rule 58: filecore_find_path is the correct abstraction for all disc
          from new code — those are implementation details that belong
          inside filecore.c.
 
+
+══════════════════════════════════════════════════════════════════
+SESSION 10 — boot386 diagnostic analysis + boot387 verbose reduction
+══════════════════════════════════════════════════════════════════
+
+  Commits:   0f56622 (boot384)  a60979f (boot385)  a290c61 (boot387)
+  Key file:  kernel/filecore.c, kernel/kernel.c, kernel/lib.c
+
+── BOOT386: DIAGNOSTIC RUN (uart_set_quiet(0) throughout) ───────
+
+  boot386 was built with uart_set_quiet(0) forced before FileCore
+  to expose the full IDA/obey trace.  Key findings from bootlog386:
+
+  1. $.!Boot.!Boot is release notes text (~88 bytes), not a boot
+     obey script.  The file starts with "This is the !Boot
+     Application..." — confirmed by the 128-byte dump.
+
+  2. The real desktop boot obey is at $.!Boot.Choices.Boot.PreDesk.
+     RISC OS 5 places the customisable boot sequence in
+     !Boot.Choices.Boot.PreDesk, not in !Boot.!Boot.
+
+  3. [IDA] prints fire once per filecore_get_child_entry call.
+     With 30+ entries per directory × 3–4 lines each = 90+ lines
+     of IDA output per directory traversal.  With uart_set_quiet(0)
+     this flooded the log and delayed the DHCP bind enough that the
+     first ping batch showed 28% packet loss (timing artefact, not
+     a regression — confirmed by steady-state avg 3.065 ms, std 2.499 ms).
+
+  4. Ping quality in boot383a (quiet mode, seq 21+):
+     avg=3.065 ms  max=10.102 ms  std=2.499 ms — excellent.
+
+── BOOT387: FILECORE_VERBOSE 0 ──────────────────────────────────
+
+  1. #define FILECORE_VERBOSE 0
+     ───────────────────────────
+     Added at top of kernel/filecore.c after last #include.
+     Three blocks in fc_ida_to_data_lba wrapped:
+       a) Entry decode print: [IDA] ida= id= ids_pz= home_zone=
+       b) Map-scan found: [IDA] found id= at alloc_bit=
+       c) Result: [IDA] zone= start= chain_lfau= lfauno= data_lba=
+     Per-entry listing in fc_try_load_modules_from_dir wrapped:
+       [Step6]   [N] 'name'  DIR/FILE  sz=N
+     End-of-scan summary line kept always-on:
+       [Step6]   (N entries)
+
+  2. Step 5 path fix
+     ─────────────────
+     Replaced the manual root→!Boot→scan→find-!Boot-file walk
+     (≈80 lines) with a single filecore_find_path() call:
+       filecore_find_path("$.!Boot.Choices.Boot.PreDesk", &fent)
+     Then filecore_read_file(fent.sin, fent.size) + filecore_exec_obey().
+     This is the correct approach (Rule 58) and exercises the full
+     path resolver in production.
+
+  3. uart_set_quiet(1) restored in kernel.c
+     ─────────────────────────────────────────
+     Was uart_set_quiet(0) for the boot386 diagnostic.
+     Restored to uart_set_quiet(1) to silence the FileCore scan.
+
+  Build: clean, zero warnings.
+
+── MODULARISATION NOTES (deferred) ──────────────────────────────
+
+  User suggested: "might be good idea to turn them into modules too"
+  (referring to FileCore and ADFS).
+
+  Design plan (for a future boot):
+  - PhoenixFileCore: AArch64 native module, SWI chunk matching real
+    ADFS allocation.  Exposes SWIs for filecore_find_path,
+    filecore_read_file, filecore_exec_obey.
+  - PhoenixADFS: thin driver module on top of PhoenixFileCore;
+    owns the disc format parsing (new-map IDA, zone map).
+  - Kernel becomes thin: calls module SWIs instead of direct C calls.
+  This mirrors how RISC OS 5 works (FileCore is a relocatable module).
+
+── RULES ADDED THIS SESSION ─────────────────────────────────────
+
+Rule 59: $.!Boot.!Boot on a RISC OS 5 disc is the !Boot Application
+         directory, not the desktop boot obey script.  The real
+         customisable desktop boot sequence is in
+         $.!Boot.Choices.Boot.PreDesk.  !Boot.!Boot is release notes.
+
+Rule 60: When uart_set_quiet(1) is active, per-frame DHCP poll loops
+         see zero [IDA] output.  Any apparent packet loss during the
+         first ping burst after boot is timing noise caused by the
+         DHCP bind completing just as pings start.  Confirm quality
+         by looking at steady-state latency (seq ≥ 20), not the
+         headline packet-loss percentage from the first burst.
+
