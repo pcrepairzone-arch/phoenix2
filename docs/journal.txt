@@ -3206,3 +3206,232 @@ Rule 65: ARM32 RISC OS modules are identified by bit 30 of the
          registered as stubs (initialised = 0) — do not call their
          init entry from AArch64 EL1 code.  AArch32 EL0 mode
          switching is required to execute them.
+
+
+═══════════════════════════════════════════════════════════════
+SESSION 12 — boot392–393: CMunge -64bit pipeline + linker fix
+Date: 2026-05-19
+═══════════════════════════════════════════════════════════════
+
+BACKGROUND
+──────────────────────────────────────────────────────────────
+Sessions 8–11 proved Phoenix can load and register AArch64
+RISC OS modules from SD card.  The remaining question was
+whether a module built from scratch via the official CMunge
+-64bit toolchain would actually execute — not just appear in
+the module table.  Charles updated CMunge to 0.84 and placed
+it in the workfolder for this test.
+
+CMUNGE 0.84 — AARCH64 CODE GENERATION
+──────────────────────────────────────────────────────────────
+CMunge is the RISC OS module header generator.  Options:
+  -64bit   generate AArch64 assembly glue instead of ARM32 AOF
+  -tgcc    emit GAS syntax (.s) rather than ObjAsm
+
+The generated assembly sets bit 30 of the init_entry field in
+the module header:
+  init_entry = (_CMUNGE_init - _CMUNGE_origin) | 0x40000000
+
+Phoenix's module_load_from_memory() checks bit 30 of init_raw
+to distinguish AArch64 (bit 30 SET) from ARM32 (bit 30 CLEAR).
+CMunge 0.84 writes exactly this discriminator.  The generated
+init veneer sequence:
+  STP x29/x30  — save frame pointer / link register
+  STR x12      — save workspace pointer
+  STP x0/x1    — save original arguments
+  MOV x0, x12  — first arg to clib initialise = workspace ptr
+  BL  _clib_initialisemodule
+  LDP x0/x2    — restore args 0 and 1
+  LDR x1       — restore arg 2
+  BL  module_init
+  LDP x29/x30  — restore frame
+  RET
+
+For an embedded standalone module the C-library hooks are no-ops:
+  _clib_initialisemodule(void *pwp) { return 0; }
+  _clib_finalisemodule(void *pwp)   { return 0; }
+
+BUILD PIPELINE — PhoenixTest MODULE
+──────────────────────────────────────────────────────────────
+Source files created in /sessions/epic-peaceful-shannon/phoenix_test_mod/:
+
+  PhoenixTest.cmhg  — CMunge input:
+      title-string:        PhoenixTest
+      help-string:         PhoenixTest 0.01 (19 May 2026)
+      initialisation-code: module_init
+      finalisation-code:   module_final
+
+  PhoenixTest.c  — C entry points:
+      _kernel_oserror *module_init(const char *tail,
+                                   int podule_base, void *pw)
+      { return 0; }
+      _kernel_oserror *module_final(int fatal,
+                                    int podule_base, void *pw)
+      { return 0; }
+
+  clib_stubs.c   — C-library no-op stubs
+  kernel.h       — _kernel_oserror typedef
+
+Build sequence:
+  riscos-cmunge -64bit -tgcc PhoenixTest.cmhg
+      → PhoenixTest_hdr.s   (AArch64 GAS assembly header)
+      → PhoenixTest.d       (C type header)
+
+  aarch64-linux-gnu-as    PhoenixTest_hdr.s -o PhoenixTest_hdr.o
+  aarch64-linux-gnu-gcc   PhoenixTest.c  -o PhoenixTest.o
+  aarch64-linux-gnu-gcc   clib_stubs.c   -o clib_stubs.o
+  aarch64-linux-gnu-ld    -T module.ld   -o PhoenixTest.elf \
+      PhoenixTest_hdr.o PhoenixTest.o clib_stubs.o
+  aarch64-linux-gnu-objcopy -O binary PhoenixTest.elf PhoenixTest.bin
+
+module.ld places .init.rmf first (required: module header must
+be at offset 0), then .text, .rodata, .data, .bss.
+Result: PhoenixTest.bin = 368 bytes flat binary.
+
+BINARY VERIFICATION
+──────────────────────────────────────────────────────────────
+Python header parse of PhoenixTest.bin:
+  +0x00  start_entry   = 0x00000000  (no Start entry)
+  +0x04  init_entry    = 0x40000078  bit30=1 → AArch64, off=0x78
+  +0x08  final_entry   = 0x400000C0  AArch64, off=0xC0
+  +0x10  title_offset  = 0x00000034  → "PhoenixTest" at byte 52
+  +0x30  flags_offset  = 0x00000070  (offset to flags word)
+  title: "PhoenixTest"
+
+title_offset 0x34 = 52 decimal; confirmed title starts at byte
+52 in the binary.  flags_offset is an OFFSET (like title_offset),
+not a raw flags value — Phoenix logs the raw value but uses bit 30
+of init_entry as the primary AArch64 discriminator.
+
+BOOT 392 — FIRST SUCCESSFUL EXECUTION, LARGE IMAGE
+──────────────────────────────────────────────────────────────
+PhoenixTest.bin embedded via kernel/test_module.S:
+  .section .test_module, "a", @progbits
+  .balign 4
+  .global test_module_start
+  test_module_start:
+      .incbin "kernel/PhoenixTest.bin"
+  .global test_module_end
+  test_module_end:
+
+(Replaced the previous kernel/test_module.c stub that defined
+test_module_start/end as PROVIDE with size 0.)
+
+Boot log (boot392) confirmed:
+  [Module] test_module: size=368 bytes
+  [Module] 'PhoenixTest' 368 bytes  AArch64  init_raw=0x40000078
+  [Module] AArch64 loading 'PhoenixTest' init_off=0x00000078
+  [Module] Registered: PhoenixTest
+  [Module] Calling Init() for PhoenixTest
+  [Module] *** PhoenixTest — first AArch64 module executed ***
+  ...
+  PhoenixTest [OK]
+
+AArch64 module execution proved end-to-end.
+
+Problem: kernel8.img = 129 MB.
+
+Root cause: linker.ld placed .test_module AFTER .bss.  The
+.bss section holds the 128 MB static heap declared in malloc.c
+(__bss_start=0xb7000, __bss_end=0x8134920).  objcopy -O binary
+must fill the gap between the last .data byte and the first
+.test_module byte with zeros — 128 MB of zeros in the output.
+Modules are read-only data; there is no reason to place them
+after BSS.
+
+BOOT 393 — LINKER FIX, 219 KB IMAGE
+──────────────────────────────────────────────────────────────
+Fix: move .test_module between .data and .bss in linker.ld.
+The section now appears in the binary immediately after .data,
+before the BSS gap.  objcopy sees no large gap to fill.
+
+linker.ld section ordering (boot393):
+  .data    → read/write initialised data
+  .test_module → embedded module binary (368 bytes)
+  PROVIDE(cursor_module_start = .)  stub for future use
+  PROVIDE(cursor_module_end   = .)
+  .bss     → uninitialised (zeroed at boot, not in binary)
+  kernel stack (4 × 64 KB)
+
+Result: kernel8.img = 219 KB.
+
+Boot393 log identical to boot392 for module loading section.
+Module table:
+  PhoenixResolver  [OK]  — AArch64 native
+  PhoenixGENET     [OK]  — AArch64 native
+  PhoenixDHCP      [OK]  — AArch64 native
+  PhoenixTest      [OK]  — AArch64 native (CMunge -64bit)
+  LanMan98               — ARM32 stub (awaits EL0 switch)
+  IconBorderFob          — ARM32 stub
+  Colours                — ARM32 stub
+  ABIMod                 — ARM32 stub
+
+Network (ping392.txt):
+  47 packets, 31 received, 34% loss overall.
+  Loss confined to first ~11 packets (before DHCP bind).
+  Steady-state from seq 12: avg 5.5 ms, max 16.0 ms, 0% loss.
+  Consistent with all previous boots — macOS pings before the
+  kernel's DHCP client completes its first exchange.
+
+COMMITS
+──────────────────────────────────────────────────────────────
+  64ca7b5  boot392: first AArch64 native module via CMunge -64bit pipeline
+  4b794f5  boot393: fix 129MB kernel image — move .test_module before .bss
+
+FILES CHANGED (boot392–393)
+──────────────────────────────────────────────────────────────
+  kernel/PhoenixTest.bin  — 368-byte AArch64 flat module binary
+                            (CMunge -64bit → assemble → link → objcopy)
+  kernel/test_module.S    — .incbin embed of PhoenixTest.bin;
+                            replaces test_module.c stub
+  kernel/test_module.c    — deleted (was empty stub)
+  kernel/linker.ld        — .test_module moved between .data and .bss
+  kernel/lib.c            — banner updated boot392 → boot393
+
+RULES ADDED THIS SESSION
+──────────────────────────────────────────────────────────────
+
+Rule 66: CMunge 0.84 -64bit -tgcc generates GAS AArch64 assembly
+         glue that sets bit 30 of init_entry
+         (init_entry = offset | 0x40000000).  This is the correct
+         discriminator Phoenix reads.  Phoenix does NOT need to
+         inspect the module_flags word at +0x30 — bit 30 of
+         init_entry is authoritative.
+
+Rule 67: The module_flags field at +0x30 holds an OFFSET to a
+         flags word (parallel to title_ptr), not the raw flags
+         value.  Logging the field as a hex integer is harmless,
+         but do not treat it as a bitmask directly.
+
+Rule 68: Never place embedded binary data sections (.test_module,
+         module images, font blobs) after .bss in the linker
+         script.  If .bss contains a large statically-allocated
+         heap, objcopy -O binary will fill the entire heap gap
+         with zeros, producing an enormous flat binary.  Embedded
+         read-only data must come before .bss.
+
+Rule 69: Standalone AArch64 RISC OS modules for Phoenix must stub
+         _clib_initialisemodule and _clib_finalisemodule to return
+         0 (NULL error pointer).  These hooks are called by the
+         CMunge -64bit veneer before and after the user init/final
+         functions.  Without the stubs the link fails with
+         undefined reference.
+
+Rule 70: The CMunge -64bit CMHG syntax for Phoenix modules
+         requires only: title-string, help-string,
+         initialisation-code, finalisation-code.  The
+         module-is-cpp field is not recognised by CMunge 0.84
+         and causes a fatal "Unknown field" error; omit it.
+
+NEXT ARC
+──────────────────────────────────────────────────────────────
+Four ARM32 modules (LanMan98, IconBorderFob, Colours, ABIMod)
+are registered as stubs.  To execute them Phoenix needs:
+  1. AArch32 EL0 context switch infrastructure
+  2. SWI trap handler that re-enters Phoenix EL1 code
+  3. Module workspace allocator (currently workspace ptr = NULL)
+This is a separate major arc; ARM32 support is deferred until
+the above three components exist.
+
+The CMunge -64bit pipeline is proven and repeatable.  Future
+AArch64 modules follow the same build recipe.
