@@ -95,13 +95,17 @@ __xhci_dma_end = .;
     . = . + 0x40000;
     __kernel_stack_top = .;
 
-    /* boot352: zero-size stubs for embedded module sections.
-     * The Windows build embeds PhoenixTest and PhoenixCursor as .o sections;
-     * here we provide PROVIDE symbols so module_init_all() compiles and links.
-     * With start==end the size is 0 → module_load_from_memory rejects them
-     * (size < 0x34) → graceful "load failed" log, no crash.              */
-    PROVIDE(test_module_start   = .);
-    PROVIDE(test_module_end     = .);
+    /* boot392: embedded AArch64 module binaries.
+     * PhoenixTest.bin built via CMunge 0.84 -64bit -tgcc pipeline.
+     * test_module.S uses .incbin to include the flat binary; symbols
+     * test_module_start/end bracket it so module_init_all() can pass
+     * the buffer directly to module_load_from_memory().               */
+    . = ALIGN(4);
+    .test_module : {
+        *(.test_module)
+    }
+
+    /* cursor_module: still a stub — PROVIDE gives size=0 safely */
     PROVIDE(cursor_module_start = .);
     PROVIDE(cursor_module_end   = .);
 }
