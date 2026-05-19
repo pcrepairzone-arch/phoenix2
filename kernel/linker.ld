@@ -81,6 +81,20 @@ __xhci_dma_end = .;
         *(.data*)
     }
 
+    /* boot392: embedded AArch64 module binaries placed HERE — between
+     * .data and .bss — so they appear in the flat binary output.
+     * If placed after .bss (which holds the 128 MB heap), objcopy
+     * -O binary spans the entire BSS gap and produces a 129 MB image.
+     * Modules are read-only data; .bss placement doesn't affect them.  */
+    . = ALIGN(4);
+    .test_module : {
+        *(.test_module)
+    }
+
+    /* cursor_module: still a stub — PROVIDE gives size=0 safely */
+    PROVIDE(cursor_module_start = .);
+    PROVIDE(cursor_module_end   = .);
+
     . = ALIGN(4096);
     .bss : {
         __bss_start = .;
@@ -94,18 +108,4 @@ __xhci_dma_end = .;
     . = ALIGN(4096);
     . = . + 0x40000;
     __kernel_stack_top = .;
-
-    /* boot392: embedded AArch64 module binaries.
-     * PhoenixTest.bin built via CMunge 0.84 -64bit -tgcc pipeline.
-     * test_module.S uses .incbin to include the flat binary; symbols
-     * test_module_start/end bracket it so module_init_all() can pass
-     * the buffer directly to module_load_from_memory().               */
-    . = ALIGN(4);
-    .test_module : {
-        *(.test_module)
-    }
-
-    /* cursor_module: still a stub — PROVIDE gives size=0 safely */
-    PROVIDE(cursor_module_start = .);
-    PROVIDE(cursor_module_end   = .);
 }
