@@ -1913,17 +1913,48 @@ static int fc_try_load_modules_from_dir(uint32_t dir_sin, const char *label,
             uart_puts("[Step6]   ("); fc_dec(i); uart_puts(" entries)\n");
             break;
         }
-        /* Always print directory listing on serial — helps diagnose misses */
-        uart_puts("[Step6]   ["); fc_dec(i); uart_puts("] '");
-        uart_puts(ent.name);
-        uart_puts(ent.type == VFS_DIRENT_DIR ? "'  DIR" : "'  FILE");
-        uart_puts("  sz="); fc_dec((uint32_t)ent.size); uart_puts("\n");
+        /* Always print directory listing on serial — helps diagnose misses.
+         * boot390: show filetype so we can confirm &FFA filtering is correct. */
+        {
+            static const char hex[] = "0123456789abcdef";
+            char tstr[8];
+            tstr[0]='&'; tstr[1]=hex[(ent.riscos_type>>8)&0xF];
+            tstr[2]=hex[(ent.riscos_type>>4)&0xF]; tstr[3]=hex[ent.riscos_type&0xF];
+            tstr[4]='\0';
+            uart_puts("[Step6]   ["); fc_dec(i); uart_puts("] '");
+            uart_puts(ent.name);
+            uart_puts(ent.type == VFS_DIRENT_DIR ? "'  DIR  " : "'  FILE ");
+            uart_puts(tstr);
+            uart_puts("  sz="); fc_dec((uint32_t)ent.size); uart_puts("\n");
+        }
 
         if (ent.type != VFS_DIRENT_FILE) continue;
         if (ent.size < 0x34u || ent.size > 4u * 1024u * 1024u) continue;
 
+        /* boot390: RISC OS module filetype gate.
+         * Datestamped typed files have load_addr bits [31:20] = 0xFFF and
+         * filetype in bits [19:8].  Module filetype = &FFA.
+         * Only attempt to load files that RISC OS has already stamped as
+         * modules — avoids Obey files, text files, BASIC programs etc.
+         * For older unstamped modules (load/exec are raw addresses, bits
+         * [31:20] != 0xFFF), fall through and let module_load_from_memory
+         * validate the header itself.                                       */
+        if ((ent.load_addr >> 20) == 0xFFFu) {
+            /* Datestamped — check filetype */
+            if (ent.riscos_type != 0xFFAu) {
+                uart_puts("[Step6]   skip (type &");
+                { static const char h[]="0123456789abcdef";
+                  char b[4]; b[0]=h[(ent.riscos_type>>8)&0xF];
+                  b[1]=h[(ent.riscos_type>>4)&0xF]; b[2]=h[ent.riscos_type&0xF];
+                  b[3]='\0'; uart_puts(b); }
+                uart_puts(" not &FFA)\n");
+                continue;
+            }
+        }
+        /* else: old-style unstamped file — try loading anyway */
+
         uart_puts("[Step6] Trying '"); uart_puts(ent.name);
-        uart_puts("' size="); fc_dec((uint32_t)ent.size); uart_puts("\n");
+        uart_puts("' type=&FFA sz="); fc_dec((uint32_t)ent.size); uart_puts("\n");
 
         uint8_t *fbuf = filecore_read_file_buf(ent.sin, (uint32_t)ent.size,
                                                 disc_map_lba, used_bits, dr_size,
