@@ -91,9 +91,21 @@ __xhci_dma_end = .;
         *(.test_module)
     }
 
-    /* cursor_module: still a stub — PROVIDE gives size=0 safely */
-    PROVIDE(cursor_module_start = .);
-    PROVIDE(cursor_module_end   = .);
+    /* boot394: CursorModule — kernel-linked AArch64 module.
+     * The CMunge -64bit generated header + veneers live in .init.rmf.
+     * cursor_module_impl.c provides the C functions called by those veneers.
+     * cursor_module_start must equal _CMUNGE_origin (start of .init.rmf) so
+     * module_load_from_memory(cursor_module_start, cm_size, ...) gives the
+     * loader the correct base for header-relative offset arithmetic.
+     * NOTE: .init.rmf is section type "xa" (allocatable + executable) so it
+     * lands in the binary output; .cursor_module_hdr follows .test_module,
+     * still before .bss, so no 128 MB binary gap.                         */
+    . = ALIGN(4);
+    cursor_module_start = .;
+    .cursor_module_hdr : {
+        *(.init.rmf)   /* CMunge module header + AArch64 init/final veneers */
+    }
+    cursor_module_end = .;
 
     . = ALIGN(4096);
     .bss : {

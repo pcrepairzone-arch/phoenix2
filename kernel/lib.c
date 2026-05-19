@@ -255,13 +255,12 @@ void wimp_task(void)
     extern int  xhci_check_hotplug(void)         __attribute__((weak));
     extern void mouse_get_pos(int16_t *x,
                               int16_t *y)        __attribute__((weak));
-    extern void cursor_init(void)                __attribute__((weak));
     extern void cursor_update(int x, int y)      __attribute__((weak));
     extern void con_puts(const char *s)          __attribute__((weak));
 
-    /* boot179: Initialise mouse cursor and place it at the starting
-     * mouse position (mouse_init() sets this to (640,360)).         */
-    if (cursor_init) cursor_init();
+    /* boot394: cursor_init() is now owned by CursorModule (module_init_all
+     * runs it before wimp_task starts).  We no longer call it here.
+     * The cursor position poll loop below (cursor_update) is unchanged.  */
     int16_t last_mx = 640, last_my = 360;
     if (mouse_get_pos && cursor_update) {
         mouse_get_pos(&last_mx, &last_my);
@@ -304,7 +303,7 @@ void wimp_task(void)
         int tag_w = 29 * 8;
         int bx = px + (pw - tag_w) / 2;
         int by = sy + 30;
-        fb_draw_string(bx, by, "boot393  BCM2711 / Cortex-A72",
+        fb_draw_string(bx, by, "boot394  BCM2711 / Cortex-A72",
                        COL_GREY, COL_DARK_GREY);
     }
 
