@@ -130,11 +130,30 @@ int module_load_from_memory(void *buffer, uint32_t size, const char *suggested_n
     /* Actual offset strips bits 30-31 */
     uint32_t init_off = raw_init & ~(3u << 30);
 
-    /* Resolve module title from header.  title_ptr is an offset from the
-     * start of the module; must be within the buffer.                       */
-    const char *mod_name = suggested_name ? suggested_name : "Unnamed";
-    if (hdr->title_ptr && hdr->title_ptr < size)
-        mod_name = (const char *)((uint8_t *)buffer + hdr->title_ptr);
+    /* ── boot390: RISC OS module header validation ───────────────────────────
+     * title_ptr (+0x10) must point into the file body (past the 52-byte
+     * header) and the byte there must be a printable ASCII character.
+     * This rejects Obey scripts, BASIC programs, text files, and any other
+     * non-module binary that happens to be >= 0x34 bytes.
+     *
+     * Real RISC OS modules always place the title string after the header
+     * (typical range: 0x34–0x200).  Text files have the 4 bytes at offset
+     * 0x10 as ASCII content, so title_ptr looks like a huge number >> size. */
+    {
+        uint32_t tp = hdr->title_ptr;
+        uint8_t  tc = (tp >= 0x34u && tp < size) ?
+                        ((uint8_t *)buffer)[tp] : 0u;
+        if (tp < 0x34u || tp >= size || tc < 0x20u || tc > 0x7Eu) {
+            uart_puts("[Module] not a module (bad title_ptr=");
+            mod_hex32(tp); uart_puts(") skip '");
+            uart_puts(suggested_name ? suggested_name : "?");
+            uart_puts("'\n");
+            return -ENOEXEC;
+        }
+    }
+
+    /* title_ptr validated above — safe to dereference directly.             */
+    const char *mod_name = (const char *)((uint8_t *)buffer + hdr->title_ptr);
 
     uart_puts("[Module] '"); uart_puts(mod_name);
     uart_puts("' "); mod_dec(size); uart_puts(" bytes  ");
