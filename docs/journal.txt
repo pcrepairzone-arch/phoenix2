@@ -2935,3 +2935,274 @@ Rule 60: When uart_set_quiet(1) is active, per-frame DHCP poll loops
          by looking at steady-state latency (seq ≥ 20), not the
          headline packet-loss percentage from the first burst.
 
+
+
+══════════════════════════════════════════════════════════════════
+SESSION 11 — boot388–391: ARM32 module loading from NVMe disc
+══════════════════════════════════════════════════════════════════
+
+  Commits:   8efb781 (boot388)  8f46c06 (boot389)
+             6bc1857 (boot390-v1)  8ba8d9f (boot390-v2)
+             e5b764a (boot391)
+  Key files: kernel/filecore.c, kernel/module.c, kernel/lib.c
+
+── PROBLEM STATEMENT ────────────────────────────────────────────
+
+  boot388 introduced the 64-bit module discriminator (bit 30 of
+  init_entry) and con_printf output for the Step 5 PreDesk result.
+  However, the Step 6 module scan was silently loading zero modules
+  from the NVMe disc.  The symptom: module list showed only the
+  three native AArch64 modules (PhoenixDHCP, PhoenixGENET,
+  PhoenixResolver); the ARM32 RISC OS modules from
+  $.!Boot.Resources.!System.Modules (ABIMod, Colours, IconBorderFob)
+  and $.!LanMan98 (LanMan98) were absent.
+
+  Two root causes identified:
+
+  1. uart_set_quiet(1) is called just before filecore_list_root().
+     Step 6 runs inside that quiet window, so all [Step6] serial
+     output was silently swallowed.  No diagnostic output = no
+     visibility into what was going wrong.
+
+  2. fc_find_in_dir() used fc_name_eq() — a byte-exact compare.
+     FileCore is case-insensitive; the path
+     $.!Boot.Resources.!System required traversing 'Resources'
+     which on disc may be stored in any case.  The mismatch meant
+     the function returned −1 and the path was abandoned.
+
+── BOOT388: DISCRIMINATOR + GROUNDWORK ──────────────────────────
+
+  Commit 8efb781.
+
+  1. 64-bit module discriminator (boot388)
+     ──────────────────────────────────────
+     RISC OS 64 / riscos64-clib identifies AArch64 native modules
+     by bit 30 of the init_entry field (+0x04 in the module header):
+       bit 30 SET  → AArch64 native; actual init offset = raw & ~(3u<<30)
+       bit 30 CLEAR → ARM32 (or old-style 32-bit module)
+
+     The old Phoenix code tested module_flags bit 24 (MODULE_FLAG_AARCH64)
+     which is a secondary confirmation only and not the gate.  Replaced
+     with the correct bit-30 test in module_load_from_memory().
+
+     ARM32 modules: registered as stubs (mod->initialised = 0).
+     The module name and header are preserved; no init call is made.
+     A stub log line is emitted: "32-bit ARM stub: 'X' registered
+     (AArch32 init deferred)".
+
+  2. con_printf for Step 5 PreDesk result
+     ──────────────────────────────────────
+     Step 5 (PreDesk) result now appears on the framebuffer via
+     con_printf whether the file was found or not:
+       "  [Step5] PreDesk OK — executing boot obey"
+       "  [Step5] PreDesk not found"
+     This matches the approach used for all other boot stages.
+
+── BOOT389: STEP 6 VISIBILITY + CASE-INSENSITIVE SCAN ───────────
+
+  Commit 8f46c06.
+
+  1. uart_set_quiet(0) before Step 5
+     ──────────────────────────────────
+     Added explicit uart_set_quiet(0) call before the Step 5 block
+     in filecore_step6_load_module() (which also owns Step 5 output).
+     This restores serial output for Steps 5 and 6 even though the
+     IDA scan earlier in filecore_list_root() ran in quiet mode.
+     Existing uart_set_quiet(1) at the start of the IDA scan is
+     unchanged — only the tail of the function is affected.
+
+  2. fc_name_ieq() — case-insensitive directory name compare
+     ──────────────────────────────────────────────────────────
+     Added to filecore.c:
+
+       static int fc_name_ieq(const char *a, const char *b)
+       {
+           while (*a && *b) {
+               char ca = *a, cb = *b;
+               if (ca >= 'a' && ca <= 'z') ca -= 32;
+               if (cb >= 'a' && cb <= 'z') cb -= 32;
+               if (ca != cb) return 0;
+               a++; b++;
+           }
+           return *a == *b;
+       }
+
+     fc_find_in_dir() updated to call fc_name_ieq() instead of
+     fc_name_eq().  This is correct: FileCore directories are
+     case-insensitive by definition (VFS_FS_CASE_INSENSITIVE flag).
+
+  3. Load all modules per directory (not just the first)
+     ──────────────────────────────────────────────────────
+     Earlier code returned after the first successful module load.
+     fc_try_load_modules_from_dir() rewritten to iterate the full
+     directory and attempt every &FFA file.  Returns the count of
+     modules loaded.
+
+  4. con_printf framebuffer progress for Step 6
+     ──────────────────────────────────────────────
+     Each loaded module prints a green "Mod: X [OK]" line to the
+     framebuffer via con_printf.  Navigation steps also reported:
+       "Step6 A: !Boot sin=0x..."
+       "Step6 A: Resources sin=0x..."  etc.
+     Summary at end: "  Step6: N module(s) loaded"
+
+  5. !System / System fallback
+     ───────────────────────────
+     Path A tries "!System" first, then falls back to "System" if
+     the former is not found.  Both names tried:
+       const char *sys_names[] = { "!System", "System", NULL };
+
+  Result: IconBorderFob now loaded.  But 21 false-positive "modules"
+  also loaded — Obey scripts, text files, BASIC files, and sprites
+  all passed the size ≥ 0x34 check.
+
+── BOOT390-V1: HEADER VALIDATION ATTEMPT (DISCARDED) ────────────
+
+  Commit 6bc1857.
+
+  First attempt to filter false positives: added ASCII validation
+  of the title_ptr offset and the character at that offset inside
+  module_load_from_memory().  Required:
+    hdr->title_ptr >= 0x34 && hdr->title_ptr < size
+    buffer[title_ptr] is printable ASCII (0x20–0x7E)
+
+  Result: only 2 modules passed (ABIMod plus one other).
+  Colours and IconBorderFob rejected because their title_ptr is 0
+  (the title string is embedded at offset 0 of the module body in
+  some ARM module formats).
+
+  This approach was wrong in principle: the authoritative RISC OS
+  file identity is the filetype stamped in the directory entry's
+  load_addr field, not the header content.
+
+── BOOT390-V2: CORRECT FIX — &FFA FILETYPE GATE ─────────────────
+
+  Commit 8ba8d9f.  Supersedes 6bc1857.
+
+  RISC OS FileCore encodes the filetype in the load_addr field of
+  each directory entry when bits [31:20] = 0xFFF (datestamped file):
+    filetype = (load_addr >> 8) & 0xFFF
+
+  Module filetype = &FFA.  The vfs_dirent_t.riscos_type field is
+  already populated with this value by filecore_get_child_entry().
+
+  Gate added in fc_try_load_modules_from_dir() before attempting
+  to load:
+
+    if ((ent.load_addr >> 20) == 0xFFFu) {
+        if (ent.riscos_type != 0xFFAu) {
+            /* log skip reason */
+            continue;
+        }
+    }
+    /* else: old-style unstamped — fall through and attempt */
+
+  Directory listing always prints the filetype hex for every entry:
+    [Step6]   [N] 'name'  FILE &ffa  sz=N
+
+  Result: exactly 4 modules loaded — ABIMod, Colours, IconBorderFob,
+  LanMan98.  Zero false positives.  LICENCE, Mappings, Templates,
+  !Boot, !Run, !Help all correctly skipped with "(type &xxx not &FFA)".
+
+  Secondary issue noticed: module dump showed all three ARM32 stubs
+  from !System.Modules with name "Templates" — the last entry name
+  encountered in the LanMan98 scan.  Root cause: use-after-free
+  on mod->name (see boot391 below).
+
+── BOOT391: MODULE NAME USE-AFTER-FREE FIX ──────────────────────
+
+  Commit e5b764a.
+
+  Root cause: in fc_try_load_modules_from_dir(), the loop variable
+  is a stack-allocated vfs_dirent_t ent.  The caller passes
+  ent.name (a char[256] inside the stack frame) as suggested_name
+  to module_load_from_memory().  Inside that function:
+
+    mod->name = suggested_name;   /* pointer into caller's stack */
+
+  For ARM32 stubs, title_ptr = 0 so no heap title string is found.
+  The suggested_name pointer is stored directly.  By the time the
+  module list is dumped, the stack frame has been reused; ent.name
+  now contains whatever the last directory scan wrote — "Templates"
+  in this case.
+
+  Fix: in module_load_from_memory(), always kmalloc a heap copy:
+
+    const char *src = suggested_name ? suggested_name : "Unnamed";
+    /* prefer title string from module body if in range */
+    if (hdr->title_ptr >= 0x34u && hdr->title_ptr < size) {
+        uint8_t c = ((uint8_t *)buffer)[hdr->title_ptr];
+        if (c >= 0x20u && c <= 0x7Eu)
+            src = (const char *)((uint8_t *)buffer + hdr->title_ptr);
+    }
+    uint32_t n = 0u;
+    while (src[n] && n < 255u) n++;
+    char *copy = (char *)kmalloc(n + 1u);
+    if (copy) { for (uint32_t i = 0u; i <= n; i++) copy[i] = src[i]; }
+    mod_name = copy ? copy : "Unnamed";
+
+  The title_ptr check uses >= 0x34 because the minimum RISC OS
+  module header is 0x34 bytes; a title_ptr of 0 is invalid in a
+  well-formed module and is skipped (falling back to suggested_name).
+  The copy is heap-allocated so its lifetime is unbounded.
+
+  Result (bootlog390.txt, boot391 run):
+    [Module] Loaded modules:
+      PhoenixResolver [OK]
+      PhoenixGENET [OK]
+      PhoenixDHCP [OK]
+      LanMan98
+      IconBorderFob
+      Colours
+      ABIMod
+  All four ARM32 stub names correct.
+
+── NETWORK / TCP TESTS (boot391) ────────────────────────────────
+
+  DHCP: bound 192.168.0.145 on first retry (no LanMan98 110KB
+        read interference during DHCP window).
+  TestA: single GET to router — 18603 bytes, PASS.
+  TestB: 4 parallel connections — all ESTABLISHED, all FIN, PASS.
+  TestC: RST on closed port 81 — RST in 30 ms, PASS.
+  TestD: 8 sequential GETs, ring wraps at 97 KB, 139376 bytes
+         total — PASS.
+  Keyboard: USB HID interrupt transfers confirmed live; ESC key
+            halts WIMP loop cleanly.
+  Router device list: Phoenix at 192.168.0.145 shown as
+  "Wired Connected Device" — network confirmed working.
+
+── RULES ADDED THIS SESSION ─────────────────────────────────────
+
+Rule 61: FileCore is case-insensitive.  All directory name lookups
+         must use fc_name_ieq(), not a byte-exact compare.  The
+         VFS_FS_CASE_INSENSITIVE flag is set on the FileCore
+         vfs_filesystem_t for this reason.
+
+Rule 62: The authoritative RISC OS file identity is the filetype
+         in the directory entry load_addr field, not the file
+         content or header structure.  When bits [31:20] of
+         load_addr = 0xFFF (datestamped file), filetype =
+         (load_addr >> 8) & 0xFFF.  Module filetype = &FFA.
+         Never attempt to validate a module by inspecting its
+         header before checking the directory entry filetype first.
+
+Rule 63: Never store a pointer to a caller's stack variable as a
+         module's permanent name (mod->name).  Always kmalloc a
+         heap copy at the point of registration.  Stack frames are
+         reused; a stack pointer stored in a long-lived struct
+         becomes a dangling pointer as soon as the caller returns.
+
+Rule 64: uart_set_quiet(1) silences ALL uart_puts output, including
+         diagnostic Step prints inside filecore.c.  If Step 5/6
+         output is missing from the serial log, check whether the
+         quiet window covers those steps.  Fix: call
+         uart_set_quiet(0) explicitly before Step 5 inside the
+         filecore boot path.  The IDA scan earlier in the same
+         function can remain quiet.
+
+Rule 65: ARM32 RISC OS modules are identified by bit 30 of the
+         init_entry field being CLEAR (bit 30 SET = AArch64 native,
+         as per riscos64-clib modhead.s).  ARM32 modules must be
+         registered as stubs (initialised = 0) — do not call their
+         init entry from AArch64 EL1 code.  AArch32 EL0 mode
+         switching is required to execute them.
