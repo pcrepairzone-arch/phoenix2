@@ -130,15 +130,29 @@ int module_load_from_memory(void *buffer, uint32_t size, const char *suggested_n
     /* Actual offset strips bits 30-31 */
     uint32_t init_off = raw_init & ~(3u << 30);
 
-    /* Resolve module title from header.  title_ptr is an offset from the
-     * start of the module; must be within the buffer and point to ASCII.
-     * Fall back to suggested_name for old-style modules that have title_ptr=0
-     * or store the title at an unusual offset.                               */
-    const char *mod_name = suggested_name ? suggested_name : "Unnamed";
-    if (hdr->title_ptr >= 0x34u && hdr->title_ptr < size) {
-        uint8_t tc = ((uint8_t *)buffer)[hdr->title_ptr];
-        if (tc >= 0x20u && tc <= 0x7Eu)
-            mod_name = (const char *)((uint8_t *)buffer + hdr->title_ptr);
+    /* Resolve module title and copy to heap.
+     * title_ptr (+0x10) is an offset into the module body.  Use it if it
+     * points to printable ASCII in range, otherwise use suggested_name.
+     *
+     * boot391: always kmalloc a copy so mod->name is safe for the module's
+     * lifetime.  suggested_name is usually a pointer into a stack-allocated
+     * vfs_dirent_t.name[] field.  Without a copy, all stub modules loaded
+     * from the same directory share the same stack address, and by the time
+     * module_dump_list() runs that memory has been overwritten (boot390
+     * showed "Templates" for ABIMod, Colours, IconBorderFob).               */
+    const char *mod_name;
+    {
+        const char *src = suggested_name ? suggested_name : "Unnamed";
+        if (hdr->title_ptr >= 0x34u && hdr->title_ptr < size) {
+            uint8_t c = ((uint8_t *)buffer)[hdr->title_ptr];
+            if (c >= 0x20u && c <= 0x7Eu)
+                src = (const char *)((uint8_t *)buffer + hdr->title_ptr);
+        }
+        uint32_t n = 0u;
+        while (src[n] && n < 255u) n++;
+        char *copy = (char *)kmalloc(n + 1u);
+        if (copy) { for (uint32_t i = 0u; i <= n; i++) copy[i] = src[i]; }
+        mod_name = copy ? copy : "Unnamed";
     }
 
     uart_puts("[Module] '"); uart_puts(mod_name);
