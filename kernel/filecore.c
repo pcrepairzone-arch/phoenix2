@@ -1731,7 +1731,13 @@ void filecore_list_root(void)
          *
          * boot386 revealed $.!Boot.!Boot is release notes text, not a boot script.
          * The real desktop boot obey is $.!Boot.Choices.Boot.PreDesk (boot387).
-         * boot388: also report find result on framebuffer via con_printf.        */
+         * boot388: also report find result on framebuffer via con_printf.
+         * boot389: turn uart quiet OFF before Steps 5 & 6 so serial log shows
+         *          all diagnostic output (IDA scan above was the noisy part).  */
+        {
+            extern void uart_set_quiet(int q);
+            uart_set_quiet(0);
+        }
         if (g_root_cache_valid && g_root_cache_count > 0u) {
             uart_puts("[FileCore] === Step 5: Execute $.!Boot.Choices.Boot.PreDesk ===\n");
 
@@ -1846,21 +1852,37 @@ static uint8_t *filecore_read_file_buf(uint32_t sin, uint32_t size,
 }
 
 /* ── fc_name_eq ──────────────────────────────────────────────────────────────
- * Simple strcmp without libc.                                               */
+ * Simple strcmp without libc (exact, case-sensitive).                       */
 static int fc_name_eq(const char *a, const char *b)
 {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
     return *a == *b;
 }
 
+/* ── fc_name_ieq ─────────────────────────────────────────────────────────────
+ * boot389: case-insensitive strcmp.  RISC OS FileCore is case-insensitive.
+ * '!' prefix IS part of the name and is compared exactly as '!'.           */
+static int fc_name_ieq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
 /* ── fc_find_in_dir ──────────────────────────────────────────────────────────
  * Scan a directory for an entry whose name matches 'name'.
+ * boot389: case-insensitive match (RISC OS FileCore is case-insensitive).
  * Returns 0 and fills *out_ent on success, -1 if not found.                */
 static int fc_find_in_dir(uint32_t dir_sin, const char *name, vfs_dirent_t *out_ent)
 {
     for (uint32_t i = 0u; i < 256u; i++) {
         if (filecore_get_child_entry(dir_sin, i, out_ent) != 0) return -1;
-        if (fc_name_eq(out_ent->name, name)) return 0;
+        if (fc_name_ieq(out_ent->name, name)) return 0;
     }
     return -1;
 }
@@ -1868,26 +1890,34 @@ static int fc_find_in_dir(uint32_t dir_sin, const char *name, vfs_dirent_t *out_
 /* ── fc_try_load_modules_from_dir ────────────────────────────────────────────
  * List every entry in dir_sin.  For each file in the module size range,
  * read it and attempt module_load_from_memory().
- * Returns 1 if a module was successfully loaded, 0 otherwise.              */
+ *
+ * boot389: load ALL valid modules in the directory (not just the first one).
+ *          Also add con_printf output so results are visible on framebuffer
+ *          even when uart_set_quiet(1) is active.
+ *
+ * Returns count of modules successfully loaded.                             */
 static int fc_try_load_modules_from_dir(uint32_t dir_sin, const char *label,
                                          uint32_t disc_map_lba,
                                          uint32_t used_bits,  uint32_t dr_size,
                                          uint32_t secperlfau, uint32_t nzones)
 {
+    extern void con_printf(const char *fmt, ...);
+    extern void con_set_colours(uint32_t fg, uint32_t bg);
+
     uart_puts("[Step6] Listing '"); uart_puts(label); uart_puts("'...\n");
     vfs_dirent_t ent;
+    int loaded = 0;
 
     for (uint32_t i = 0u; i < 128u; i++) {
         if (filecore_get_child_entry(dir_sin, i, &ent) != 0) {
             uart_puts("[Step6]   ("); fc_dec(i); uart_puts(" entries)\n");
             break;
         }
-#if FILECORE_VERBOSE
+        /* Always print directory listing on serial — helps diagnose misses */
         uart_puts("[Step6]   ["); fc_dec(i); uart_puts("] '");
         uart_puts(ent.name);
         uart_puts(ent.type == VFS_DIRENT_DIR ? "'  DIR" : "'  FILE");
         uart_puts("  sz="); fc_dec((uint32_t)ent.size); uart_puts("\n");
-#endif
 
         if (ent.type != VFS_DIRENT_FILE) continue;
         if (ent.size < 0x34u || ent.size > 4u * 1024u * 1024u) continue;
@@ -1898,86 +1928,132 @@ static int fc_try_load_modules_from_dir(uint32_t dir_sin, const char *label,
         uint8_t *fbuf = filecore_read_file_buf(ent.sin, (uint32_t)ent.size,
                                                 disc_map_lba, used_bits, dr_size,
                                                 secperlfau, nzones);
-        if (!fbuf) continue;
+        if (!fbuf) {
+            uart_puts("[Step6] read fail skip\n");
+            continue;
+        }
 
         int mrc = module_load_from_memory(fbuf, (uint32_t)ent.size, ent.name);
         if (mrc == 0) {
             uart_puts("[Step6] *** '"); uart_puts(ent.name);
             uart_puts("' loaded OK ***\n");
-            return 1;   /* buffer owned by module manager — don't free */
+            /* boot389: report success on framebuffer */
+            con_set_colours(0xFF004000u, 0xFFE0E0E0u);
+            con_printf("  Mod: %s [OK]\n", ent.name);
+            con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+            loaded++;
+            /* boot389: DON'T return — load all modules in directory */
+        } else {
+            uart_puts("[Step6] rc="); fc_dec((uint32_t)(-mrc)); uart_puts(" skip\n");
+            kfree(fbuf);
         }
-        uart_puts("[Step6] rc="); fc_dec((uint32_t)(-mrc)); uart_puts(" skip\n");
-        kfree(fbuf);
     }
-    return 0;
+    return loaded;
 }
 
 /* ── filecore_step6_load_module ──────────────────────────────────────────────
- * Two search paths (confirmed from bootlog244):
+ * Two search paths:
  *
  *   Path A: $.!Boot.Resources.!System[.Modules]
- *     !Boot (sin=0x0a8ba101) → Resources (entry[9], ida=0x0a85ea01)
- *     → !System → try files directly, then Modules subdir
+ *     !Boot → Resources → !System → try files directly, then Modules subdir
+ *     boot389: also try 'System' (without '!') as fallback for !System
+ *              case-insensitive matching via fc_name_ieq (in fc_find_in_dir)
  *
  *   Path B: $.!LanMan98
- *     Root cache entry '!LanMan98' (ida=0x0a70ab01)
- *     → scan directly for LanManFS module file
  *
- * Path A is tried first (standard RISC OS system module location).          */
+ * boot389: add con_printf output so results are visible on framebuffer even
+ *          with uart_set_quiet(1) active.  Load ALL modules, not just first.
+ * boot389: case-insensitive directory navigation (RISC OS FileCore standard).*/
 static void filecore_step6_load_module(uint32_t disc_map_lba,
                                         uint32_t used_bits,
                                         uint32_t dr_size,
                                         uint32_t secperlfau,
                                         uint32_t total_nzones)
 {
+    extern void con_printf(const char *fmt, ...);
+    extern void con_set_colours(uint32_t fg, uint32_t bg);
+
     vfs_dirent_t ent;
+    int total_loaded = 0;
 
     /* ── Path A: $.!Boot.Resources.!System ── */
     uart_puts("[Step6] Path A: $.!Boot.Resources.!System\n");
+    con_printf("  Step6: scanning $.!Boot.Resources.!System\n");
 
-    /* Step A1: !Boot from root cache */
+    /* Step A1: !Boot from root cache (case-sensitive — '!' is literal) */
     uint32_t boot_sin = 0u;
     for (uint32_t ri = 0u; ri < g_root_cache_count; ri++) {
-        if (fc_name_eq(g_root_cache[ri].name, "!Boot")) {
+        if (fc_name_ieq(g_root_cache[ri].name, "!Boot")) {
             boot_sin = g_root_cache[ri].sin; break;
         }
     }
-    if (!boot_sin) { uart_puts("[Step6] A: !Boot not found\n"); goto path_b; }
+    if (!boot_sin) {
+        uart_puts("[Step6] A: !Boot not found in root cache\n");
+        con_set_colours(0xFFFFFFFFu, 0xFF800000u);
+        con_printf("  Step6: !Boot not found in root\n");
+        con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+        goto path_b;
+    }
+    uart_puts("[Step6] A: !Boot sin="); fc_hex32(boot_sin); uart_puts("\n");
 
-    /* Step A2: Resources inside !Boot */
+    /* Step A2: Resources inside !Boot (case-insensitive) */
     if (fc_find_in_dir(boot_sin, "Resources", &ent) != 0 ||
             ent.type != VFS_DIRENT_DIR) {
-        uart_puts("[Step6] A: Resources not found in !Boot\n"); goto path_b;
+        uart_puts("[Step6] A: Resources not found in !Boot\n");
+        con_set_colours(0xFFFFFFFFu, 0xFF800000u);
+        con_printf("  Step6: Resources not found in !Boot\n");
+        con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+        goto path_b;
     }
     uart_puts("[Step6] A: Resources sin="); fc_hex32(ent.sin); uart_puts("\n");
     {
         uint32_t res_sin = ent.sin;
 
-        /* Step A3: !System inside Resources */
-        if (fc_find_in_dir(res_sin, "!System", &ent) != 0 ||
-                ent.type != VFS_DIRENT_DIR) {
-            uart_puts("[Step6] A: !System not found in Resources\n"); goto path_b;
-        }
-        uart_puts("[Step6] A: !System sin="); fc_hex32(ent.sin); uart_puts("\n");
-        {
-            uint32_t sys_sin = ent.sin;
-
-            /* Step A4a: try files directly inside !System */
-            if (fc_try_load_modules_from_dir(sys_sin, "!System",
-                                              disc_map_lba, used_bits, dr_size,
-                                              secperlfau, total_nzones))
-                return;
-
-            /* Step A4b: try !System.Modules subdir */
-            if (fc_find_in_dir(sys_sin, "Modules", &ent) == 0 &&
+        /* Step A3: look for !System (canonical) or System (without !) inside
+         * Resources.  Some setups may name the directory without the '!'.
+         * fc_find_in_dir is now case-insensitive so 'system'/'SYSTEM' also OK. */
+        uint32_t sys_sin = 0u;
+        const char *sys_name = NULL;
+        const char *sys_names[] = { "!System", "System", NULL };
+        for (int ni = 0; sys_names[ni]; ni++) {
+            if (fc_find_in_dir(res_sin, sys_names[ni], &ent) == 0 &&
                     ent.type == VFS_DIRENT_DIR) {
-                uart_puts("[Step6] A: found !System/Modules sin=");
-                fc_hex32(ent.sin); uart_puts("\n");
-                if (fc_try_load_modules_from_dir(ent.sin, "!System/Modules",
-                                                  disc_map_lba, used_bits, dr_size,
-                                                  secperlfau, total_nzones))
-                    return;
+                sys_sin  = ent.sin;
+                sys_name = sys_names[ni];
+                break;
             }
+        }
+
+        if (!sys_sin) {
+            uart_puts("[Step6] A: !System/System not found in Resources\n");
+            con_set_colours(0xFFFFFFFFu, 0xFF800000u);
+            con_printf("  Step6: !System not found in Resources\n");
+            con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+            goto path_b;
+        }
+        uart_puts("[Step6] A: "); uart_puts(sys_name);
+        uart_puts(" sin="); fc_hex32(sys_sin); uart_puts("\n");
+        con_printf("  Step6: found %s\n", sys_name);
+
+        /* Step A4a: try files directly inside !System/System */
+        int n = fc_try_load_modules_from_dir(sys_sin, sys_name,
+                                              disc_map_lba, used_bits, dr_size,
+                                              secperlfau, total_nzones);
+        total_loaded += n;
+
+        /* Step A4b: try Modules subdir (case-insensitive) */
+        if (fc_find_in_dir(sys_sin, "Modules", &ent) == 0 &&
+                ent.type == VFS_DIRENT_DIR) {
+            uart_puts("[Step6] A: found Modules subdir sin=");
+            fc_hex32(ent.sin); uart_puts("\n");
+            con_printf("  Step6: found Modules subdir\n");
+            n = fc_try_load_modules_from_dir(ent.sin, "Modules",
+                                              disc_map_lba, used_bits, dr_size,
+                                              secperlfau, total_nzones);
+            total_loaded += n;
+        } else {
+            uart_puts("[Step6] A: no Modules subdir\n");
+            con_printf("  Step6: no Modules subdir in %s\n", sys_name);
         }
     }
 
@@ -1987,19 +2063,31 @@ path_b:
 
     uint32_t lanman_sin = 0u;
     for (uint32_t ri = 0u; ri < g_root_cache_count; ri++) {
-        if (fc_name_eq(g_root_cache[ri].name, "!LanMan98")) {
+        if (fc_name_ieq(g_root_cache[ri].name, "!LanMan98")) {
             lanman_sin = g_root_cache[ri].sin; break;
         }
     }
-    if (!lanman_sin) { uart_puts("[Step6] B: !LanMan98 not in root cache\n"); return; }
-    uart_puts("[Step6] B: !LanMan98 sin="); fc_hex32(lanman_sin); uart_puts("\n");
+    if (!lanman_sin) {
+        uart_puts("[Step6] B: !LanMan98 not in root cache\n");
+    } else {
+        uart_puts("[Step6] B: !LanMan98 sin="); fc_hex32(lanman_sin); uart_puts("\n");
+        total_loaded += fc_try_load_modules_from_dir(lanman_sin, "!LanMan98",
+                                                      disc_map_lba, used_bits, dr_size,
+                                                      secperlfau, total_nzones);
+    }
 
-    if (fc_try_load_modules_from_dir(lanman_sin, "!LanMan98",
-                                      disc_map_lba, used_bits, dr_size,
-                                      secperlfau, total_nzones))
-        return;
-
-    uart_puts("[Step6] No module loaded from either path\n");
+    /* Summary */
+    uart_puts("[Step6] Total modules loaded: "); fc_dec((uint32_t)total_loaded);
+    uart_puts("\n");
+    if (total_loaded == 0) {
+        con_set_colours(0xFFFFFFFFu, 0xFF800000u);
+        con_printf("  Step6: no modules loaded\n");
+        con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+    } else {
+        con_set_colours(0xFF004000u, 0xFFE0E0E0u);
+        con_printf("  Step6: %d module(s) loaded\n", total_loaded);
+        con_set_colours(0xFF202020u, 0xFFE0E0E0u);
+    }
 }
 
 /* ── Stubs (safe, preserve existing link interfaces) ─────────────────────── */
