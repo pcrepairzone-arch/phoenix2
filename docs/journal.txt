@@ -3435,3 +3435,216 @@ the above three components exist.
 
 The CMunge -64bit pipeline is proven and repeatable.  Future
 AArch64 modules follow the same build recipe.
+
+
+═══════════════════════════════════════════════════════════════
+SESSION 13 — boot394: CursorModule — kernel-linked AArch64 module
+Date: 2026-05-19
+═══════════════════════════════════════════════════════════════
+
+BACKGROUND
+──────────────────────────────────────────────────────────────
+Boot393 proved the CMunge -64bit pipeline with PhoenixTest — a
+do-nothing module that just returns 0.  The next step was a real
+functional module: CursorModule, the RISC OS pointer/input manager.
+
+The cursor_module_start / cursor_module_end PROVIDE stubs were
+already in linker.ld since boot382 (size=0, skipped by loader).
+module.c already called module_load_from_memory(cursor_module_start,
+cm_size, "PhoenixCursor") with a guard against cm_size < 32.
+usb_hid.c already had usb_hid_mouse_count() / usb_hid_keyboard_count()
+with the comment "Called by CursorMod".  The groundwork was laid;
+boot394 fills in the implementation.
+
+ARCHITECTURE DECISION — LINKED MODULE vs FLAT BINARY
+──────────────────────────────────────────────────────────────
+PhoenixTest uses the flat-binary approach: CMunge → objcopy -O binary
+→ .incbin in kernel/test_module.S.  This works for a module that
+returns 0 immediately.
+
+CursorModule must call kernel functions: cursor_init(), mouse_init(),
+mouse_set_bounds(), cursor_show(), usb_hid_mouse_count(), etc.  A
+flat binary linked at 0x0 cannot call these: the BL instructions in
+the binary would encode offsets from 0x0, but the binary runs at
+cursor_module_start (somewhere in the kernel image above 0x80000).
+PC-relative branches would land at wrong addresses.
+
+Solution: link the CMunge-generated objects DIRECTLY into the kernel.
+The .init.rmf section (module header + veneers) and the C implementation
+object are both linked as normal kernel objects.  AArch64 CALL26
+relocations are resolved at kernel link time, so BL cursor_module_impl_init
+compiles to the exact kernel address of that function.
+
+The module loader calls init_fn = (uint8_t *)cursor_module_start + init_off.
+Since cursor_module_start == _CMUNGE_origin (the .init.rmf section base),
+and init_off = _CMUNGE_init - _CMUNGE_origin (a link-time constant), the
+arithmetic is correct: init_fn == _CMUNGE_init == the actual AArch64 address
+of the init veneer.
+
+This is the correct pattern for all future embedded modules that need kernel
+API access.  Modules that are truly self-contained (no kernel calls) can
+continue to use the flat-binary .incbin pattern.
+
+BUILD PIPELINE
+──────────────────────────────────────────────────────────────
+CursorModule.cmhg:
+    title-string:        CursorModule
+    help-string:         CursorModule 0.01 (19 May 2026)
+    initialisation-code: cursor_module_impl_init
+    finalisation-code:   cursor_module_impl_final
+
+riscos-cmunge -64bit -tgcc -s CursorModule_hdr.s -d CursorModule.d \
+    CursorModule.cmhg
+→  kernel/cursor_module.S   (CMunge output, replaces cursor_module.c stub)
+→  kernel/cursor_module_impl.c  (kernel C implementation)
+
+Makefile already had cursor_module.o and cursor_module_impl.o in OBJS.
+Deleting cursor_module.c causes make to use the %.o: %.S rule for
+cursor_module.S automatically — no Makefile changes needed.
+
+LINKER SCRIPT CHANGE
+──────────────────────────────────────────────────────────────
+Replaced:
+    PROVIDE(cursor_module_start = .);
+    PROVIDE(cursor_module_end   = .);
+
+With:
+    . = ALIGN(4);
+    cursor_module_start = .;
+    .cursor_module_hdr : {
+        *(.init.rmf)   /* CMunge header + AArch64 init/final veneers */
+    }
+    cursor_module_end = .;
+
+The .init.rmf section is type "xa" (executable + allocatable), placed
+between .test_module and .bss, so it appears in the flat binary output
+without contributing to the BSS gap.
+
+CURSOR MODULE IMPLEMENTATION
+──────────────────────────────────────────────────────────────
+kernel/cursor_module_impl.c:
+
+_clib_initialisemodule / _clib_finalisemodule — weak stubs returning 0.
+The CMunge -64bit veneer calls these; for a kernel-linked module there
+is no RISC OS C library to initialise.
+
+__ZISize = 0 — CMunge places this in the module flags block.  A
+kernel-linked module manages its own storage; the ZI area is empty.
+
+cursor_module_impl_init():
+    keyboard_init()               — reset 16-slot key event queue
+    mouse_init()                  — reset 16-slot mouse event queue
+    mouse_set_bounds(fb.w, fb.h)  — clamp to framebuffer dimensions
+    cursor_init()                 — initialise sprite + save buffer
+    cursor_show()                 — make pointer visible
+    usb_hid_mouse_count()         — log mice found (1 in boot394)
+    usb_hid_keyboard_count()      — log keyboards found (1 in boot394)
+    → logs "[CursorMod] SELECT=left MENU=middle ADJUST=right"
+
+RISC OS button conventions enforced at HID level (usb_hid.c,
+hid_process_mouse(), unchanged since boot283):
+    USB bit 0 (left)   → BUTTON_SELECT  0x04  — primary action
+    USB bit 1 (right)  → BUTTON_ADJUST  0x01  — inverse / toggle
+    USB bit 2 (middle) → BUTTON_MENU    0x02  — context menu
+
+LIB.C CHANGE
+──────────────────────────────────────────────────────────────
+Removed cursor_init() call from wimp_task().  CursorModule now owns
+cursor initialisation.  The cursor_update() poll loop in the WIMP
+main loop is unchanged — that is rendering, not initialisation.
+
+The `cursor_init` extern declaration and weak attribute are removed
+from wimp_task() since we no longer call it from there.
+
+BOOT 394 LOG CONFIRMATION
+──────────────────────────────────────────────────────────────
+[Module] cursor_module: size=272 bytes
+[Module] 'CursorModule' 272 bytes  AArch64  init_raw=0x40000078
+[Module] AArch64 loading 'CursorModule' init_off=0x00000078
+[Module] Registered: CursorModule
+[Module] Calling Init() for CursorModule
+INPUT: Keyboard event queue ready (16 slots)
+INPUT: Mouse event queue ready (16 slots), pos=(640,360)
+INPUT: Mouse bounds 1920x1080
+[CursorMod] init ok — mice=1 kbds=1 bounds=1920x1080
+[CursorMod] SELECT=left MENU=middle ADJUST=right
+[Module] *** PhoenixCursor — caret + pointer active ***
+
+Module table (5 green, 4 ARM32 stubs):
+  PhoenixResolver [OK]
+  PhoenixGENET    [OK]
+  PhoenixDHCP     [OK]
+  CursorModule    [OK]   ← new
+  PhoenixTest     [OK]
+  LanMan98
+  IconBorderFob
+  Colours
+  ABIMod
+
+Network (ping393.txt):
+  38 packets, 23 received, 39.5% loss overall.
+  Loss confined to first 9 packets (pre-DHCP bind, same as all boots).
+  Steady-state from seq 10: avg 5.1 ms, max 13.7 ms, 0% loss.
+
+Image size: 219 KB (unchanged — .cursor_module_hdr = 272 bytes, fits
+within the existing binary footprint between .test_module and .bss).
+
+COMMITS
+──────────────────────────────────────────────────────────────
+  6c76795  boot394: CursorModule — first kernel-linked AArch64 module
+
+FILES CHANGED (boot394)
+──────────────────────────────────────────────────────────────
+  kernel/cursor_module.S      — CMunge -64bit output (replaces stub .c)
+  kernel/cursor_module_impl.c — C implementation: init/final, clib stubs
+  kernel/cursor_module.c      — deleted (was /* stub */)
+  kernel/linker.ld            — PROVIDE stubs → .cursor_module_hdr section
+  kernel/lib.c                — cursor_init() call removed from wimp_task,
+                                banner updated boot393 → boot394
+
+RULES ADDED THIS SESSION
+──────────────────────────────────────────────────────────────
+
+Rule 71: Kernel-linked embedded modules (those that need to call kernel
+         functions) must NOT go through objcopy -O binary.  The flat
+         binary is linked at 0x0; PC-relative BL instructions computed
+         from 0x0 are wrong when the code runs at the kernel image
+         address.  Instead: compile the CMunge-generated .s and the C
+         implementation as normal kernel objects; let the kernel linker
+         resolve all relocations.
+
+Rule 72: For a kernel-linked module, cursor_module_start must equal
+         _CMUNGE_origin exactly.  Both are symbols for the first byte
+         of the .init.rmf section.  The module loader computes
+         init_fn = cursor_module_start + (raw_init & ~(3<<30)), which
+         equals _CMUNGE_init only when cursor_module_start == _CMUNGE_origin.
+         Achieve this with: cursor_module_start = .; .cursor_module_hdr
+         { *(.init.rmf) } in linker.ld.
+
+Rule 73: _kernel_oserror is not defined in Phoenix's kernel.h.  Module
+         entry points that return _kernel_oserror * must define the
+         typedef locally in the implementation file.  The struct is:
+         { unsigned int errnum; char errmess[252]; }.  NULL = no error.
+
+Rule 74: __ZISize must be defined for CMunge -64bit linked modules.
+         CMunge places it in the module flags block (.word __ZISize
+         after the flags word).  For a kernel-linked module with no
+         separate zero-init workspace, define: int __ZISize = 0;
+
+Rule 75: _clib_initialisemodule and _clib_finalisemodule must be
+         defined in the kernel link when using CMunge -64bit veneers,
+         even for modules that don't use the RISC OS C library.  Stub
+         both to return 0 (NULL = no error).  Use __attribute__((weak))
+         so a future full riscos64-clib can override them.
+
+NEXT ARC
+──────────────────────────────────────────────────────────────
+Five AArch64 modules are now [OK] (PhoenixResolver, PhoenixGENET,
+PhoenixDHCP, CursorModule, PhoenixTest).  Four ARM32 stubs remain.
+
+CursorModule owns pointer initialisation; the WIMP loop drives cursor
+position updates via cursor_update().  Future work:
+  • OS_Mouse SWI (read current x, y, buttons — when SWI dispatcher exists)
+  • Pointer shape management (cursor_set_shape for different pointer styles)
+  • Key buffer (OS_ReadC / KeyV equivalent)
+  • AArch32 EL0 switching infrastructure (for the 4 ARM32 stubs)
